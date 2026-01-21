@@ -1,0 +1,1 @@
+print ("Hello! This is the main file for the Stock application.")

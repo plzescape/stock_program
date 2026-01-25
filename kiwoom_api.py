@@ -10,7 +10,7 @@ from config import (
     TRAIL_START_RATE, TRAIL_GAP,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
     CONDITION_NAME, CONDITION_INDEX,
-    SCAN_MAX_CODES, SCAN_TR_DELAY_MS
+    SCAN_MAX_CODES, SCAN_TR_DELAY_MS, MOCK_ACCOUNT_NO
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate
@@ -90,10 +90,24 @@ class KiwoomAPI(QAxWidget):
             self.log_system.info("[DAILY_RESET] counters cleared")
 
     def get_account(self) -> str:
-        if IS_REAL and ACCOUNT_NO.strip():
-            return ACCOUNT_NO.strip()
         accs = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
-        return accs.split(";")[0].strip()
+        accounts = [a.strip() for a in accs.split(";") if a.strip()]
+    
+        if not accounts:
+            raise RuntimeError("계좌 없음")
+    
+        if IS_REAL:
+            if not ACCOUNT_NO.strip():
+                raise RuntimeError("IS_REAL=True 인데 ACCOUNT_NO 비어 있음")
+            return ACCOUNT_NO.strip()
+    
+        # 🔒 모의투자: 지정한 계좌만 사용
+        if MOCK_ACCOUNT_NO not in accounts:
+            raise RuntimeError(
+                f"🚨 설정된 모의계좌({MOCK_ACCOUNT_NO})가 로그인 계좌 목록에 없음"
+            )
+    
+        return MOCK_ACCOUNT_NO
 
     def now_can_enter(self) -> bool:
         # 너무 이른/늦은 시간 신규진입 차단 (원하면 조정)

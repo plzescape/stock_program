@@ -78,10 +78,15 @@ class KiwoomAPI(QAxWidget):
         self.cond_timer = QTimer()
         self.cond_timer.timeout.connect(self.run_condition_cycle)
 
+        # ===== 자동매매 상태 =====
+        self.auto_trade_enabled = False   # 🔥 기본 OFF
+        self.self_check_retry_count = 0
     # ---------------------------
     # 기본 유틸
     # ---------------------------
     def _reset_daily_if_needed(self):
+        if not self.auto_trade_enabled:   # 🔥 추가
+            return
         today = datetime.now().date()
         if today != self._today:
             self._today = today
@@ -435,3 +440,34 @@ class KiwoomAPI(QAxWidget):
     # ---------------------------
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
         self.log_system.info(f"[MSG] [{screen_no}] {msg}")
+
+    # ---------------------------
+    # 셀프 체크 (매매 전 상태 점검)
+    # ---------------------------
+    def self_check(self, phase: str) -> bool:
+        try:
+            self.log_system.info(f"[SELF_CHECK_START] phase={phase}")
+
+            # 1. 계좌
+            acc = self.get_account()
+            if not acc:
+                raise RuntimeError("계좌 없음")
+
+            # 2. 상태
+            if self.position is not None:
+                raise RuntimeError("포지션 잔존")
+
+            if self.ordering:
+                raise RuntimeError("ordering 상태")
+
+            self.log_system.info(f"[SELF_CHECK_OK] phase={phase}")
+            self.self_check_retry_count = 0
+            return True
+
+        except Exception as e:
+            self.log_system.error(
+                f"[SELF_CHECK_FAIL] phase={phase} reason={e}"
+            )
+            self.auto_trade_enabled = False
+            self.self_check_retry_count += 1
+            return False    

@@ -17,6 +17,14 @@ def test_account(api: KiwoomAPI):
     else:
         print("🟢 모의투자 모드")
 
+def enable_auto_trade(api: KiwoomAPI):
+    ok = api.self_check("POST_MARKET_OPEN")
+    if ok:
+        api.auto_trade_enabled = True
+        print("✅ 자동매매 활성화")
+    else:
+        print("❌ self-check 실패, 자동매매 비활성 유지")
+
 def main():
     app = QApplication(sys.argv)
     api = KiwoomAPI()
@@ -30,6 +38,10 @@ def main():
     # 2) 조건검색식 로드 (필수)
     api.load_conditions()
 
+    # 2-1) 장전 자가진단 (필수)
+    api.self_check("PRE_MARKET")
+    enable_auto_trade(api)
+    
     # 3) 08:50 실행해도 09:00 이후 자동으로 조건검색이 돌도록 스케줄러 시작
     api.start_condition_scheduler()
 

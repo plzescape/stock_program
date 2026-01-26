@@ -106,7 +106,8 @@ def enable_auto_trade(api: KiwoomAPI):
         f"({api.self_check_retry_count}/{MAX_SELF_CHECK_RETRY}) → 재시도 예정"
     )
     QTimer.singleShot(SELF_CHECK_RETRY_SEC * 1000,  lambda: enable_auto_trade(api))
-    
+
+   
 #===== 메인 함수 =====        
 def main():
     app = QApplication(sys.argv)
@@ -125,6 +126,9 @@ def main():
     ok = api.self_check("PRE_MARKET")
     if not ok:
         print("⚠️ 장전 self-check 실패 (재시도는 장 시작 후)")
+
+    # 테스트용: 조건검색 결과 바로 받아보기
+    # api.test_realtime_condition_in()
 
     # 2-2) 장 시작 후 자동매매 활성화 예약
     now = datetime.now()

@@ -31,7 +31,7 @@ class KiwoomAPI(QAxWidget):
         # ===== 이벤트 연결 =====
         self.OnEventConnect.connect(self._on_event_connect)
         self.OnReceiveConditionVer.connect(self._on_receive_condition_ver)
-        self.OnReceiveTrCondition.connect(self._on_receive_tr_condition)
+        self.OnReceiveRealCondition.connect(self._on_receive_real_condition)   # 🔥 변경
         self.OnReceiveTrData.connect(self._on_receive_tr_data)
         self.OnReceiveRealData.connect(self._on_receive_real_data)
         self.OnReceiveChejanData.connect(self._on_receive_chejan_data)
@@ -43,85 +43,43 @@ class KiwoomAPI(QAxWidget):
         self._tr_loop: QEventLoop | None = None
 
         # ===== TR 상태 =====
-        self._last_tr_rqname: str | None = None
-        self._last_tr_trcode: str | None = None
-        self._last_tr_record: str | None = None
+        self._last_tr_rqname = None
+        self._last_tr_trcode = None
 
         # ===== 조건검색 상태 =====
         self.watchlist: list[str] = []
         self._scan_queue: list[str] = []
-        self._scan_running: bool = False
-        self._last_condition_run = None  # datetime
+        self._scan_running = False
+
+        self.realtime_condition_started = False   # 🔥 추가
 
         # ===== 주문/포지션 상태 =====
-        self.position: str | None = None
-        self.entry_price: int | None = None
-        self.highest_price: int = 0
-        self.total_qty: int = QTY
-        self.remain_qty: int = 0
+        self.position = None
+        self.entry_price = None
+        self.highest_price = 0
+        self.total_qty = QTY
+        self.remain_qty = 0
 
-        self.tp1_done: bool = False
-        self.tp2_done: bool = False
-        self.trailing_active: bool = False
+        self.tp1_done = False
+        self.tp2_done = False
+        self.trailing_active = False
 
-        self.ordering: bool = False
-        self._pending_buy_code: str | None = None
-        self._pending_buy_qty: int = 0
-        self._pending_sell_qty: int = 0
+        self.ordering = False
+        self._pending_buy_code = None
+        self._pending_buy_qty = 0
 
         # ===== 일일 제한 =====
         self._today = datetime.now().date()
         self.daily_trade_count = 0
         self.traded_today: set[str] = set()
 
-        # ===== 타이머 =====
-        self.cond_timer = QTimer()
-        self.cond_timer.timeout.connect(self.run_condition_cycle)
-
         # ===== 자동매매 상태 =====
-        self.auto_trade_enabled = False   # 🔥 기본 OFF
+        self.auto_trade_enabled = False
         self.self_check_retry_count = 0
-    # ---------------------------
-    # 기본 유틸
-    # ---------------------------
-    def _reset_daily_if_needed(self):
-        if not self.auto_trade_enabled:   # 🔥 추가
-            return
-        today = datetime.now().date()
-        if today != self._today:
-            self._today = today
-            self.daily_trade_count = 0
-            self.traded_today.clear()
-            self.log_system.info("[DAILY_RESET] counters cleared")
 
-    def get_account(self) -> str:
-        accs = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
-        accounts = [a.strip() for a in accs.split(";") if a.strip()]
-    
-        if not accounts:
-            raise RuntimeError("계좌 없음")
-    
-        if IS_REAL:
-            if not ACCOUNT_NO.strip():
-                raise RuntimeError("IS_REAL=True 인데 ACCOUNT_NO 비어 있음")
-            return ACCOUNT_NO.strip()
-    
-        # 🔒 모의투자: 지정한 계좌만 사용
-        if MOCK_ACCOUNT_NO not in accounts:
-            raise RuntimeError(
-                f"🚨 설정된 모의계좌({MOCK_ACCOUNT_NO})가 로그인 계좌 목록에 없음"
-            )
-    
-        return MOCK_ACCOUNT_NO
-
-    def now_can_enter(self) -> bool:
-        # 너무 이른/늦은 시간 신규진입 차단 (원하면 조정)
-        t = datetime.now().time()
-        return time(9, 0) <= t <= time(14, 50)
-
-    # ---------------------------
+    # -------------------------------------------------
     # 로그인 / 조건검색 로드
-    # ---------------------------
+    # -------------------------------------------------
     def login(self):
         self.dynamicCall("CommConnect()")
         self._login_loop = QEventLoop()
@@ -129,9 +87,7 @@ class KiwoomAPI(QAxWidget):
 
     def _on_event_connect(self, err_code):
         self.log_system.info(f"[LOGIN] err_code={err_code}")
-        if self._login_loop:
-            self._login_loop.exit()
-            self._login_loop = None
+        self._login_loop.exit()
 
     def load_conditions(self):
         # 조건검색식 사용하려면 필수
@@ -141,52 +97,47 @@ class KiwoomAPI(QAxWidget):
 
     def _on_receive_condition_ver(self, ret, msg):
         self.log_system.info(f"[CONDITION_LOAD] ret={ret} msg={msg}")
-        if self._cond_loop:
-            self._cond_loop.exit()
-            self._cond_loop = None
+        self._cond_loop.exit()
 
-    # ---------------------------
-    # 조건검색 주기 실행
-    # ---------------------------
-    def start_condition_scheduler(self):
-        # 08:50에 실행해도, 09:00 이후에 조건검색이 자동으로 돌도록
-        self._last_condition_run = None
-        self.cond_timer.start(60 * 1000)  # 1분마다 체크(내부에서 30분 간격 제한)
-
-    def run_condition_cycle(self):
-        self._reset_daily_if_needed()
-
-        if self.position is not None or self.ordering:
-            return
-        if not self.now_can_enter():
-            return
-        if self.daily_trade_count >= MAX_TRADES_PER_DAY:
+    # -------------------------------------------------
+    # 🔥 실시간 조건검색 시작 (딱 1회)
+    # -------------------------------------------------
+    def start_realtime_condition(self):
+        if self.realtime_condition_started:
             return
 
-        now = datetime.now()
-        if self._last_condition_run is not None:
-            diff_min = (now - self._last_condition_run).total_seconds() / 60.0
-            if diff_min < CONDITION_INTERVAL_MIN:
-                return
-
-        self._last_condition_run = now
-        self.log_system.info("[CONDITION] run SendCondition")
-
+        self.log_system.info("[CONDITION] start realtime condition")
         self.dynamicCall(
             "SendCondition(QString, QString, int, int)",
-            "9000", CONDITION_NAME, CONDITION_INDEX, 0
+            "9000", CONDITION_NAME, CONDITION_INDEX, 1
         )
+        self.realtime_condition_started = True
 
-    def _on_receive_tr_condition(self, screen_no, codes, cond_name, cond_index, next):
-        self.watchlist = [c for c in codes.split(";") if c]
-        self.log_signal.info(f"[CONDITION_RESULT] name={cond_name} codes={self.watchlist}")
+    # -------------------------------------------------
+    # 🔥 실시간 조건 편입 / 이탈
+    # -------------------------------------------------
+    def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
+        if event_type == "I":
+            self.log_signal.info(f"[REAL_CONDITION_IN] {code}")
 
-        # 스캔 큐 구성
-        self._scan_queue = [c for c in self.watchlist if c and c not in self.traded_today][:SCAN_MAX_CODES]
-        if not self._scan_running:
-            self._scan_running = True
-            QTimer.singleShot(0, self._scan_next)
+            if (
+                not self.auto_trade_enabled or
+                self.position is not None or
+                self.ordering or
+                code in self.traded_today or
+                code in self._scan_queue
+            ):
+                return
 
+            self._scan_queue.append(code)
+
+            if not self._scan_running:
+                self._scan_running = True
+                QTimer.singleShot(0, self._scan_next)
+
+        elif event_type == "D":
+            self.log_signal.info(f"[REAL_CONDITION_OUT] {code}")
+            
     # ---------------------------
     # TR: OPT10080 (3분봉) 요청/응답
     # ---------------------------
@@ -241,13 +192,12 @@ class KiwoomAPI(QAxWidget):
             return abs(int(str(x).strip() or "0"))
         except Exception:
             return 0
-
     # ---------------------------
     # 스캔 루프 (조건검색 결과 종목을 순차 TR로 체크)
     # ---------------------------
     def _scan_next(self):
         try:
-            if self.position is not None or self.ordering:
+            if self.position or self.ordering:
                 self._scan_running = False
                 return
 
@@ -256,13 +206,14 @@ class KiwoomAPI(QAxWidget):
                 return
 
             code = self._scan_queue.pop(0)
+
             self.request_3min_candle_blocking(code)
             candles = self.parse_3min()
 
             if is_entry_candidate(candles, self.log_signal, code):
                 self.log_signal.info(f"[ENTRY_PICK] code={code}")
                 self.buy_market(code, self.total_qty)
-                return  # 주문 넣으면 스캔 종료(체결 이후 실시간 관리)
+                return
             else:
                 QTimer.singleShot(SCAN_TR_DELAY_MS, self._scan_next)
 
@@ -471,3 +422,14 @@ class KiwoomAPI(QAxWidget):
             self.auto_trade_enabled = False
             self.self_check_retry_count += 1
             return False    
+        
+    # 테스트용 더미 조건검색 결과
+    def test_realtime_condition_in(self):
+        fake_codes = ["005930", "000660", "035420"]
+        for code in fake_codes:
+            self._on_receive_real_condition(
+                code=code,
+                event_type="I",
+                cond_name="TEST",
+                cond_index=0
+            )

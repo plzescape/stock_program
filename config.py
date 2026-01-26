@@ -23,7 +23,7 @@ TRAIL_GAP = 0.01        # 고점 대비 1% 하락 시 청산
 
 # ===== 제한 =====
 MAX_TRADES_PER_DAY = 100
-CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
+CONDITION_INTERVAL_MIN = 3  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
 CONDITION_NAME = "단타_거래대금_500억"

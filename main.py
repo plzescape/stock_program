@@ -126,6 +126,8 @@ def main():
     ok = api.self_check("PRE_MARKET")
     if not ok:
         print("⚠️ 장전 self-check 실패 (재시도는 장 시작 후)")
+    else:
+        print("🟢 장전 self-check 통과")
 
     # 테스트용: 조건검색 결과 바로 받아보기
     # api.test_realtime_condition_in()
@@ -138,7 +140,7 @@ def main():
     QTimer.singleShot(delay_ms + 3000,  lambda: enable_auto_trade(api))    
     
     # 3) 08:50 실행해도 09:00 이후 자동으로 조건검색이 돌도록 스케줄러 시작
-    api.start_condition_scheduler()
+    api.start_realtime_condition()
 
     sys.exit(app.exec_())
 

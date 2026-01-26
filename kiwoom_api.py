@@ -20,6 +20,7 @@ class KiwoomAPI(QAxWidget):
     """키움 OpenAPI+ (OCX) 래퍼 + 모의투자 자동매매용 엔진"""
 
     def __init__(self):
+        print("🔥 KiwoomAPI __init__ CALLED")
         super().__init__()
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
 
@@ -76,7 +77,45 @@ class KiwoomAPI(QAxWidget):
         # ===== 자동매매 상태 =====
         self.auto_trade_enabled = False
         self.self_check_retry_count = 0
+        
+    # ---------------------------
+    # 기본 유틸
+    # ---------------------------
+    def _reset_daily_if_needed(self):
+        if not self.auto_trade_enabled:   # 🔥 추가
+            return
+        today = datetime.now().date()
+        if today != self._today:
+            self._today = today
+            self.daily_trade_count = 0
+            self.traded_today.clear()
+            self.log_system.info("[DAILY_RESET] counters cleared")
 
+    def get_account(self) -> str:
+        accs = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+        accounts = [a.strip() for a in accs.split(";") if a.strip()]
+    
+        if not accounts:
+            raise RuntimeError("계좌 없음")
+    
+        if IS_REAL:
+            if not ACCOUNT_NO.strip():
+                raise RuntimeError("IS_REAL=True 인데 ACCOUNT_NO 비어 있음")
+            return ACCOUNT_NO.strip()
+    
+        # 🔒 모의투자: 지정한 계좌만 사용
+        if MOCK_ACCOUNT_NO not in accounts:
+            raise RuntimeError(
+                f"🚨 설정된 모의계좌({MOCK_ACCOUNT_NO})가 로그인 계좌 목록에 없음"
+            )
+    
+        return MOCK_ACCOUNT_NO
+
+    def now_can_enter(self) -> bool:
+        # 너무 이른/늦은 시간 신규진입 차단 (원하면 조정)
+        t = datetime.now().time()
+        return time(9, 0) <= t <= time(14, 50)
+    
     # -------------------------------------------------
     # 로그인 / 조건검색 로드
     # -------------------------------------------------
@@ -196,6 +235,7 @@ class KiwoomAPI(QAxWidget):
     # 스캔 루프 (조건검색 결과 종목을 순차 TR로 체크)
     # ---------------------------
     def _scan_next(self):
+        print("🔥 _scan_next CALLED")
         try:
             if self.position or self.ordering:
                 self._scan_running = False
@@ -225,6 +265,7 @@ class KiwoomAPI(QAxWidget):
     # 주문 (모의투자/실계좌 공통: SendOrder 사용)
     # ---------------------------
     def buy_market(self, code: str, qty: int):
+        print("🔥 buy_market CALLED", code, qty)
         if self.ordering or self.position is not None:
             return
         if qty <= 0:
@@ -248,6 +289,7 @@ class KiwoomAPI(QAxWidget):
             self.log_system.error(f"[BUY_FAIL] ret={ret}")
 
     def sell_market(self, code: str, qty: int, reason: str):
+        print("🔥 sell_market CALLED", code, qty, reason)
         if qty <= 0:
             return
         ret = self.dynamicCall(
@@ -263,6 +305,7 @@ class KiwoomAPI(QAxWidget):
     # 체결(chejan) 이벤트: 상태 업데이트
     # ---------------------------
     def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
+        print("🔥 _on_receive_chejan_data CALLED")
         # gubun: 0(주문/체결), 1(잔고), 4(파생잔고) - 보통 0만으로도 충분
         if str(gubun) != "0":
             return
@@ -313,6 +356,7 @@ class KiwoomAPI(QAxWidget):
                 self._clear_position()
 
     def _clear_position(self):
+        print("🔥 _clear_position CALLED")
         self.log_system.info(f"[POS_CLEAR] code={self.position}")
         self.position = None
         self.entry_price = None
@@ -329,6 +373,7 @@ class KiwoomAPI(QAxWidget):
     # 실시간: 손절/분할익절/트레일링
     # ---------------------------
     def register_real(self, code: str):
+        print("🔥 register_real CALLED", code)
         # FID 10: 현재가
         self.dynamicCall(
             "SetRealReg(QString, QString, QString, QString)",
@@ -336,6 +381,7 @@ class KiwoomAPI(QAxWidget):
         )
 
     def _on_receive_real_data(self, code, real_type, data):
+        print("🔥 _on_receive_real_data CALLED", code, real_type)
         if real_type != "주식체결":
             return
         if self.position != code or self.entry_price is None:
@@ -390,6 +436,7 @@ class KiwoomAPI(QAxWidget):
     # 메시지(키움 서버 메시지)
     # ---------------------------
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
+        print("🔥 _on_receive_msg CALLED", screen_no, rqname, trcode, msg)
         self.log_system.info(f"[MSG] [{screen_no}] {msg}")
 
     # ---------------------------

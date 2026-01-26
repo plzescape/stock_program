@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from curses import raw
 from datetime import datetime, time
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
@@ -9,7 +10,7 @@ from config import (
     STOP_LOSS_RATE, TP1_RATE, TP1_RATIO, TP2_RATE, TP2_RATIO,
     TRAIL_START_RATE, TRAIL_GAP,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
-    CONDITION_NAME, CONDITION_INDEX,
+    CONDITION_NAME,
     SCAN_MAX_CODES, SCAN_TR_DELAY_MS, MOCK_ACCOUNT_NO
 )
 from logger_util import setup_logger
@@ -74,10 +75,6 @@ class KiwoomAPI(QAxWidget):
         self.daily_trade_count = 0
         self.traded_today: set[str] = set()
 
-        # ===== 타이머 =====
-        self.cond_timer = QTimer()
-        self.cond_timer.timeout.connect(self.run_condition_cycle)
-
         # ===== 자동매매 상태 =====
         self.auto_trade_enabled = False   # 🔥 기본 OFF
         self.self_check_retry_count = 0
@@ -141,6 +138,19 @@ class KiwoomAPI(QAxWidget):
 
     def _on_receive_condition_ver(self, ret, msg):
         self.log_system.info(f"[CONDITION_LOAD] ret={ret} msg={msg}")
+        list = self.dynamicCall("GetConditionNameList()")
+        self.log_system.info(f"[CONDITION_LIST] {list}")
+        
+        self.condition_map = {}
+        
+        for item in list.split(";"):
+            if not item:
+                continue
+            idx, name = item.split("^")
+            self.condition_map[name] = int(idx)
+
+        self.log_system.info(f"[CONDITION_MAP] {self.condition_map}")  
+        
         if self._cond_loop:
             self._cond_loop.exit()
             self._cond_loop = None
@@ -148,11 +158,6 @@ class KiwoomAPI(QAxWidget):
     # ---------------------------
     # 조건검색 주기 실행
     # ---------------------------
-    def start_condition_scheduler(self):
-        # 08:50에 실행해도, 09:00 이후에 조건검색이 자동으로 돌도록
-        self._last_condition_run = None
-        self.cond_timer.start(60 * 1000)  # 1분마다 체크(내부에서 30분 간격 제한)
-
     def run_condition_cycle(self):
         self._reset_daily_if_needed()
 
@@ -170,16 +175,22 @@ class KiwoomAPI(QAxWidget):
                 return
 
         self._last_condition_run = now
-        self.log_system.info("[CONDITION] run SendCondition")
-
-        self.dynamicCall(
+        
+        idx = self.condition_map[CONDITION_NAME]
+        result = self.dynamicCall(
             "SendCondition(QString, QString, int, int)",
-            "9000", CONDITION_NAME, CONDITION_INDEX, 0
+            "9000", CONDITION_NAME, idx, 1
         )
-
+        if result == 1:
+            print(f"{CONDITION_NAME} [Test용] 조건검색 등록 완료")
+            self.log_system.info("[CONDITION] SendCondition OK") 
+        else :
+            self.log_system.error("[CONDITION] SendCondition FAILED")   
+            
     def _on_receive_tr_condition(self, screen_no, codes, cond_name, cond_index, next):
         self.watchlist = [c for c in codes.split(";") if c]
         self.log_signal.info(f"[CONDITION_RESULT] name={cond_name} codes={self.watchlist}")
+        print(f"조건검색 결과 수신: watchlist={self.watchlist}")
 
         # 스캔 큐 구성
         self._scan_queue = [c for c in self.watchlist if c and c not in self.traded_today][:SCAN_MAX_CODES]
@@ -246,6 +257,7 @@ class KiwoomAPI(QAxWidget):
     # 스캔 루프 (조건검색 결과 종목을 순차 TR로 체크)
     # ---------------------------
     def _scan_next(self):
+        print("스캔 진행 중... 남은 종목 수:", len(self._scan_queue))
         try:
             if self.position is not None or self.ordering:
                 self._scan_running = False
@@ -274,6 +286,7 @@ class KiwoomAPI(QAxWidget):
     # 주문 (모의투자/실계좌 공통: SendOrder 사용)
     # ---------------------------
     def buy_market(self, code: str, qty: int):
+        print(f"매수 주문 시도: code={code} qty={qty}")
         if self.ordering or self.position is not None:
             return
         if qty <= 0:
@@ -297,6 +310,7 @@ class KiwoomAPI(QAxWidget):
             self.log_system.error(f"[BUY_FAIL] ret={ret}")
 
     def sell_market(self, code: str, qty: int, reason: str):
+        print(f"매도 주문 시도: code={code} qty={qty} reason={reason}")
         if qty <= 0:
             return
         ret = self.dynamicCall(
@@ -312,6 +326,7 @@ class KiwoomAPI(QAxWidget):
     # 체결(chejan) 이벤트: 상태 업데이트
     # ---------------------------
     def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
+        print(f"체결 이벤트 수신: gubun={gubun} item_cnt={item_cnt} fid_list={fid_list}")
         # gubun: 0(주문/체결), 1(잔고), 4(파생잔고) - 보통 0만으로도 충분
         if str(gubun) != "0":
             return

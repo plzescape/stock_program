@@ -26,8 +26,9 @@ MAX_TRADES_PER_DAY = 100
 CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
-CONDITION_NAME = "단타_거래대금_500억"
-CONDITION_INDEX = 0
+# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "AUTO_CANDI_KOSDAQ_SCALP"
+CONDITION_NAME = "AUTO_CANDI_KOSDAQ_SCALP"
+# CONDITION_INDEX = 0
 
 # ===== 스캔 설정 =====
 SCAN_MAX_CODES = 30        # 조건검색 결과 중 최대 몇 종목만 스캔할지

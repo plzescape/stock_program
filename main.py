@@ -118,23 +118,23 @@ def main():
     # 🔍 계좌 테스트 (월요일 아침에 꼭 한 번 실행)
     test_account(api)
 
-    # 2) 조건검색식 로드 (필수)
+    # 2) 조건검색식 로드 및 등록 - 0 : 현재 기준만, 1 : 조건 + 실시간  
     api.load_conditions()
 
     # 2-1) 장전 자가진단 (필수)
     ok = api.self_check("PRE_MARKET")
     if not ok:
         print("⚠️ 장전 self-check 실패 (재시도는 장 시작 후)")
-
+        
     # 2-2) 장 시작 후 자동매매 활성화 예약
     now = datetime.now()
     market_open = datetime.combine(now.date(), time(9, 0))
     delay_ms = max(0, int((market_open - now).total_seconds() * 1000))
 
     QTimer.singleShot(delay_ms + 3000,  lambda: enable_auto_trade(api))    
-    
-    # 3) 08:50 실행해도 09:00 이후 자동으로 조건검색이 돌도록 스케줄러 시작
-    api.start_condition_scheduler()
+    # enable_auto_trade(api)
+    # 2-3) 조건검색 실행
+    api.run_condition_cycle()
 
     sys.exit(app.exec_())
 

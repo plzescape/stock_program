@@ -132,7 +132,7 @@ def main():
     delay_ms = max(0, int((market_open - now).total_seconds() * 1000))
 
     QTimer.singleShot(delay_ms + 3000,  lambda: enable_auto_trade(api))    
-    # enable_auto_trade(api)
+    enable_auto_trade(api)
     # 2-3) 조건검색 실행
     api.run_condition_cycle()
 

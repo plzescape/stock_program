@@ -32,4 +32,4 @@ CONDITION_NAME = "AUTO_CANDI_KOSDAQ_SCALP"
 
 # ===== 스캔 설정 =====
 SCAN_MAX_CODES = 30        # 조건검색 결과 중 최대 몇 종목만 스캔할지
-SCAN_TR_DELAY_MS = 250     # 종목별 TR 요청 간 최소 딜레이(밀리초)
+SCAN_TR_DELAY_MS = 300     # 종목별 TR 요청 간 최소 딜레이(밀리초)

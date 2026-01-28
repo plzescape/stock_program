@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from curses import raw
 from datetime import datetime, time
+from multiprocessing.util import info
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
 
@@ -16,6 +17,9 @@ from config import (
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate
 
+MAX_RETRY_PER_CODE = 30
+RETRY_INTERVAL_MS = 60_000
+SCAN_CYCLE_SEC = 60
 
 class KiwoomAPI(QAxWidget):
     """키움 OpenAPI+ (OCX) 래퍼 + 모의투자 자동매매용 엔진"""
@@ -36,6 +40,7 @@ class KiwoomAPI(QAxWidget):
         self.OnReceiveTrData.connect(self._on_receive_tr_data)
         self.OnReceiveRealData.connect(self._on_receive_real_data)
         self.OnReceiveChejanData.connect(self._on_receive_chejan_data)
+        self.OnReceiveRealCondition.connect(self._on_receive_real_condition)
         self.OnReceiveMsg.connect(self._on_receive_msg)
 
         # ===== 루프 =====
@@ -47,6 +52,12 @@ class KiwoomAPI(QAxWidget):
         self._last_tr_rqname: str | None = None
         self._last_tr_trcode: str | None = None
         self._last_tr_record: str | None = None
+
+        # ===== 조건검색 맵 =====
+        self.condition_map = {}
+        self.candidates = {}   # 🔥 상태머신 핵심
+        self._scan_running = False
+        self._scan_index = 0
 
         # ===== 조건검색 상태 =====
         self.watchlist: list[str] = []
@@ -78,6 +89,14 @@ class KiwoomAPI(QAxWidget):
         # ===== 자동매매 상태 =====
         self.auto_trade_enabled = False   # 🔥 기본 OFF
         self.self_check_retry_count = 0
+
+        # ===== TR 큐 / 스캔 상태 =====
+        self.scan_queue: list[str] = []
+        self.tr_inflight: bool = False
+        self.current_scan_code: str | None = None   
+        self._screen_seq = 0     
+        self.TR_INTERVAL_MS = 300       # 실전 안정값
+        self.TR_TIMEOUT_MS  = 2000
     # ---------------------------
     # 기본 유틸
     # ---------------------------
@@ -136,12 +155,13 @@ class KiwoomAPI(QAxWidget):
         self._cond_loop = QEventLoop()
         self._cond_loop.exec_()
 
+    # ---------------------------
+    # 조건검색식 로드 완료 이벤트
+    # ---------------------------
     def _on_receive_condition_ver(self, ret, msg):
         self.log_system.info(f"[CONDITION_LOAD] ret={ret} msg={msg}")
         list = self.dynamicCall("GetConditionNameList()")
         self.log_system.info(f"[CONDITION_LIST] {list}")
-        
-        self.condition_map = {}
         
         for item in list.split(";"):
             if not item:
@@ -154,6 +174,38 @@ class KiwoomAPI(QAxWidget):
         if self._cond_loop:
             self._cond_loop.exit()
             self._cond_loop = None
+
+    # ---------------------------
+    # 실시간 조건검색 이벤트
+    # ---------------------------
+    def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
+        code = code.strip()
+
+        if event_type == "I":   # 조건 진입
+            self.log_signal.info(f"[COND_IN] {code}")
+
+            if code not in self.candidates:
+               self.candidates: dict[str, dict] = {
+                   code: {
+                       "state": "NEW",
+                       "retry": 0,
+                       "last_try": None,
+                       "added_at": datetime,
+                   }
+               }
+
+            # 스캔 중이 아니면 즉시 스캔 재개
+            if not self._scan_running:
+                self._scan_running = True
+                QTimer.singleShot(0, self._scan_next)
+
+        elif event_type == "D": # 조건 이탈
+            self.log_signal.info(f"[COND_OUT] {code}")
+
+            if code in self.candidates:
+                # 포지션 중이 아니면 제거
+                if self.position != code and not self.ordering:
+                    self.candidates.pop(code, None)
 
     # ---------------------------
     # 조건검색 주기 실행
@@ -182,61 +234,111 @@ class KiwoomAPI(QAxWidget):
             "9000", CONDITION_NAME, idx, 1
         )
         if result == 1:
-            print(f"{CONDITION_NAME} [Test용] 조건검색 등록 완료")
+            print(f"{CONDITION_NAME} 조건검색 등록 완료")
             self.log_system.info("[CONDITION] SendCondition OK") 
         else :
             self.log_system.error("[CONDITION] SendCondition FAILED")   
             
     def _on_receive_tr_condition(self, screen_no, codes, cond_name, cond_index, next):
-        self.watchlist = [c for c in codes.split(";") if c]
-        self.log_signal.info(f"[CONDITION_RESULT] name={cond_name} codes={self.watchlist}")
-        print(f"조건검색 결과 수신: watchlist={self.watchlist}")
+        new_codes = [c for c in codes.split(";") if c]
 
-        # 스캔 큐 구성
-        self._scan_queue = [c for c in self.watchlist if c and c not in self.traded_today][:SCAN_MAX_CODES]
-        if not self._scan_running:
-            self._scan_running = True
+        for code in new_codes:
+            if code not in self.candidates:
+                self.candidates[code] = {
+                    "state": "NEW",
+                    "retry": 0,
+                    "last_try": None,
+                }
+                self.scan_queue.append(code)
+                self.log_signal.info(f"[COND_IN] {code}")
+
+        # 스캔 시작 트리거
+        if not self.tr_inflight:
             QTimer.singleShot(0, self._scan_next)
 
     # ---------------------------
-    # TR: OPT10080 (3분봉) 요청/응답
+    # TR: OPT10080 (1분봉) 요청/응답
     # ---------------------------
-    def request_3min_candle_blocking(self, code: str):
+    def request_1min_candle(self, code: str):
         self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
-        self.dynamicCall("SetInputValue(QString, QString)", "틱범위", "3")
+        self.dynamicCall("SetInputValue(QString, QString)", "틱범위", "1")
         self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
 
-        self._last_tr_rqname = "RQ_3MIN"
+        self._last_tr_rqname = "RQ_1MIN"
         self._last_tr_trcode = "OPT10080"
 
-        self.dynamicCall("CommRqData(QString, QString, int, QString)",
-                         "RQ_3MIN", "OPT10080", 0, "9100")
+        screen_no = f"91{self._screen_seq}"
+        self._screen_seq += 1
 
-        self._tr_loop = QEventLoop()
-        self._tr_loop.exec_()
-        self._tr_loop = None
+        self.dynamicCall(
+            "CommRqData(QString, QString, int, QString)",
+            "RQ_1MIN", "OPT10080", 0, screen_no
+        )
 
-    def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name, prev_next,
-                            data_len, err_code, msg1, msg2):
-        # 우리가 기다리던 TR이면 loop 종료
-        if self._tr_loop is not None and rqname == self._last_tr_rqname and trcode == self._last_tr_trcode:
-            if self._tr_loop:
-                self._tr_loop.exit()
+    def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name,
+                            prev_next, data_len, err_code, msg1, msg2):
 
-    def parse_3min(self) -> list[dict]:
+        if not self.tr_inflight:
+            return
+        if rqname != "RQ_1MIN" or trcode != "OPT10080":
+            return
+
+        self._tr_timeout_timer.stop()
+
+        code = self.current_scan_code
+        candles = self.parse_1min()
+
+        info = self.candidates.get(code)
+        if not info:
+            self._finish_tr()
+            return
+
+        self.log_signal.info(
+            f"[1MIN_PARSE] {code} rows={len(candles)}"
+        )
+
+        if len(candles) < 3:
+            info["retry"] += 1
+            info["state"] = "WAIT_DATA"
+
+            # 다음 사이클에 다시 보기
+            self.scan_queue.append(code)
+
+            self._finish_tr(delay=True)
+            return
+
+        # === 전략 판단 ===
+        if is_entry_candidate(candles, self.log_signal, code):
+            self.log_signal.info(f"[ENTRY] {code}")
+            self.buy_market(code, self.total_qty)
+            info["state"] = "DONE"
+            self._finish_tr()
+            return
+
+        # 조건 불충족 → 다음 봉에서 재검사
+        info["state"] = "WAIT_DATA"
+        self.scan_queue.append(code)
+
+        self._finish_tr(delay=True)
+                
+
+    def parse_1min(self) -> list[dict]:
         # 최신봉이 index 0이 되도록 3개 추출
-        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", "OPT10080", "RQ_3MIN")
+        print("1분봉 데이터 파싱")
+        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", "OPT10080", "RQ_1MIN")
+        
         candles = []
-        for i in range(min(int(rows), 3)):
+        for i in range(rows):   # ❗ min(rows, 3) 아님
             close = self._to_int_abs(self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
-                "OPT10080", "RQ_3MIN", i, "현재가"
+                "OPT10080", "RQ_1MIN", i, "현재가"
             ))
             volume = self._to_int(self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
-                "OPT10080", "RQ_3MIN", i, "거래량"
+                "OPT10080", "RQ_1MIN", i, "거래량"
             ))
             candles.append({"close": close, "volume": volume})
+        print("1분봉 데이터 파싱 완료:", candles)            
         return candles
 
     @staticmethod
@@ -253,40 +355,54 @@ class KiwoomAPI(QAxWidget):
         except Exception:
             return 0
 
+    def _resume_scan_if_needed(self):
+        if self.position or self.ordering:
+            return
+
+        if any(info["state"] != "DONE" for info in self.candidates.values()):
+            if not self._scan_running:
+                self._scan_running = True
+                self.log_system.info("[SCAN] resumed")
+                QTimer.singleShot(0, self._scan_next)
     # ---------------------------
     # 스캔 루프 (조건검색 결과 종목을 순차 TR로 체크)
     # ---------------------------
     def _scan_next(self):
-        print("스캔 진행 중... 남은 종목 수:", len(self._scan_queue))
-        try:
-            if self.position is not None or self.ordering:
-                self._scan_running = False
-                return
+        # 이미 주문 중이거나 포지션 있으면 중단
+        if self.position or self.ordering:
+            return
 
-            if not self._scan_queue:
-                self._scan_running = False
-                return
+        if self.tr_inflight:
+            return
 
-            code = self._scan_queue.pop(0)
-            self.request_3min_candle_blocking(code)
-            candles = self.parse_3min()
+        if not self.scan_queue:
+            self.log_signal.info("[SCAN] queue empty, waiting...")
+            return
 
-            if is_entry_candidate(candles, self.log_signal, code):
-                self.log_signal.info(f"[ENTRY_PICK] code={code}")
-                self.buy_market(code, self.total_qty)
-                return  # 주문 넣으면 스캔 종료(체결 이후 실시간 관리)
-            else:
-                QTimer.singleShot(SCAN_TR_DELAY_MS, self._scan_next)
+        code = self.scan_queue.pop(0)
+        info = self.candidates.get(code)
+        if not info:
+            QTimer.singleShot(0, self._scan_next)
+            return
 
-        except Exception as e:
-            self.log_system.error(f"[SCAN_ERR] {e}")
-            self._scan_running = False
+        self.current_scan_code = code
+        self.tr_inflight = True
 
+        self.log_signal.info(
+            f"[SCAN] request {code} retry={info['retry']}"
+        )
+
+        self.request_1min_candle(code)
+
+        # ⏱ TR 타임아웃
+        self._tr_timeout_timer = QTimer()
+        self._tr_timeout_timer.setSingleShot(True)
+        self._tr_timeout_timer.timeout.connect(self._on_tr_timeout)
+        self._tr_timeout_timer.start(self.TR_TIMEOUT_MS)
     # ---------------------------
     # 주문 (모의투자/실계좌 공통: SendOrder 사용)
     # ---------------------------
     def buy_market(self, code: str, qty: int):
-        print(f"매수 주문 시도: code={code} qty={qty}")
         if self.ordering or self.position is not None:
             return
         if qty <= 0:
@@ -294,13 +410,23 @@ class KiwoomAPI(QAxWidget):
 
         self.ordering = True
         self._pending_buy_code = code
-        self._pending_buy_qty = qty
-
+        self._pending_buy_qty = int(qty)
+   
         ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            "BUY", "9200", self.get_account(),
-            1, code, qty, 0, "03", ""
+            "SendOrder",
+            [
+                "BUY",              # sRQName
+                "9200",             # sScreenNo
+                self.get_account(), # sAccNo
+                1,                  # nOrderType (1=매수)
+                code,               # sCode
+                qty,                # nQty
+                0,                  # nPrice (시장가)
+                "03",               # sHogaGb (03=시장가)
+                ""                  # sOrgOrderNo
+            ]
         )
+
         self.log_trade.info(f"[BUY_ORDER] code={code} qty={qty} ret={ret}")
 
         if ret != 0:
@@ -310,15 +436,26 @@ class KiwoomAPI(QAxWidget):
             self.log_system.error(f"[BUY_FAIL] ret={ret}")
 
     def sell_market(self, code: str, qty: int, reason: str):
-        print(f"매도 주문 시도: code={code} qty={qty} reason={reason}")
         if qty <= 0:
             return
+
         ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            "SELL", "9201", self.get_account(),
-            2, code, qty, 0, "03", ""
+            "SendOrder",
+            [
+                "SELL",
+                "9201",
+                self.get_account(),
+                2,          # 매도
+                code,
+                qty,
+                0,
+                "03",
+                ""
+            ]
         )
+
         self.log_trade.info(f"[SELL_ORDER] code={code} qty={qty} reason={reason} ret={ret}")
+
         if ret != 0:
             self.log_system.error(f"[SELL_FAIL] ret={ret} reason={reason}")
 
@@ -407,7 +544,9 @@ class KiwoomAPI(QAxWidget):
         if self.remain_qty <= 0:
             return
 
-        current = self._to_int_abs(self.dynamicCall("GetCommRealData(QString, int)", code, 10))
+        current = self._to_int_abs(
+            self.dynamicCall("GetCommRealData(QString, int)", code, 10)
+        )
         if current <= 0:
             return
 
@@ -417,38 +556,67 @@ class KiwoomAPI(QAxWidget):
 
         entry = self.entry_price
 
-        # 1) 손절 최우선
+        # 1️⃣ 손절 (최우선)
         if current <= entry * (1 - STOP_LOSS_RATE):
-            self.log_trade.info(f"[STOP_LOSS] code={code} price={current} entry={entry}")
+            self.log_trade.info(
+                f"[STOP] {code} cur={current} entry={entry}"
+            )
             self.sell_market(code, self.remain_qty, "STOP")
             return
 
-        # 2) 1차 익절
-        if (not self.tp1_done) and current >= entry * (1 + TP1_RATE):
+        # 2️⃣ 1차 익절
+        if not self.tp1_done and current >= entry * (1 + TP1_RATE):
             qty = max(1, int(self.total_qty * TP1_RATIO))
             qty = min(qty, self.remain_qty)
             self.tp1_done = True
-            self.log_trade.info(f"[TP1] code={code} price={current} qty={qty}")
+            self.log_trade.info(
+                f"[TP1] {code} cur={current} qty={qty}"
+            )
             self.sell_market(code, qty, "TP1")
             return
 
-        # 3) 2차 익절 + 트레일링 활성화
-        if self.tp1_done and (not self.tp2_done) and current >= entry * (1 + TP2_RATE):
+        # 3️⃣ 2차 익절
+        if self.tp1_done and not self.tp2_done and current >= entry * (1 + TP2_RATE):
             qty = max(1, int(self.total_qty * TP2_RATIO))
             qty = min(qty, self.remain_qty)
             self.tp2_done = True
             self.trailing_active = True
-            self.log_trade.info(f"[TP2] code={code} price={current} qty={qty} trailing_on=1")
+            self.log_trade.info(
+                f"[TP2] {code} cur={current} qty={qty}"
+            )
             self.sell_market(code, qty, "TP2")
             return
 
-        # 4) 트레일링 (남은 물량)
-        if self.trailing_active and current >= entry * (1 + TRAIL_START_RATE):
+        # 4️⃣ 트레일링 스탑 (남은 물량)
+        if self.trailing_active:
             stop_price = int(self.highest_price * (1 - TRAIL_GAP))
             if current <= stop_price:
-                self.log_trade.info(f"[TRAIL_STOP] code={code} cur={current} high={self.highest_price} stop={stop_price}")
+                self.log_trade.info(
+                    f"[TRAIL] {code} cur={current} high={self.highest_price}"
+                )
                 self.sell_market(code, self.remain_qty, "TRAIL")
                 return
+
+    def _on_tr_timeout(self):
+        code = self.current_scan_code
+        self.log_system.error(f"[TR_TIMEOUT] {code}")
+
+        info = self.candidates.get(code)
+        if info:
+            info["retry"] += 1
+            if info["retry"] < 10:
+                self.scan_queue.append(code)
+            else:
+                info["state"] = "DONE"
+
+        self._finish_tr(delay=True)
+
+    def _finish_tr(self, delay=False):
+        self.tr_inflight = False
+        self.current_scan_code = None
+
+        next_delay = self.TR_INTERVAL_MS if delay else 0
+        QTimer.singleShot(next_delay, self._scan_next)
 
     # ---------------------------
     # 메시지(키움 서버 메시지)
@@ -486,3 +654,5 @@ class KiwoomAPI(QAxWidget):
             self.auto_trade_enabled = False
             self.self_check_retry_count += 1
             return False    
+        
+        

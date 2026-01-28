@@ -324,7 +324,7 @@ class KiwoomAPI(QAxWidget):
 
     def parse_1min(self) -> list[dict]:
         # 최신봉이 index 0이 되도록 3개 추출
-        print("1분봉 데이터 파싱")
+        # print("1분봉 데이터 파싱")
         rows = self.dynamicCall("GetRepeatCnt(QString, QString)", "OPT10080", "RQ_1MIN")
         
         candles = []
@@ -338,7 +338,7 @@ class KiwoomAPI(QAxWidget):
                 "OPT10080", "RQ_1MIN", i, "거래량"
             ))
             candles.append({"close": close, "volume": volume})
-        print("1분봉 데이터 파싱 완료:", candles)            
+        # print("1분봉 데이터 파싱 완료:", candles)            
         return candles
 
     @staticmethod
@@ -413,19 +413,20 @@ class KiwoomAPI(QAxWidget):
         self._pending_buy_qty = int(qty)
    
         ret = self.dynamicCall(
-            "SendOrder",
+            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [
-                "BUY",              # sRQName
-                "9200",             # sScreenNo
-                self.get_account(), # sAccNo
-                1,                  # nOrderType (1=매수)
-                code,               # sCode
-                qty,                # nQty
-                0,                  # nPrice (시장가)
-                "03",               # sHogaGb (03=시장가)
-                ""                  # sOrgOrderNo
+            "BUY",
+            "9200",
+            self.get_account(),
+            1,          # 매수
+            code,
+            qty,
+            0,          # 시장가 → 반드시 0
+            "03",       # 시장가
+            ""
             ]
         )
+
 
         self.log_trade.info(f"[BUY_ORDER] code={code} qty={qty} ret={ret}")
 
@@ -438,21 +439,22 @@ class KiwoomAPI(QAxWidget):
     def sell_market(self, code: str, qty: int, reason: str):
         if qty <= 0:
             return
-
+        
         ret = self.dynamicCall(
-            "SendOrder",
+            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [
-                "SELL",
-                "9201",
-                self.get_account(),
-                2,          # 매도
-                code,
-                qty,
-                0,
-                "03",
-                ""
+            "SELL",
+            "9100",
+            self.get_account(),
+            2,          # 매도
+            code,
+            qty,
+            0,          # 시장가 → 반드시 0
+            "03",       # 시장가
+            ""
             ]
         )
+
 
         self.log_trade.info(f"[SELL_ORDER] code={code} qty={qty} reason={reason} ret={ret}")
 

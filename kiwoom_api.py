@@ -1,9 +1,13 @@
+# Refactored Kiwoom OpenAPI+ engine
+# - Multi-position (MAX 3)
+# - PositionState based
+# - Safe scan resume/stop
+# - Per-position STOP / TP / TRAIL
+
 from __future__ import annotations
 
-import code
-from curses import raw
+from dataclasses import dataclass
 from datetime import datetime, time
-from multiprocessing.util import info
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
 import time as pytime
@@ -11,37 +15,41 @@ import time as pytime
 from config import (
     IS_REAL, ACCOUNT_NO, QTY,
     STOP_LOSS_RATE, TP1_RATE, TP1_RATIO, TP2_RATE, TP2_RATIO,
-    TRAIL_START_RATE, TRAIL_GAP,
+    TRAIL_GAP,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
-    CONDITION_NAME,
-    SCAN_MAX_CODES, SCAN_TR_DELAY_MS, MOCK_ACCOUNT_NO
+    CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate
 
-MAX_RETRY_PER_CODE = 30
-RETRY_INTERVAL_MS = 60_000
-SCAN_CYCLE_SEC = 60
+MAX_POSITIONS = 3
+
+
+@dataclass
+class PositionState:
+    code: str
+    entry_price: int
+    highest_price: int
+    total_qty: int
+    remain_qty: int
+    tp1_done: bool = False
+    tp2_done: bool = False
+    trailing_active: bool = False
+    ordering: bool = False
+    selling: bool = False
+
 
 class KiwoomAPI(QAxWidget):
-    """키움 OpenAPI+ (OCX) 래퍼 + 모의투자 자동매매용 엔진"""
-
     def __init__(self):
         super().__init__()
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
 
-        # ===== 주문 타임아웃 감시 타이머 =====
-        self._order_watchdog = QTimer()
-        self._order_watchdog.setInterval(500)  # 0.5초마다 체크
-        self._order_watchdog.timeout.connect(self.check_order_timeout)
-        self._order_watchdog.start()
-
-        # ===== 로그 =====
+        # ---- logger ----
         self.log_system = setup_logger("system", "system.log")
-        self.log_trade  = setup_logger("trade",  "trade.log")
+        self.log_trade = setup_logger("trade", "trade.log")
         self.log_signal = setup_logger("signal", "signal.log")
 
-        # ===== 이벤트 연결 =====
+        # ---- events ----
         self.OnEventConnect.connect(self._on_event_connect)
         self.OnReceiveConditionVer.connect(self._on_receive_condition_ver)
         self.OnReceiveTrCondition.connect(self._on_receive_tr_condition)
@@ -51,123 +59,133 @@ class KiwoomAPI(QAxWidget):
         self.OnReceiveRealCondition.connect(self._on_receive_real_condition)
         self.OnReceiveMsg.connect(self._on_receive_msg)
 
-        # ===== 루프 =====
-        self._login_loop: QEventLoop | None = None
-        self._cond_loop: QEventLoop | None = None
-        self._tr_loop: QEventLoop | None = None
+        # ---- loops ----
+        self._login_loop = None
+        self._cond_loop = None
 
-        # ===== TR 상태 =====
-        self._last_tr_rqname: str | None = None
-        self._last_tr_trcode: str | None = None
-        self._last_tr_record: str | None = None
-
-        # ===== 주문 상태 =====
-        self.selling = False
-
-        # ===== 조건검색 맵 =====
-        self.condition_map = {}
-        self.candidates = {}   # 🔥 상태머신 핵심
-        self._scan_running = False
-        self._scan_index = 0
-
-        # ===== 조건검색 상태 =====
-        self.watchlist: list[str] = []
-        self._scan_queue: list[str] = []
-        self._scan_running: bool = False
-        self._last_condition_run = None  # datetime
-
-        # ===== 주문/포지션 상태 =====
-        self.position: str | None = None
-        self.entry_price: int | None = None
-        self.highest_price: int = 0
-        self.total_qty: int = QTY
-        self.remain_qty: int = 0
-
-        self.tp1_done: bool = False
-        self.tp2_done: bool = False
-        self.trailing_active: bool = False
-
-        self.ordering: bool = False
-        self._pending_buy_code: str | None = None
-        self._pending_buy_qty: int = 0
-        self._pending_sell_qty: int = 0
+        # ---- trading state ----
+        self.positions: dict[str, PositionState] = {}
+        self.ordering = False
+        self._pending_buy_code = None
+        self._pending_buy_qty = 0
+        self.last_order_ts = None
 
         # ===== 일일 제한 =====
         self._today = datetime.now().date()
         self.daily_trade_count = 0
-        self.traded_today: set[str] = set()
+        self.traded_today = set()
 
-        # ===== 자동매매 상태 =====
-        self.auto_trade_enabled = False   # 🔥 기본 OFF
-        self.self_check_retry_count = 0
-
-        # ===== TR 큐 / 스캔 상태 =====
+        # ---- scan ----
+        self.condition_map = {}
+        self.candidates = {}
         self.scan_queue: list[str] = []
-        self.tr_inflight: bool = False
-        self.current_scan_code: str | None = None   
-        self._screen_seq = 0     
-        self.TR_INTERVAL_MS = 300       # 실전 안정값
-        self.TR_TIMEOUT_MS  = 2000
-    # ---------------------------
-    # 기본 유틸
-    # ---------------------------
-    # 1.일일 초기화
-    def _reset_daily_if_needed(self):
-        if not self.auto_trade_enabled:   # 🔥 추가
-            return
+        self._scan_running = False
+        self.tr_inflight = False
+        self.current_scan_code = None
+        self._screen_seq = 0
+        self.TR_TIMEOUT_MS = 2000
+
+    # ==================================================
+    # Login / condition
+    # ==================================================
+    def run_condition_cycle(self):
+        """
+        조건검색 주기 실행
+        - MAX_POSITIONS 미만일 때만 실행
+        - 일일 거래 횟수 제한
+        - 시장 시간 / 진입 시간 방어
+        """
+        # 일일 리셋
         today = datetime.now().date()
         if today != self._today:
             self._today = today
             self.daily_trade_count = 0
             self.traded_today.clear()
-            self.log_system.info("[DAILY_RESET] counters cleared")
 
-    # 2.계좌 정보 조회
-    def get_account(self) -> str:
-        accs = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
-        accounts = [a.strip() for a in accs.split(";") if a.strip()]
-    
-        if not accounts:
-            raise RuntimeError("계좌 없음")
-    
-        if IS_REAL:
-            if not ACCOUNT_NO.strip():
-                raise RuntimeError("IS_REAL=True 인데 ACCOUNT_NO 비어 있음")
-            return ACCOUNT_NO.strip()
-    
-        # 🔒 모의투자: 지정한 계좌만 사용
-        if MOCK_ACCOUNT_NO not in accounts:
-            raise RuntimeError(
-                f"🚨 설정된 모의계좌({MOCK_ACCOUNT_NO})가 로그인 계좌 목록에 없음"
-            )
-    
-        return MOCK_ACCOUNT_NO
+        # 포지션 가득 차면 조건검색 중단
+        if len(self.positions) >= MAX_POSITIONS:
+            return
 
-    # 3.신규진입 가능 시간대 판단
-    def now_can_enter(self) -> bool:
-        # 너무 이른/늦은 시간 신규진입 차단 (원하면 조정)
+        # 일일 거래 제한
+        if self.daily_trade_count >= MAX_TRADES_PER_DAY:
+            return
+
+        # 시장 시간 방어
+        if not is_market_time():
+            return
+
+        # 너무 늦은 시간 신규 진입 방지 (14:50 이후 차단)
         t = datetime.now().time()
-        return time(9, 0) <= t <= time(14, 50)
+        if t > time(14, 50):
+            return
 
-    # ---------------------------
-    # 주문 타임아웃 체크
-    # ---------------------------
-    def check_order_timeout(self, timeout_sec: int = 10):
-        if not IS_REAL:
+        # 조건검색 주기 제한
+        now = datetime.now()
+        if hasattr(self, "_last_condition_run") and self._last_condition_run:
+            diff = (now - self._last_condition_run).total_seconds() / 60.0
+            if diff < CONDITION_INTERVAL_MIN:
+                return
+        self._last_condition_run = now
+
+        idx = self.condition_map.get(CONDITION_NAME)
+        if idx is None:
+            self.log_system.error(f"[CONDITION] not found: {CONDITION_NAME}")
             return
-        if not self.ordering:
-            return
-        if self.last_order_ts is None:
-            return   # 이미 체결됨 → timeout 금지
-        if pytime.time() - self.last_order_ts >= timeout_sec:
+
+        ret = self.dynamicCall(
+            "SendCondition(QString, QString, int, int)",
+            "9000", CONDITION_NAME, idx, 1
+        )
+
+        if ret == 1:
+            self.log_system.info("[CONDITION] SendCondition OK")
+        else:
+            self.log_system.error("[CONDITION] SendCondition FAILED")
+
+
+    def self_check(self, phase: str) -> bool:
+        """
+        매매 전/중 상태 점검
+        - 계좌
+        - 포지션 상태 일관성
+        - 주문 플래그
+        """
+        try:
+            self.log_system.info(f"[SELF_CHECK_START] phase={phase}")
+
+            # 계좌 확인
+            acc = self.get_account()
+            if not acc:
+                raise RuntimeError("계좌 없음")
+
+            # 포지션 수 초과 방지
+            if len(self.positions) > MAX_POSITIONS:
+                raise RuntimeError("포지션 수 초과")
+
+            # 포지션 상태 검증
+            for code, pos in self.positions.items():
+                if pos.remain_qty <= 0:
+                    raise RuntimeError(f"잔여수량 0 code={code}")
+                if pos.entry_price <= 0:
+                    raise RuntimeError(f"entry_price 오류 code={code}")
+
+            # 주문 중인데 타임스탬프 없는 경우
+            if self.ordering and self.last_order_ts is None:
+                raise RuntimeError("ordering 상태 불일치")
+
+            self.log_system.info(f"[SELF_CHECK_OK] phase={phase}")
+            return True
+
+        except Exception as e:
             self.log_system.error(
-                "[ORDER_TIMEOUT] no chejan event → force release"
+                f"[SELF_CHECK_FAIL] phase={phase} reason={e}"
             )
-            self._force_release_order()
+            return False
 
-    # ---------------------------
-    # 로그인 / 조건검색 로드
-    # ---------------------------
+
+# ==================================================
+# Login / condition
+    # ==================================================
     def login(self):
         self.dynamicCall("CommConnect()")
         self._login_loop = QEventLoop()
@@ -180,667 +198,331 @@ class KiwoomAPI(QAxWidget):
             self._login_loop = None
 
     def load_conditions(self):
-        # 조건검색식 사용하려면 필수
         self.dynamicCall("GetConditionLoad()")
         self._cond_loop = QEventLoop()
         self._cond_loop.exec_()
 
-    # ---------------------------
-    # 조건검색식 로드 완료 이벤트
-    # ---------------------------
     def _on_receive_condition_ver(self, ret, msg):
-        self.log_system.info(f"[CONDITION_LOAD] ret={ret} msg={msg}")
-        list = self.dynamicCall("GetConditionNameList()")
-        self.log_system.info(f"[CONDITION_LIST] {list}")
-        
-        for item in list.split(";"):
+        conds = self.dynamicCall("GetConditionNameList()")
+        for item in conds.split(";"):
             if not item:
                 continue
             idx, name = item.split("^")
             self.condition_map[name] = int(idx)
-
-        self.log_system.info(f"[CONDITION_MAP] {self.condition_map}")  
-        
         if self._cond_loop:
             self._cond_loop.exit()
             self._cond_loop = None
 
-    # ---------------------------
-    # 실시간 조건검색 이벤트
-    # ---------------------------
-    def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
-        code = code.strip()
-
-        if event_type == "I":   # 조건 진입
-            self.log_signal.info(f"[COND_IN] {code}")
-
-            if code not in self.candidates:
-               self.candidates: dict[str, dict] = {
-                   code: {
-                       "state": "NEW",
-                       "retry": 0,
-                       "last_try": None,
-                       "added_at": datetime.now(),
-                   }
-               }
-
-            # 스캔 중이 아니면 즉시 스캔 재개
-            if not self._scan_running:
-                self._scan_running = True
-                QTimer.singleShot(0, self._scan_next)
-
-        elif event_type == "D": # 조건 이탈
-            self.log_signal.info(f"[COND_OUT] {code}")
-
-            if code in self.candidates:
-                # 포지션 중이 아니면 제거
-                if self.position != code and not self.ordering:
-                    self.candidates.pop(code, None)
-
-    # ---------------------------
-    # 조건검색 주기 실행
-    # ---------------------------
-    def run_condition_cycle(self):
-        self._reset_daily_if_needed()
-
-        if self.position is not None or self.ordering:
-            return
-        if not self.now_can_enter():
-            return
-        if self.daily_trade_count >= MAX_TRADES_PER_DAY:
-            return
-
-        now = datetime.now()
-        if self._last_condition_run is not None:
-            diff_min = (now - self._last_condition_run).total_seconds() / 60.0
-            if diff_min < CONDITION_INTERVAL_MIN:
-                return
-
-        self._last_condition_run = now
-        
-        idx = self.condition_map[CONDITION_NAME]
-        result = self.dynamicCall(
-            "SendCondition(QString, QString, int, int)",
-            "9000", CONDITION_NAME, idx, 1
-        )
-        if result == 1:
-            print(f"{CONDITION_NAME} 조건검색 등록 완료")
-            self.log_system.info("[CONDITION] SendCondition OK") 
-        else :
-            self.log_system.error("[CONDITION] SendCondition FAILED")   
-            
-    def _on_receive_tr_condition(self, screen_no, codes, cond_name, cond_index, next):
-        new_codes = [c for c in codes.split(";") if c]
-
-        for code in new_codes:
-            if code not in self.candidates:
-                self.candidates[code] = {
-                    "state": "NEW",
-                    "retry": 0,
-                    "last_try": None,
-                }
-                self.scan_queue.append(code)
-                self.log_signal.info(f"[COND_IN] {code}")
-
-        # 스캔 시작 트리거
-        if not self.tr_inflight:
-            QTimer.singleShot(0, self._scan_next)
-
-    # ---------------------------
-    # TR: OPT10080 (1분봉) 요청/응답
-    # ---------------------------
-    def request_1min_candle(self, code: str):
-        self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
-        self.dynamicCall("SetInputValue(QString, QString)", "틱범위", "1")
-        self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-
-        self._last_tr_rqname = "RQ_1MIN"
-        self._last_tr_trcode = "OPT10080"
-
-        screen_no = f"91{self._screen_seq}"
-        self._screen_seq += 1
-
-        self.dynamicCall(
-            "CommRqData(QString, QString, int, QString)",
-            "RQ_1MIN", "OPT10080", 0, screen_no
-        )
-
-    def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name,
-                            prev_next, data_len, err_code, msg1, msg2):
-
-        if not self.tr_inflight:
-            return
-        if rqname != "RQ_1MIN" or trcode != "OPT10080":
-            return
-
-        self._tr_timeout_timer.stop()
-
-        code = self.current_scan_code
-        candles = self.parse_1min()
-
-        info = self.candidates.get(code)
-        if not info:
-            self._finish_tr()
-            return
-
-        self.log_signal.info(
-            f"[1MIN_PARSE] {code} rows={len(candles)}"
-        )
-
-        if len(candles) < 3:
-            info["retry"] += 1
-            info["state"] = "WAIT_DATA"
-
-            # 다음 사이클에 다시 보기
-            self.scan_queue.append(code)
-
-            self._finish_tr(delay=True)
-            return
-
-        # === 전략 판단 ===
-        if is_entry_candidate(candles, self.log_signal, code):
-            self.log_signal.info(f"[ENTRY] {code}")
-            # self.buy_market(code, self.total_qty)
-            self.send_market_order(side = "BUY", code = code, qty = self.total_qty, reason = "ENTRY")
-            info["state"] = "DONE"
-            self._finish_tr()
-            return
-
-        # 조건 불충족 → 다음 봉에서 재검사
-        info["state"] = "WAIT_DATA"
-        self.scan_queue.append(code)
-
-        self._finish_tr(delay=True)
-                
-
-    def parse_1min(self) -> list[dict]:
-        # 최신봉이 index 0이 되도록 3개 추출
-        # print("1분봉 데이터 파싱")
-        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", "OPT10080", "RQ_1MIN")
-        
-        candles = []
-        for i in range(min(rows, 3)):   # ❗ min(rows, 3) 아님
-            close = self._to_int_abs(self.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                "OPT10080", "RQ_1MIN", i, "현재가"
-            ))
-            volume = self._to_int(self.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                "OPT10080", "RQ_1MIN", i, "거래량"
-            ))
-            candles.append({"close": close, "volume": volume})
-        # print("1분봉 데이터 파싱 완료:", candles)            
-        return candles
-
-    @staticmethod
-    def _to_int(x) -> int:
-        try:
-            return int(str(x).strip() or "0")
-        except Exception:
-            return 0
-
-    @staticmethod
-    def _to_int_abs(x) -> int:
-        try:
-            return abs(int(str(x).strip() or "0"))
-        except Exception:
-            return 0
-
-    def _resume_scan_if_needed(self):
-        if self.position or self.ordering:
-            return
-
-        if any(info["state"] != "DONE" for info in self.candidates.values()):
-            if not self._scan_running:
-                self._scan_running = True
-                self.log_system.info("[SCAN] resumed")
-                QTimer.singleShot(0, self._scan_next)
-    # ---------------------------
-    # 스캔 루프 (조건검색 결과 종목을 순차 TR로 체크)
-    # ---------------------------
+    # ==================================================
+    # Scan control
+    # ==================================================
     def _scan_next(self):
-        # 이미 주문 중이거나 포지션 있으면 중단
-        if self.position or self.ordering:
+        if len(self.positions) >= MAX_POSITIONS:
+            self._scan_running = False
             return
-
         if self.tr_inflight:
             return
-
         if not self.scan_queue:
-            self.log_signal.info("[SCAN] queue empty, waiting...")
+            self._scan_running = False
             return
 
         code = self.scan_queue.pop(0)
-        info = self.candidates.get(code)
-        if not info:
+        if code in self.positions:
             QTimer.singleShot(0, self._scan_next)
             return
 
         self.current_scan_code = code
         self.tr_inflight = True
+        self.request_1min(code)
 
-        self.log_signal.info(
-            f"[SCAN] request {code} retry={info['retry']}"
-        )
-
-        self.request_1min_candle(code)
-
-        # ⏱ TR 타임아웃
         self._tr_timeout_timer = QTimer()
         self._tr_timeout_timer.setSingleShot(True)
         self._tr_timeout_timer.timeout.connect(self._on_tr_timeout)
         self._tr_timeout_timer.start(self.TR_TIMEOUT_MS)
 
-    def _force_release_order(self):
-        self.log_system.warning("[ORDER_RELEASE] force clear ordering state")
-    
-        self.ordering = False
-        self._pending_buy_code = None
-        self._pending_buy_qty = 0
-      
-    # ---------------------------
-    # 주문 (모의투자/실계좌 공통: SendOrder 사용)
-    # ---------------------------
-    def send_market_order(
-        self,
-        side: str,          # "BUY" | "SELL"
-        code: str,          # 종목코드
-        qty: int,
-        reason: str = ""
-    ) -> bool:
-        """
-        시장가 전용 SendOrder 래퍼
-        """
-
-        # --------------------
-        # 기본 방어
-        # --------------------
-        if qty <= 0:
-            self.log_system.error(
-                f"[ORDER_ABORT] side={side} code={code} qty={qty}"
-            )
-            return False
-
-        if side not in ("BUY", "SELL"):
-            self.log_system.error(f"[ORDER_ABORT] invalid side={side}")
-            return False
-
-        # 장마감 방어 (시장가 only)
-        from strategy import is_market_time
-        if not is_market_time():
-            self.log_system.warning(
-                f"[ORDER_BLOCK] market closed side={side} code={code}"
-            )
-            return False
-
-        order_type = 1 if side == "BUY" else 2
-        screen_no = "9200" if side == "BUY" else "9100"
-
-        # --------------------
-        # 주문 상태 기록
-        # --------------------
-        self.ordering = True
-        self.last_order_ts = pytime.time()
-
-        if side == "BUY":
-            self._pending_buy_code = code
-            self._pending_buy_qty = qty
-        else:
-            self._pending_sell_qty = qty
-
-        # --------------------
-        # SendOrder (강제 시그니처)
-        # --------------------
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [
-                side,
-                screen_no,
-                self.get_account(),
-                order_type,
-                code,
-                int(qty),
-                0,          # 시장가 → 가격 0
-                "03",       # 시장가
-                ""
-            ]
-        )
-
-        # --------------------
-        # 강제 로그
-        # --------------------
-        self.log_trade.info(
-            f"[ORDER_SEND] side={side} code={code} qty={qty} "
-            f"reason={reason} ret={ret}"
-        )
-
-        # --------------------
-        # 결과 판정
-        # --------------------
-        if ret is None:
-            self.log_system.critical(
-                f"[ORDER_FATAL] SendOrder returned None "
-                f"side={side} code={code}"
-            )
-            self._force_release_order()
-            return False
-
-        if ret != 0:
-            self.log_system.error(
-                f"[ORDER_FAIL] ret={ret} side={side} code={code}"
-            )
-            if side == "SELL":
-                self.selling = False
-            self._force_release_order()
-            return False
-
-        # ret == 0 → 접수 성공
-        return True    
-    
-    def buy_market(self, code: str, qty: int):
-        if self.ordering or self.position is not None:
+    def _resume_scan_if_possible(self):
+        if len(self.positions) >= MAX_POSITIONS:
             return
-        if qty <= 0:
+        if not self.scan_queue:
             return
+        if not self._scan_running:
+            self._scan_running = True
+            QTimer.singleShot(0, self._scan_next)
 
-        self.ordering = True
-        self._pending_buy_code = code
-        self._pending_buy_qty = int(qty)
-   
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [
-            "BUY",
-            "9200",
-            self.get_account(),
-            1,          # 매수
-            code,
-            qty,
-            0,          # 시장가 → 반드시 0
-            "03",       # 시장가
-            ""
-            ]
-        )
+    # ==================================================
+    # TR
+    # ==================================================
+    def request_1min(self, code):
+        self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
+        self.dynamicCall("SetInputValue(QString, QString)", "틱범위", "1")
+        self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
+        screen = f"91{self._screen_seq}"
+        self._screen_seq += 1
+        self.dynamicCall("CommRqData(QString, QString, int, QString)",
+                         "RQ_1MIN", "OPT10080", 0, screen)
 
-
-        self.log_trade.info(f"[BUY_ORDER] code={code} qty={qty} ret={ret}")
-
-        if ret != 0:
-            self.ordering = False
-            self._pending_buy_code = None
-            self._pending_buy_qty = 0
-            self.log_system.error(f"[BUY_FAIL] ret={ret}")
-
-    def sell_market(self, code: str, qty: int, reason: str):
-        if qty <= 0:
+    def _on_receive_tr_data(self, *args):
+        if not self.tr_inflight:
             return
         
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [
-            "SELL",
-            "9100",
-            self.get_account(),
-            2,          # 매도
-            code,
-            qty,
-            0,          # 시장가 → 반드시 0
-            "03",       # 시장가
-            ""
-            ]
+        if hasattr(self, "_tr_timeout_timer"):
+            self._tr_timeout_timer.stop()
+        
+        code = self.current_scan_code
+        candles = self.parse_1min()
+        self.tr_inflight = False
+        self.current_scan_code = None
+
+        info = self.candidates.get(code)
+        if info is None:
+            self._finish_tr(delay=True)
+            return
+
+        # === ENTRY 성공 ===
+        if len(candles) >= 3 and is_entry_candidate(candles, self.log_signal, code):
+            if len(self.positions) < MAX_POSITIONS:
+                self.send_market_order("BUY", code, QTY, "ENTRY")
+            info["state"] = "DONE"
+            self._finish_tr(delay=True)
+            return
+        
+        # === ENTRY 실패 ===
+        info["retry"] += 1
+        info["last_try"] = datetime.now()
+        info["state"] = "WAIT"
+        
+        # ⭐ 핵심: 다시 큐에 넣기 (지연 없이 바로 다음 스캔)
+        self.scan_queue.append(code)    
+        
+        print("Finishing TR for code:", code)
+        self._finish_tr(delay=True)
+
+    def _on_tr_timeout(self):
+        self.tr_inflight = False
+        self.current_scan_code = None
+        QTimer.singleShot(0, self._scan_next)
+
+    def _finish_tr(self, delay=True):
+        self.tr_inflight = False
+        self.current_scan_code = None
+        QTimer.singleShot(
+            SCAN_TR_DELAY_MS if delay else 0,
+            self._scan_next
         )
-
-
-        self.log_trade.info(f"[SELL_ORDER] code={code} qty={qty} reason={reason} ret={ret}")
-
-        if ret != 0:
-            self.log_system.error(f"[SELL_FAIL] ret={ret} reason={reason}")
 
     # ---------------------------
     # 체결(chejan) 이벤트: 상태 업데이트
     # ---------------------------
     def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
-        # 디버그용
-
-    
-        # 주문/체결 이벤트만 처리
         if str(gubun) != "0":
             return
-    
-        # ---- 종목코드 ----
-        raw_code = str(self.dynamicCall("GetChejanData(int)", 9001)).strip()
-        code = raw_code.replace("A", "").strip()
-        # if not code:
-        #     return
-    
-        # ---- 체결 정보 ----
-        filled_price = self._to_int_abs(
-            self.dynamicCall("GetChejanData(int)", 910)
-        )
-        filled_qty = self._to_int(
-            self.dynamicCall("GetChejanData(int)", 911)
-        )
-
-        print(f"체결 이벤트 수신: gubun={gubun} item_cnt={item_cnt}, code={code} price={filled_price} qty={filled_qty}")    
-        # 체결 수량이 없으면 무시
-        if filled_qty <= 0 or not code:
+        code = str(self.dynamicCall("GetChejanData(int)", 9001)).replace("A", "").strip()
+        qty = int(str(self.dynamicCall("GetChejanData(int)", 911)).strip() or 0)
+        price = abs(int(str(self.dynamicCall("GetChejanData(int)", 910)).strip() or 0))
+        if qty <= 0:
             return
-    
-        # ---- 주문 구분 ----
-        order_gubun = str(
-            self.dynamicCall("GetChejanData(int)", 905)
-        ).strip()   # "매수" / "매도"
-    
-        self.log_trade.info(
-            f"[CHEJAN] {order_gubun} code={code} price={filled_price} qty={filled_qty}"
-        )
-    
-        # ====================
-        # 매수 체결
-        # ====================
-        if "매수" in order_gubun and self._pending_buy_code == code:
-            if self.position is None:
-                self.position = code
-                self.entry_price = filled_price if filled_price > 0 else filled_price
-                self.highest_price = self.entry_price
-                self.remain_qty = 0
-                self.tp1_done = False
-                self.tp2_done = False
-                self.trailing_active = False
-                self.last_order_ts = None   # ⭐ watchdog 종료 신호
-                
+        order_gubun = str(self.dynamicCall("GetChejanData(int)", 905))
+
+        # BUY
+        if "매수" in order_gubun:
+            pos = self.positions.get(code)
+            if pos is None:
+                pos = PositionState(code, price, price, QTY, 0, ordering=True)
+                self.positions[code] = pos
                 self.register_real(code)
-    
-            self.remain_qty += filled_qty
-    
-            if self.remain_qty >= self._pending_buy_qty:
+            pos.remain_qty += qty
+            if pos.remain_qty >= pos.total_qty:
+                pos.ordering = False
                 self.ordering = False
-                self._pending_buy_code = None
-                self._pending_buy_qty = 0
+                self.last_order_ts = None
                 self.daily_trade_count += 1
-    
             return
-    
-        # ====================
-        # 매도 체결
-        # ====================
-        if "매도" in order_gubun and self.position == code:
-            self.remain_qty = max(0, self.remain_qty - filled_qty)
-    
-            if self.remain_qty == 0:
-                self.selling = False
+
+        # SELL
+        if "매도" in order_gubun:
+            pos = self.positions.get(code)
+            if not pos:
+                return
+            pos.remain_qty = max(0, pos.remain_qty - qty)
+            pos.selling = False
+            if pos.remain_qty == 0:
+                self.positions.pop(code, None)
                 self.traded_today.add(code)
-                self._clear_position()
+                self._resume_scan_if_possible()
 
-    def _clear_position(self):
-        self.log_system.info(f"[POS_CLEAR] code={self.position}")
-        self.position = None
-        self.entry_price = None
-        self.highest_price = 0
-        self.remain_qty = 0
-        self.tp1_done = False
-        self.tp2_done = False
-        self.trailing_active = False
-        self.ordering = False
-        self._pending_buy_code = None
-        self._pending_buy_qty = 0
-
-    # ---------------------------
-    # 실시간: 손절/분할익절/트레일링
-    # ---------------------------
-    def register_real(self, code: str):
-        # FID 10: 현재가
-        self.dynamicCall(
-            "SetRealReg(QString, QString, QString, QString)",
-            "9300", code, "10", "0"
-        )
-
+    # ==================================================
+    # Real-time (STOP / TP / TRAIL)
+    # ==================================================
     def _on_receive_real_data(self, code, real_type, data):
-      
         if real_type != "주식체결":
             return
-        if self.position != code or self.entry_price is None:
+        pos = self.positions.get(code)
+        if not pos or pos.remain_qty <= 0:
             return
-        if self.remain_qty <= 0:
+        cur = abs(int(self.dynamicCall("GetCommRealData(QString, int)", code, 10) or 0))
+        if cur <= 0:
             return
 
-        current = self._to_int_abs(
-            self.dynamicCall("GetCommRealData(QString, int)", code, 10)
+        if cur > pos.highest_price:
+            pos.highest_price = cur
+
+        entry = pos.entry_price
+
+        # STOP
+        if cur <= entry * (1 - STOP_LOSS_RATE) and not pos.selling:
+            pos.selling = True
+            self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+            return
+
+        # TP1
+        if not pos.tp1_done and cur >= entry * (1 + TP1_RATE) and not pos.selling:
+            qty = min(pos.remain_qty, max(1, int(pos.total_qty * TP1_RATIO)))
+            pos.tp1_done = True
+            pos.selling = True
+            self.send_market_order("SELL", code, qty, "TP1")
+            return
+
+        # TP2
+        if pos.tp1_done and not pos.tp2_done and cur >= entry * (1 + TP2_RATE) and not pos.selling:
+            qty = min(pos.remain_qty, max(1, int(pos.total_qty * TP2_RATIO)))
+            pos.tp2_done = True
+            pos.trailing_active = True
+            pos.selling = True
+            self.send_market_order("SELL", code, qty, "TP2")
+            return
+
+        # TRAIL
+        if pos.trailing_active and not pos.selling:
+            stop = int(pos.highest_price * (1 - TRAIL_GAP))
+            if cur <= stop:
+                pos.trailing_active = False
+                pos.selling = True
+                self.send_market_order("SELL", code, pos.remain_qty, "TRAIL_STOP")
+
+    # ==================================================
+    # Order wrapper
+    # ==================================================
+    def send_market_order(self, side, code, qty, reason=""):
+        if qty <= 0 or not is_market_time():
+            return False
+        order_type = 1 if side == "BUY" else 2
+        screen = "9200" if side == "BUY" else "9100"
+        self.ordering = True
+        self.last_order_ts = pytime.time()
+        if side == "BUY":
+            self._pending_buy_code = code
+            self._pending_buy_qty = qty
+        ret = self.dynamicCall(
+            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+            [side, screen, self.get_account(), order_type, code, qty, 0, "03", ""]
         )
-        if current <= 0:
-            return
+        if ret != 0:
+            self.ordering = False
+            pos = self.positions.get(code)
+            if pos:
+                pos.selling = False
+            return False
+        return True
 
-        # self.log_trade.info(
-        #     f"[REAL] code={code} type={real_type}, position={self.position}, entry_price={self.entry_price}"
-        # ) 
+    # ==================================================
+    # Utils
+    # ==================================================
+    def register_real(self, code):
+        self.dynamicCall("SetRealReg(QString, QString, QString, QString)",
+                         "9300", code, "10", "0")
 
-        # 최고가 갱신
-        if current > self.highest_price:
-            self.highest_price = current
+    def parse_1min(self):
+        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", "OPT10080", "RQ_1MIN")
+        candles = []
+        for i in range(min(rows, 3)):
+            close = abs(int(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                "OPT10080", "RQ_1MIN", i, "현재가"
+            ) or 0))
+            vol = int(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                "OPT10080", "RQ_1MIN", i, "거래량"
+            ) or 0)
+            candles.append({"close": close, "volume": vol})
+        return candles
 
-        entry = self.entry_price
+    def get_account(self):
+        accs = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+        accounts = [a for a in accs.split(";") if a]
+        if IS_REAL:
+            return ACCOUNT_NO
+        return MOCK_ACCOUNT_NO
 
-        # 1️⃣ 손절 (최우선)
-        if current <= entry * (1 - STOP_LOSS_RATE):
-            if self.selling:
+    def _on_receive_tr_condition(
+        self,
+        screen_no: str,
+        codes: str,
+        cond_name: str,
+        cond_index: int,
+        next: int
+    ):
+        """
+        조건검색 결과 수신 (일괄)
+        - codes: '005930;000660;...' 형태
+        """
+
+        new_codes = [c for c in codes.split(";") if c]
+
+        for code in new_codes:
+            # 이미 포지션 있으면 무시
+            if code in self.positions:
+                continue
+
+            # 이미 후보에 있으면 무시
+            if code in self.candidates:
+                continue
+
+            # 후보 등록
+            self.candidates[code] = {
+                "state": "NEW",
+                "retry": 0,
+                "added_at": datetime.now(),
+            }
+
+            self.scan_queue.append(code)
+            self.log_signal.info(f"[COND_IN] {code}")
+
+        # 🔥 스캔 트리거 조건
+        if (
+            len(self.positions) < MAX_POSITIONS
+            and not self._scan_running
+            and self.scan_queue
+        ):
+            self._scan_running = True
+            self.log_signal.info("[SCAN_TRIGGER] by TR_CONDITION")
+            QTimer.singleShot(0, self._scan_next)
+
+
+    def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
+        code = code.strip()
+
+        if event_type == "I":  # 조건 진입
+            if code in self.positions:
                 return
-            self.selling = True
-            self.log_trade.info(
-                f"[STOP] {code} cur={current} entry={entry}"
-            )
-            # self.sell_market(code, self.remain_qty, "STOP")
-            self.send_market_order(side = "SELL", code = code, qty = self.remain_qty, reason = "STOP_LOSS")
-            return
-
-        # 2️⃣ 1차 익절
-        if not self.tp1_done and current >= entry * (1 + TP1_RATE):
-            if self.selling:
-                return
-            
-            qty = max(1, int(self.total_qty * TP1_RATIO))
-            qty = min(qty, self.remain_qty)
-            
-            self.tp1_done = True
-            self.selling = True
-            self.log_trade.info(
-                f"[TP1] {code} cur={current} qty={qty}"
-            )
-            # self.sell_market(code, qty, "TP1")
-            self.send_market_order(side = "SELL", code = code, qty = qty, reason = "TP1")
-            return
-
-        # 3️⃣ 2차 익절
-        if self.tp1_done and not self.tp2_done and current >= entry * (1 + TP2_RATE):
-            if self.selling:
-                return
-            
-            qty = max(1, int(self.total_qty * TP2_RATIO))
-            qty = min(qty, self.remain_qty)
-            
-            self.tp2_done = True
-            self.selling = True
-            self.trailing_active = True
-            self.log_trade.info(
-                f"[TP2] {code} cur={current} qty={qty}"
-            )
-            # self.sell_market(code, qty, "TP2")
-            self.send_market_order(side = "SELL", code = code, qty = qty, reason = "TP2")
-            return
-
-        # 4️⃣ 트레일링 스탑 (남은 물량)
-        if self.trailing_active:
-            stop_price = int(self.highest_price * (1 - TRAIL_GAP))
-            if current <= stop_price:
-                if self.selling:
-                    return
-                
-                self.log_trade.info(
-                    f"[TRAIL] {code} cur={current} high={self.highest_price}"
-                )
-                self.selling = True
-                # self.sell_market(code, self.remain_qty, "TRAIL")
-                self.send_market_order(side = "SELL", code = code, qty = self.remain_qty, reason = "TRAIL_STOP")
+            if code in self.candidates:
                 return
 
-    def _on_tr_timeout(self):
-        code = self.current_scan_code
-        self.log_system.error(f"[TR_TIMEOUT] {code}")
+            self.candidates[code] = {
+                "state": "NEW",
+                "retry": 0,
+                "added_at": datetime.now(),
+            }
+            self.scan_queue.append(code)
 
-        info = self.candidates.get(code)
-        if info:
-            info["retry"] += 1
-            if info["retry"] < 10:
-                self.scan_queue.append(code)
-            else:
-                info["state"] = "DONE"
+            if len(self.positions) < MAX_POSITIONS and not self._scan_running:
+                self._scan_running = True
+                QTimer.singleShot(0, self._scan_next)
 
-        self._finish_tr(delay=True)
+        elif event_type == "D":
+            # 조건 이탈 → 필요하면 후보에서 제거
+            pass
 
-    def _finish_tr(self, delay=False):
-        self.tr_inflight = False
-        self.current_scan_code = None
 
-        next_delay = self.TR_INTERVAL_MS if delay else 0
-        QTimer.singleShot(next_delay, self._scan_next)
-
-    # ---------------------------
-    # 메시지(키움 서버 메시지)
-    # ---------------------------
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
-        self.log_system.info(f"[MSG] [{screen_no}] {msg}")
         if "주문완료" in msg:
-            # 주문은 접수됨 → 타임아웃 리셋
             self.last_order_ts = pytime.time()
-
-    # ---------------------------
-    # 셀프 체크 (매매 전 상태 점검)
-    # ---------------------------
-    def self_check(self, phase: str) -> bool:
-        try:
-            self.log_system.info(f"[SELF_CHECK_START] phase={phase}")
-
-            # 1. 계좌
-            acc = self.get_account()
-            if not acc:
-                raise RuntimeError("계좌 없음")
-
-            # 2. 상태
-            if self.position is None:
-                raise RuntimeError("포지션 잔존")
-
-            if self.remain_qty <= 0:
-                raise RuntimeError("잔여수량 없음")
-
-            self.log_system.info(f"[SELF_CHECK_OK] phase={phase}")
-            self.self_check_retry_count = 0
-            return True
-
-        except Exception as e:
-            self.log_system.error(
-                f"[SELF_CHECK_FAIL] phase={phase} reason={e}"
-            )
-            self.auto_trade_enabled = False
-            self.self_check_retry_count += 1
-            return False    
-        
-        

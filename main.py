@@ -125,14 +125,20 @@ def main():
     ok = api.self_check("PRE_MARKET")
     if not ok:
         print("⚠️ 장전 self-check 실패 (재시도는 장 시작 후)")
-        
+    else:
+        print("🟢 장전 self-check 통과")
+        notify_operator(
+            "self-check 통과\n자동매매가 활성화되었습니다.",
+            level="INFO"
+        )
+           
     # 2-2) 장 시작 후 자동매매 활성화 예약
     now = datetime.now()
     market_open = datetime.combine(now.date(), time(9, 0))
     delay_ms = max(0, int((market_open - now).total_seconds() * 1000))
 
     QTimer.singleShot(delay_ms + 3000,  lambda: enable_auto_trade(api))    
-    # enable_auto_trade(api)
+    enable_auto_trade(api)
     # 2-3) 조건검색 실행
     api.run_condition_cycle()
 

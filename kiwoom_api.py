@@ -326,8 +326,11 @@ class KiwoomAPI(QAxWidget):
         # BUY
         if "매수" in order_gubun:
             pos = self.positions.get(code)
-            if pos is None:
+            if pos is None:               
                 pos = PositionState(code, price, price, QTY, 0, ordering=True)
+                self.log_trade.info(
+                    f"[BUY_FILL_NEW] code={code} price={price}"
+                )                
                 self.positions[code] = pos
                 self.register_real(code)
             pos.remain_qty += qty
@@ -404,11 +407,20 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     def send_market_order(self, side, code, qty, reason=""):
         if qty <= 0 or not is_market_time():
+            self.log_trade.warning(
+                f"[ORDER_ABORT] side={side} code={code} qty={qty} reason={reason}"
+            )            
             return False
+        
         order_type = 1 if side == "BUY" else 2
         screen = "9200" if side == "BUY" else "9100"
         self.ordering = True
         self.last_order_ts = pytime.time()
+        
+        self.log_trade.info(
+            f"[ORDER_TRY] side={side} code={code} qty={qty} reason={reason}"
+        )        
+        
         if side == "BUY":
             self._pending_buy_code = code
             self._pending_buy_qty = qty
@@ -500,27 +512,63 @@ class KiwoomAPI(QAxWidget):
 
     def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
         code = code.strip()
-
+        # =========================
+        # 조건 진입 (I)
+        # =========================
         if event_type == "I":  # 조건 진입
             if code in self.positions:
+                self.log_trade.info(
+                    f"[COND_IN_IGNORE] code={code} reason=already_position"
+                )
                 return
             if code in self.candidates:
+                self.log_trade.info(
+                    f"[COND_IN_IGNORE] code={code} reason=already_candidate"
+                )                
                 return
 
             self.candidates[code] = {
                 "state": "NEW",
                 "retry": 0,
+                "last_try": None,
                 "added_at": datetime.now(),
             }
+            
             self.scan_queue.append(code)
+            self.log_signal.info(f"[COND_IN] {code}")
+            self.log_trade.info(
+                f"[CANDIDATE_ADD] code={code} queue_size={len(self.scan_queue)}"
+            )
 
             if len(self.positions) < MAX_POSITIONS and not self._scan_running:
                 self._scan_running = True
+                self.log_trade.info(
+                    f"[SCAN_TRIGGER] reason=REAL_CONDITION positions={len(self.positions)}"
+                )                
                 QTimer.singleShot(0, self._scan_next)
 
+        # =========================
+        # 조건 이탈 (D)
+        # =========================
         elif event_type == "D":
-            # 조건 이탈 → 필요하면 후보에서 제거
-            pass
+            self.log_signal.info(f"[COND_OUT] {code}")
+            # 🔴 이미 포지션 보유 중이면 건드리지 않음
+            if code in self.positions:
+                return
+
+            # 1️⃣ scan_queue에서 제거
+            if code in self.scan_queue:
+                self.scan_queue = [c for c in self.scan_queue if c != code]
+
+            # 2️⃣ candidates에서 제거
+            if code in self.candidates:
+                self.candidates.pop(code, None)
+
+            # 3️⃣ 현재 TR 대상이면 안전 해제
+            if self.current_scan_code == code:
+                self.current_scan_code = None
+                self.tr_inflight = False            
+            
 
 
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):

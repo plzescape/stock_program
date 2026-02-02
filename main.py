@@ -76,22 +76,15 @@ def test_account(api: KiwoomAPI):
 
 #===== 자동매매 활성화 =====
 def enable_auto_trade(api: KiwoomAPI):
-    if api.auto_trade_enabled:
-        return  # 이미 활성화됨
+    #if api.auto_trade_enabled:
+   #     return  # 이미 활성화됨
         
     ok = api.self_check("POST_MARKET_OPEN")
     if ok:
-        api.auto_trade_enabled = True
+        #api.auto_trade_enabled = True
         notify_operator(
             "self-check 통과\n자동매매가 활성화되었습니다.",
             level="INFO"
-        )
-        return
-
-    if api.self_check_retry_count >= MAX_SELF_CHECK_RETRY:
-        notify_operator(
-            "self-check 재시도 초과\n오늘 자동매매는 실행되지 않습니다.",
-            level="CRITICAL"
         )
         return
 
@@ -101,12 +94,7 @@ def enable_auto_trade(api: KiwoomAPI):
         retry_info=f"{api.self_check_retry_count}/{MAX_SELF_CHECK_RETRY}"
     )
         
-    print(
-        f"⚠️ self-check 실패 "
-        f"({api.self_check_retry_count}/{MAX_SELF_CHECK_RETRY}) → 재시도 예정"
-    )
-    QTimer.singleShot(SELF_CHECK_RETRY_SEC * 1000,  lambda: enable_auto_trade(api))
-    
+   
 #===== 메인 함수 =====        
 def main():
     app = QApplication(sys.argv)
@@ -138,7 +126,7 @@ def main():
     delay_ms = max(0, int((market_open - now).total_seconds() * 1000))
 
     QTimer.singleShot(delay_ms + 3000,  lambda: enable_auto_trade(api))    
-    enable_auto_trade(api)
+    # enable_auto_trade(api)
     # 2-3) 조건검색 실행
     api.run_condition_cycle()
 

@@ -34,7 +34,19 @@ CONDITION_NAME = "AUTO_CANDI_MOMENTUM"
 SCAN_MAX_CODES = 30        # 조건검색 결과 중 최대 몇 종목만 스캔할지
 SCAN_TR_DELAY_MS = 300     # 종목별 TR 요청 간 최소 딜레이(밀리초)
 
+# ===== 매수/매도 포지션 최대 개수 =====
+MAX_POSITIONS = 5
+
 # ===== 자가진단 =====
 TIME_STOP_SEC = 600        # 10분
 TIME_STOP_MAX_LOSS = -0.003  # -0.3%
 SELL_COOLDOWN_SEC = 3
+
+# 거래량 기반 Time Stop
+VOL_CHECK_TICKS = 20        # 최근 20틱
+VOL_AVG_MIN = 50            # 평균 거래량 50 이하 = 사실상 정지
+
+# ===== 주문 체결 타임아웃 =====
+BUY_FILL_TIMEOUT_SEC = 10     # 체결 대기 최대 8초 (너 환경에 맞게 5~15초 추천)
+CANCEL_RETRY_COOLDOWN_SEC = 2
+MAX_CANCEL_RETRIES = 2

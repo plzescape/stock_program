@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+import code
 from dataclasses import dataclass
 from datetime import datetime, time
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
 from dataclasses import dataclass, field
+from collections import deque
 import time as pytime
 
 from config import (
@@ -19,12 +21,11 @@ from config import (
     TRAIL_GAP,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
     CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
-    TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC
+    TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
+    MAX_POSITIONS
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate
-
-MAX_POSITIONS = 3
 
 
 @dataclass
@@ -47,6 +48,11 @@ class PositionState:
     # ⭐ 최근 매도 시도 시간 기록
     last_sell_attempt_ts: float = 0.0
 
+    # ⭐ 추가
+    recent_volumes: deque = field(
+        default_factory=lambda: deque(maxlen=VOL_CHECK_TICKS)
+    )
+
 class KiwoomAPI(QAxWidget):
     def __init__(self):
         super().__init__()
@@ -67,6 +73,12 @@ class KiwoomAPI(QAxWidget):
         self.OnReceiveRealCondition.connect(self._on_receive_real_condition)
         self.OnReceiveMsg.connect(self._on_receive_msg)
 
+        # ===== pending BUY 취소 감시 타이머 =====
+        self._pending_cancel_timer = QTimer()
+        self._pending_cancel_timer.setInterval(500)  # 0.5초마다 체크
+        self._pending_cancel_timer.timeout.connect(self.check_pending_buy_cancel)
+        self._pending_cancel_timer.start()
+
         # ---- loops ----
         self._login_loop = None
         self._cond_loop = None
@@ -77,6 +89,18 @@ class KiwoomAPI(QAxWidget):
         self._pending_buy_code = None
         self._pending_buy_qty = 0
         self.last_order_ts = None
+
+        # ===== 주문 대기(pending) 관리 =====
+        # code -> {
+        #   side: "BUY"|"SELL",
+        #   qty: int,
+        #   ts: float,
+        #   reason: str,
+        #   order_no: str|None,
+        #   cancel_retries: int,
+        #   last_cancel_ts: float
+        # }
+        self.pending_orders: dict[str, dict] = {}
 
         # ===== 일일 제한 =====
         self._today = datetime.now().date()
@@ -191,8 +215,8 @@ class KiwoomAPI(QAxWidget):
             return False
 
 
-# ==================================================
-# Login / condition
+    # ==================================================
+    # Login / condition
     # ==================================================
     def login(self):
         self.dynamicCall("CommConnect()")
@@ -225,13 +249,17 @@ class KiwoomAPI(QAxWidget):
     # Scan control
     # ==================================================
     def _scan_next(self):
-        if len(self.positions) >= MAX_POSITIONS:
+        active_slots = len(self.positions) + self._count_pending_buys()
+        
+        if active_slots >= MAX_POSITIONS:
             self._scan_running = False
             return
         if self.tr_inflight:
             return
         if not self.scan_queue:
             self._scan_running = False
+            return
+        if code in self.positions or code in self.pending_orders:
             return
 
         code = self.scan_queue.pop(0)
@@ -329,15 +357,31 @@ class KiwoomAPI(QAxWidget):
         if str(gubun) != "0":
             return
         
-        code = str(self.dynamicCall("GetChejanData(int)", 9001)).replace("A", "").strip()
+        order_no = str(self.dynamicCall("GetChejanData(int)", 9203)).strip()  # 주문번호
+        raw_code = str(self.dynamicCall("GetChejanData(int)", 9001)).strip()
+        code = raw_code.replace("A", "").strip()
         qty = int(str(self.dynamicCall("GetChejanData(int)", 911)).strip() or 0)
         price = abs(int(str(self.dynamicCall("GetChejanData(int)", 910)).strip() or 0))
         order_gubun = str(self.dynamicCall("GetChejanData(int)", 905))
+        status = str(self.dynamicCall("GetChejanData(int)", 913)).strip()  # 주문상태
+        
+        pend = self.pending_orders.get(code)
+        if pend and order_no and pend.get("order_no") is None:
+            pend["order_no"] = order_no
+            self.log_trade.info(f"[PENDING_ORDERNO] code={code} order_no={order_no}")        
         
         if not code or qty <= 0:
             return
 
         self.log_trade.info(f"[CHEJAN] {order_gubun} code={code} price={price} qty={qty}")
+        
+        # CANCEL_DONE
+        if "취소" in order_gubun or "취소" in status:
+            self.pending_orders.pop(code, None)
+            self.ordering = False
+            self.last_order_ts = None
+            self.log_trade.info(f"[CANCEL_DONE] code={code} status={status}")
+            return
 
         # BUY
         if "매수" in order_gubun:
@@ -410,6 +454,10 @@ class KiwoomAPI(QAxWidget):
             )            
             return
         cur = abs(int(self.dynamicCall("GetCommRealData(QString, int)", code, 10) or 0))
+        # 거래량 FID = 15
+        vol = abs(int(self.dynamicCall("GetCommRealData(QString, int)", code, 15) or 0))
+        pos.recent_volumes.append(vol)
+        
         if cur <= 0:
             return
 
@@ -463,6 +511,39 @@ class KiwoomAPI(QAxWidget):
                 self.send_market_order("SELL", code, pos.remain_qty, "TRAIL_STOP")
 
         # =========================
+        # ⚠️ 거래량 급감 즉시 TIME STOP
+        # =========================
+        if (
+            not pos.time_stop_done
+            and not pos.selling
+            and len(pos.recent_volumes) == VOL_CHECK_TICKS
+        ):
+            avg_vol = sum(pos.recent_volumes) / VOL_CHECK_TICKS
+            pnl_rate = (cur - pos.entry_price) / pos.entry_price
+        
+            if avg_vol <= VOL_AVG_MIN and pnl_rate >= TIME_STOP_MAX_LOSS:
+                if not self.can_try_sell(pos):
+                    return
+        
+                pos.time_stop_done = True
+                pos.selling = True
+                pos.last_sell_attempt_ts = pytime.time()
+        
+                self.log_trade.info(
+                    f"[VOL_TIME_STOP] code={code} "
+                    f"avg_vol={avg_vol:.2f} "
+                    f"pnl={pnl_rate:.4f}"
+                )
+        
+                self.send_market_order(
+                    side="SELL",
+                    code=code,
+                    qty=pos.remain_qty,
+                    reason="VOL_TIME_STOP"
+                )
+                return
+
+        # =========================
         # ⏱ TIME STOP (-0.3% 이내)
         # =========================
         now = pytime.time()
@@ -495,6 +576,96 @@ class KiwoomAPI(QAxWidget):
                     reason="TIME_STOP"
                 )
                 return
+
+    # ==================================================
+    # 주문 취소 함수
+    # ==================================================
+    def send_cancel_order(self, code: str, org_order_no: str) -> bool:
+        """
+        원주문번호 기반 BUY 취소
+        nOrderType: 3(매수취소), 4(매도취소)
+        """
+        if not org_order_no:
+            self.log_system.error(f"[CANCEL_ABORT] no org_order_no code={code}")
+            return False
+
+        pend = self.pending_orders.get(code)
+
+        ret = self.dynamicCall(
+            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+            [
+                "BUY_CANCEL",          # sRQName (아무 문자열 가능)
+                "9200",                # sScreenNo
+                self.get_account(),    # sAccNo
+                3,                     # nOrderType: 매수취소
+                code,                  # sCode
+                pend["qty"],           # nQty (0으로도 취소 동작하는 경우 많음)
+                0,                     # nPrice
+                "00",                  # sHogaGb (취소는 보통 "00")
+                org_order_no           # sOrgOrderNo
+            ]
+        )
+
+        self.log_trade.info(f"[CANCEL_SEND] code={code} org={org_order_no} ret={ret}")
+        return (ret == 0)
+
+    # ==================================================
+    # pending BUY 취소 감시 함수
+    # ==================================================
+    def check_pending_buy_cancel(self):
+        from config import BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES
+    
+        now = pytime.time()
+    
+        # positions 슬롯 계산과는 별개로, "체결 지연 BUY"만 취소
+        for code, pend in list(self.pending_orders.items()):
+            if pend.get("side") != "BUY":
+                continue
+            
+            # 이미 포지션이 잡혀서 체결 진행중이면(부분체결 포함) 취소 정책 선택
+            pos = self.positions.get(code)
+            if pos and pos.remain_qty > 0:
+                # ✅ 정책 1) 부분체결이면 취소 안 하고 둔다
+                # 원하면 "잔량 취소"로 바꿀 수 있음
+                continue
+            
+            # 체결 대기 시간 초과?
+            age = now - float(pend.get("ts", now))
+            if age < BUY_FILL_TIMEOUT_SEC:
+                continue
+            
+            # 주문번호 아직 없으면 취소 불가 → 로그만
+            org = pend.get("order_no")
+            if not org:
+                self.log_system.warning(
+                    f"[CANCEL_WAIT] code={code} no order_no yet age={age:.1f}s"
+                )
+                continue
+            
+            # 취소 재시도 쿨다운/횟수 제한
+            if pend.get("cancel_retries", 0) >= MAX_CANCEL_RETRIES:
+                self.log_system.error(f"[CANCEL_GIVEUP] code={code} org={org}")
+                # 여기서 pending을 지울지 말지는 선택:
+                # - 지우면 더 이상 관리 안 함
+                # - 유지하면 계속 경고 남음
+                self.pending_orders.pop(code, None)
+                continue
+            
+            if now - float(pend.get("last_cancel_ts", 0.0)) < CANCEL_RETRY_COOLDOWN_SEC:
+                continue
+            
+            # 취소 시도
+            ok = self.send_cancel_order(code, org)
+            pend["last_cancel_ts"] = now
+            pend["cancel_retries"] = int(pend.get("cancel_retries", 0)) + 1
+    
+            if ok:
+                self.log_trade.info(f"[CANCEL_OK] code={code} org={org}")
+                # 취소 접수됐으니 ordering/pending 정리(체결 이벤트로도 정리 가능)
+                self.ordering = False
+                # pending은 Chejan에서 "취소완료" 이벤트를 받으면 지우는게 베스트지만
+                # 간단하게는 여기서 제거해도 됨:
+                self.pending_orders.pop(code, None)
 
     # ==================================================
     # 매도 / 매수 주문 함수
@@ -531,6 +702,16 @@ class KiwoomAPI(QAxWidget):
                     f"[REAL_SKIP] code={code} not in positions"
                 )                
             return False
+        else:
+            self.pending_orders[code] = {
+                "side": side,
+                "qty": qty,
+                "ts": pytime.time(),    # 주문 시각
+                "reason": reason,
+                "order_no": None,       # 주문번호 (체결시 채워짐)
+                "cancel_retries": 0,
+                "last_cancel_ts": 0.0
+            }
         return True
 
     # ==================================================
@@ -573,6 +754,13 @@ class KiwoomAPI(QAxWidget):
         if now - pos.last_sell_attempt_ts < SELL_COOLDOWN_SEC:
             return False
         return True    
+
+    # 5. 대기 중인 매수 주문 수
+    def _count_pending_buys(self) -> int:
+        return sum(
+            1 for o in self.pending_orders.values()
+            if o["side"] == "BUY"
+        )    
 
     # ==================================================
     # 조건검색 수신

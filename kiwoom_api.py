@@ -1,5 +1,5 @@
 # Refactored Kiwoom OpenAPI+ engine
-# - Multi-position (MAX 3)
+# - Multi-position (MAX 5)
 # - PositionState based
 # - Safe scan resume/stop
 # - Per-position STOP / TP / TRAIL
@@ -254,16 +254,11 @@ class KiwoomAPI(QAxWidget):
         if active_slots >= MAX_POSITIONS:
             self._scan_running = False
             return
-        if self.tr_inflight:
-            return
-        if not self.scan_queue:
-            self._scan_running = False
-            return
-        if code in self.positions or code in self.pending_orders:
+        if self.tr_inflight or not self.scan_queue:
             return
 
         code = self.scan_queue.pop(0)
-        if code in self.positions:
+        if code in self.positions or code in self.pending_orders
             QTimer.singleShot(0, self._scan_next)
             return
 
@@ -465,12 +460,13 @@ class KiwoomAPI(QAxWidget):
             pos.highest_price = cur
 
         entry = pos.entry_price
+        now = pytime.time()
 
         # STOP
         if cur <= entry * (1 - STOP_LOSS_RATE):
             if not self.can_try_sell(pos):
                 return
-            
+            pos.last_sell_attempt_ts = now
             pos.selling = True
             self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             return
@@ -482,6 +478,7 @@ class KiwoomAPI(QAxWidget):
             
             qty = min(pos.remain_qty, max(1, int(pos.total_qty * TP1_RATIO)))
             pos.tp1_done = True
+            pos.last_sell_attempt_ts = now
             pos.selling = True
             self.send_market_order("SELL", code, qty, "TP1")
             return
@@ -494,6 +491,7 @@ class KiwoomAPI(QAxWidget):
             qty = min(pos.remain_qty, max(1, int(pos.total_qty * TP2_RATIO)))
             pos.tp2_done = True
             pos.trailing_active = True
+            pos.last_sell_attempt_ts = now
             pos.selling = True
             self.send_market_order("SELL", code, qty, "TP2")
             return
@@ -687,6 +685,16 @@ class KiwoomAPI(QAxWidget):
         )        
         
         if side == "BUY":
+            # 포지션 슬롯 체크
+            current_slots = len(self.positions) + sum(
+                1 for p in self.pending_orders.values() if p.get("side") == "BUY"
+            )
+            if current_slots >= MAX_POSITIONS:
+                self.log_trade.info(
+                    f"[BUY_BLOCK] max positions reached ({current_slots}/{MAX_POSITIONS})"
+                )
+                return False            
+            
             self._pending_buy_code = code
             self._pending_buy_qty = qty
         ret = self.dynamicCall(
@@ -720,7 +728,7 @@ class KiwoomAPI(QAxWidget):
     # 1. 실시간 등록
     def register_real(self, code):
         self.dynamicCall("SetRealReg(QString, QString, QString, QString)",
-                         "9300", code, "10", "0")
+                         "9300", code, "10;15", "0")
 
     # 2. 1분봉 파싱
     def parse_1min(self):

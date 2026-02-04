@@ -258,7 +258,7 @@ class KiwoomAPI(QAxWidget):
             return
 
         code = self.scan_queue.pop(0)
-        if code in self.positions or code in self.pending_orders
+        if code in self.positions or code in self.pending_orders:
             QTimer.singleShot(0, self._scan_next)
             return
 
@@ -334,12 +334,14 @@ class KiwoomAPI(QAxWidget):
 
     def _on_tr_timeout(self):
         self.tr_inflight = False
+        self._scan_running = False
         self.current_scan_code = None
         QTimer.singleShot(0, self._scan_next)
 
     def _finish_tr(self, delay=True):
         self.tr_inflight = False
         self.current_scan_code = None
+        self._scan_running = False
         QTimer.singleShot(
             SCAN_TR_DELAY_MS if delay else 0,
             self._scan_next
@@ -701,14 +703,22 @@ class KiwoomAPI(QAxWidget):
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [side, screen, self.get_account(), order_type, code, qty, 0, "03", ""]
         )
+        
+        # 주문 접수 실패 처리
         if ret != 0:
             self.ordering = False
-            pos = self.positions.get(code)
-            if not pos:
-                # ⭐ 디버그 로그 (나중에 지워도 됨)
-                self.log_signal.debug(
-                    f"[REAL_SKIP] code={code} not in positions"
-                )                
+
+            # BUY 주문 실패 시 포지션이 없으면 pending도 제거
+            self.pending_orders.pop(code, None)
+            
+            if side == "BUY":
+                self._pending_buy_code = None
+                self._pending_buy_qty = 0
+               
+            self.log_trade.error(
+                f"[ORDER_FAIL] side={side} code={code} qty={qty} reason={reason} ret={ret}" 
+            ) 
+                           
             return False
         else:
             self.pending_orders[code] = {

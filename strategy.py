@@ -70,3 +70,67 @@ def is_entry_candidate(candles, logger=None, code=None) -> bool:
         )
 
     return vol_ok and price_ok
+
+
+def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
+    """
+    고신뢰도 + MA20 추세 추종 전략
+    - candles: 이미 kiwoom_api에서 candles[1:]로 슬라이싱되어 넘어온 완성봉 리스트
+    - candles[0]: 가장 최근 완성봉
+    """
+    print("is_entry_candidate_VER2 called with code:", code, len(candles), "candles")
+    # 1. 이동평균선 계산을 위해 최소 25개 이상의 데이터가 필요함
+    if len(candles) < 25:
+        if logger:
+            logger.info(f"[STRATEGY_SKIP] {code} 데이터 부족 (필요:25, 현재:{len(candles)})")
+        return False
+
+    # --- 데이터 정의 ---
+    c1 = candles[0]          # 직전 완성봉 (기준)
+    c2 = candles[1]          # 전전 완성봉
+    prev_5_candles = candles[1:6]  # 최근 5개 봉 (평균 거래량용)
+
+    # 2. 이동평균선(MA20) 계산
+    # 최근 20개 완성봉의 종가 평균
+    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
+    # 5봉 전 시점의 MA20 (기울기 확인용)
+    ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
+
+    # 3. [추가] MA20 정배열 및 추세 조건
+    # - 현재 주가가 MA20 위에 있어야 함 (정배열 초입/유지)
+    # - MA20의 수치 자체가 5봉 전보다 높아야 함 (우상향 추세)
+    trend_ok = (
+        c1['close'] > ma20_now and
+        ma20_now > ma20_prev
+    )
+
+    # 4. 가격 돌파 조건 (직전 고점 돌파 및 양봉)
+    price_ok = (
+        c1['close'] > c2['high'] and 
+        c1['close'] > c1['open']
+    )
+
+    # 5. 거래량 조건 (과거 5봉 평균 대비 3배 폭증)
+    avg_vol = sum(c['volume'] for c in prev_5_candles) / len(prev_5_candles)
+    vol_ok = (
+        c1['volume'] > avg_vol * 3.0 and
+        c1['volume'] >= 5000
+    )
+
+    # 6. 캔들 강도 (윗꼬리가 짧은 장대양봉)
+    candle_range = c1['high'] - c1['low']
+    body_size = c1['close'] - c1['open']
+    strength_ok = (body_size / candle_range) >= 0.7 if candle_range > 0 else False
+
+    # --- 최종 판정 ---
+    is_valid = trend_ok and price_ok and vol_ok and strength_ok
+
+    if logger and is_valid:
+        logger.info(
+            f"[ENTRY_CONFIRMED] {code} | "
+            f"종가:{c1['close']} | "
+            f"MA20추세:상향({ma20_now:.1f}) | "
+            f"거래량:{c1['volume']}(평균의 {c1['volume']/avg_vol:.1f}배)"
+        )
+
+    return is_valid

@@ -26,7 +26,7 @@ from config import (
     MAX_POSITIONS
 )
 from logger_util import setup_logger
-from strategy import is_market_time, is_entry_candidate
+from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2
 
 
 @dataclass
@@ -118,6 +118,9 @@ class KiwoomAPI(QAxWidget):
         self._screen_seq = 0
         self.TR_TIMEOUT_MS = 2000
 
+        # ===== 스캔 타임스탬프 =====
+        self.last_scan_times = {}  # { '005930': 1700000.123 } 형태
+
     # ==================================================
     # Login / condition
     # ==================================================
@@ -128,37 +131,37 @@ class KiwoomAPI(QAxWidget):
         - 일일 거래 횟수 제한
         - 시장 시간 / 진입 시간 방어
         """
-        # 일일 리셋
-        today = datetime.now().date()
-        if today != self._today:
-            self._today = today
-            self.daily_trade_count = 0
-            self.traded_today.clear()
+        # # 일일 리셋
+        # today = datetime.now().date()
+        # if today != self._today:
+        #     self._today = today
+        #     self.daily_trade_count = 0
+        #     self.traded_today.clear()
 
-        # 포지션 가득 차면 조건검색 중단
-        if len(self.positions) >= MAX_POSITIONS:
-            return
+        # # 포지션 가득 차면 조건검색 중단
+        # if len(self.positions) >= MAX_POSITIONS:
+        #     return
 
-        # 일일 거래 제한
-        if self.daily_trade_count >= MAX_TRADES_PER_DAY:
-            return
+        # # 일일 거래 제한
+        # if self.daily_trade_count >= MAX_TRADES_PER_DAY:
+        #     return
 
-        # 시장 시간 방어
-        if not is_market_time():
-            return
+        # # 시장 시간 방어
+        # if not is_market_time():
+        #     return
 
-        # 너무 늦은 시간 신규 진입 방지 (14:50 이후 차단)
-        t = datetime.now().time()
-        if t > time(14, 50):
-            return
+        # # 너무 늦은 시간 신규 진입 방지 (14:50 이후 차단)
+        # t = datetime.now().time()
+        # if t > time(14, 50):
+        #     return
 
-        # 조건검색 주기 제한
-        now = datetime.now()
-        if hasattr(self, "_last_condition_run") and self._last_condition_run:
-            diff = (now - self._last_condition_run).total_seconds() / 60.0
-            if diff < CONDITION_INTERVAL_MIN:
-                return
-        self._last_condition_run = now
+        # # 조건검색 주기 제한
+        # now = datetime.now()
+        # if hasattr(self, "_last_condition_run") and self._last_condition_run:
+        #     diff = (now - self._last_condition_run).total_seconds() / 60.0
+        #     if diff < CONDITION_INTERVAL_MIN:
+        #         return
+        # self._last_condition_run = now
 
         idx = self.condition_map.get(CONDITION_NAME)
         if idx is None:
@@ -259,6 +262,15 @@ class KiwoomAPI(QAxWidget):
             return
 
         code = self.scan_queue.pop(0)
+        
+    # 🟢 추가된 쿨타임 체크 로직
+        last_time = self.last_scan_times.get(code, 0)
+        if pytime.time() - last_time < 30: # 마지막 조회 후 30초가 안 지났다면
+            self.scan_queue.append(code)   # 다시 큐의 맨 뒤로 보냄
+            # 0.2초 정도 쉬었다가 다음 종목 확인 (CPU 과부하 방지)
+            QTimer.singleShot(200, self._scan_next) 
+            return        
+        
         if code in self.positions or code in self.pending_orders:
             QTimer.singleShot(0, self._scan_next)
             return
@@ -288,23 +300,31 @@ class KiwoomAPI(QAxWidget):
         self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
         self.dynamicCall("SetInputValue(QString, QString)", "틱범위", "1")
         self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-        screen = f"91{self._screen_seq}"
+        screen = f"{9000 + (self._screen_seq % 100)}"
         self._screen_seq += 1
+      
+        # self.dynamicCall(
+        #     "CommRqData(QString, QString, int, QString)",
+        #     "opt10080_req",
+        #     "opt10080",
+        #     0,
+        #     screen
+        # )        
         self.dynamicCall("CommRqData(QString, QString, int, QString)",
                          "RQ_1MIN", "OPT10080", 0, screen)
 
     def _on_receive_tr_data(self, screen_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
         if not self.tr_inflight:
             return
-        
-        if rq_name != "RQ_1MIN" or tr_code != "OPT10080":
+        # print(rq_name, tr_code)
+        if tr_code != "OPT10080" or rq_name != "RQ_1MIN":
             return
         
         if hasattr(self, "_tr_timeout_timer"):
             self._tr_timeout_timer.stop()
         
         code = self.current_scan_code
-        candles = self.parse_1min()
+        candles = self.parse_1min(code)
         
         self.tr_inflight = False
         self.current_scan_code = None
@@ -314,8 +334,11 @@ class KiwoomAPI(QAxWidget):
             self._finish_tr(delay=True)
             return
 
+        # 최신봉 제외한 완성봉들
+        completed_candles = candles[1:] if len(candles) > 1 else []
+
         # === ENTRY 성공 ===
-        if len(candles) >= 3 and is_entry_candidate(candles, self.log_signal, code):
+        if len(completed_candles) >= 3 and is_entry_candidate_VER2(completed_candles, self.log_signal, code):
             if len(self.positions) < MAX_POSITIONS:
                 self.send_market_order("BUY", code, QTY, "ENTRY")
             info["state"] = "DONE"
@@ -328,10 +351,12 @@ class KiwoomAPI(QAxWidget):
         info["state"] = "WAIT"
         
         # ⭐ 핵심: 다시 큐에 넣기 (지연 없이 바로 다음 스캔)
-        self.scan_queue.append(code)    
+        # self.scan_queue.append(code)    # 기존
+        
+        self.last_scan_times[code] = pytime.time()  # 스캔 타임스탬프 기록
         
         print("Finishing TR for code:", code)
-        self._finish_tr(delay=True)
+        self._finish_tr(delay=True) # 조회 속도 제한
 
     def _on_tr_timeout(self):
         self.tr_inflight = False
@@ -809,20 +834,96 @@ class KiwoomAPI(QAxWidget):
                          "9300", code, "10;15", "0")
 
     # 2. 1분봉 파싱
-    def parse_1min(self):
-        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", "OPT10080", "RQ_1MIN")
+    def parse_1min(self, code):
+        """
+        opt10080 1분봉 데이터 파싱
+        - OHLCV 포함
+        - 최소 30개 이상 확보 (VER2 전략 대응)
+        - 최신봉 → 과거봉 순서 유지
+        """
+
+        rqname = "opt10080_req"
+        trcode = "opt10080"
+
         candles = []
-        for i in range(min(rows, 3)):
-            close = abs(int(self.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                "OPT10080", "RQ_1MIN", i, "현재가"
-            ) or 0))
-            vol = int(self.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                "OPT10080", "RQ_1MIN", i, "거래량"
-            ) or 0)
-            candles.append({"close": close, "volume": vol})
-        return candles
+
+        try:
+            rows = self.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+
+            if rows <= 0:
+                self.log_system.warning(f"[1MIN_PARSE_EMPTY] {code}")
+                return []
+
+            # ✔ 최소 30개 확보 (여유 두고 60까지 가져와도 OK)
+            fetch_cnt = min(rows, 60)
+
+            for i in range(fetch_cnt):
+
+                def _safe_int(val):
+                    try:
+                        return abs(int(val.strip()))
+                    except:
+                        return 0
+
+                open_ = _safe_int(
+                    self.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        trcode, rqname, i, "시가"
+                    )
+                )
+
+                high = _safe_int(
+                    self.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        trcode, rqname, i, "고가"
+                    )
+                )
+
+                low = _safe_int(
+                    self.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        trcode, rqname, i, "저가"
+                    )
+                )
+
+                close = _safe_int(
+                    self.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        trcode, rqname, i, "현재가"
+                    )
+                )
+
+                volume = _safe_int(
+                    self.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        trcode, rqname, i, "거래량"
+                    )
+                )
+
+                candles.append({
+                    "open": open_,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                })
+
+            # ✔ VER2는 25개 이상 필요
+            if len(candles) < 30:
+                self.log_system.warning(
+                    f"[1MIN_PARSE_SHORT] {code} rows={len(candles)} (<30)"
+                )
+                return candles
+
+            self.log_system.info(
+                f"[1MIN_PARSE] {code} rows={len(candles)} (OHLCV)"
+            )
+
+            return candles
+
+        except Exception as e:
+            self.log_system.error(f"[1MIN_PARSE_ERROR] {code} {e}")
+            return []
 
     # 3. 계좌번호 조회
     def get_account(self):

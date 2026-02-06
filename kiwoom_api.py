@@ -124,6 +124,10 @@ class KiwoomAPI(QAxWidget):
         # ===== 스캔 타임스탬프 =====
         self.last_scan_times = {}  # { '005930': 1700000.123 } 형태
 
+        # ===== TR 요청 간격 관리 =====        
+        self.TR_REQ_INTERVAL = 1
+        self._last_tr_time = 0
+
     # ==================================================
     # Login / condition
     # ==================================================
@@ -257,12 +261,21 @@ class KiwoomAPI(QAxWidget):
     # Scan control
     # ==================================================
     def _scan_next(self):
+        self.purge_candidates()
+        
         active_slots = len(self.positions) + self._count_pending_buys()
-        print("Active slots:", active_slots, "Positions:", len(self.positions), "Pending buys:", self._count_pending_buys())
+        # print("Active slots:", active_slots, "Positions:", len(self.positions), "Pending buys:", self._count_pending_buys())
         if active_slots >= MAX_POSITIONS:
             self._scan_running = False
             return
         if self.tr_inflight or not self.scan_queue:
+            return
+
+        # 🔴 TR 간격 제한
+        now = pytime.time()
+        if now - self._last_tr_time < self.TR_REQ_INTERVAL:
+            delay = int((self.TR_REQ_INTERVAL - (now - self._last_tr_time)) * 1000)
+            QTimer.singleShot(delay, self._scan_next)
             return
 
         code = self.scan_queue.pop(0)
@@ -352,7 +365,7 @@ class KiwoomAPI(QAxWidget):
         info["state"] = "WAIT"
         
         # ⭐ 핵심: 다시 큐에 넣기 (지연 없이 바로 다음 스캔)
-        # self.scan_queue.append(code)    # 기존
+        self.scan_queue.append(code)    # 기존
         
         self.last_scan_times[code] = pytime.time()  # 스캔 타임스탬프 기록
         
@@ -369,6 +382,8 @@ class KiwoomAPI(QAxWidget):
         self.tr_inflight = False
         self.current_scan_code = None
         # self._scan_running = False
+        if self.scan_queue:
+            self._scan_running = True
         QTimer.singleShot(
             SCAN_TR_DELAY_MS if delay else 0,
             self._scan_next
@@ -475,20 +490,23 @@ class KiwoomAPI(QAxWidget):
             
             pos.remain_qty = max(0, pos.remain_qty - qty)
             
+            # 🔴 핵심: 체결 발생했으면 일단 selling 해제
+            # (부분체결이든 전량체결이든 다시 매도 시도 가능해야 함)            
+            pos.selling = False
+            
             if pos.remain_qty > 0:
                 # pending이 아직 SELL이면 selling 유지
-                pend = getattr(self, "pending_orders", {}).get(code)
-                if not pend or pend.get("side") != "SELL":
-                    pos.selling = False  # 예외적으로 pending이 없으면 풀어줌
+                # pend = getattr(self, "pending_orders", {}).get(code)
+                # if not pend or pend.get("side") != "SELL":
+                #     pos.selling = False  # 예외적으로 pending이 없으면 풀어줌
                 self.log_trade.info(f"[SELL_PARTIAL] code={code} remain={pos.remain_qty}/{pos.total_qty}")
                 return                
             
             # 전량 매도 완료
-            pos.selling = False
+            # pos.selling = False
             self.positions.pop(code, None)
             self.pending_orders.pop(code, None)
             self.traded_today.add(code)
-            # self.ordering = False
             self.ordering = bool(self.pending_orders)
             self.last_order_ts = None
             
@@ -508,7 +526,8 @@ class KiwoomAPI(QAxWidget):
                 f"[REAL_SKIP] code={code} not in positions"
             )            
             return
-        cur = abs(int(self.dynamicCall("GetCommRealData(QString, int)", code, 10) or 0))
+        cur = int(self.dynamicCall("GetCommRealData(QString, int)", code, 10) or 0)
+        cur = abs(cur)
         # 거래량 FID = 15
         vol = abs(int(self.dynamicCall("GetCommRealData(QString, int)", code, 15) or 0))
         pos.recent_volumes.append(vol)
@@ -523,14 +542,23 @@ class KiwoomAPI(QAxWidget):
         now = pytime.time()
         pnl_rate = (cur - entry) / entry  # 현재 수익률
 
+        self.log_trade.info(
+            f"[PNL_CHECK] code={code} "
+            f"entry={pos.entry_price} "
+            f"current={cur} "
+            f"pnl={pnl_rate:.4f}"
+        )
+
         # STOP
-        if cur <= entry * (1 - STOP_LOSS_RATE):
+        # if cur <= entry * (1 - STOP_LOSS_RATE):
+        if pnl_rate <= -STOP_LOSS_RATE:
+            self.log_trade.info(f"[STOP_LOSS] {code} 손절 매도 트리거 (현재가:{cur})")
             if not self.can_try_sell(pos):
                 return
             ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             if ok:
                 pos.last_sell_attempt_ts = now
-                pos.selling = True
+                # pos.selling = True
             else:
                 pos.selling = False  # 혹시라도 이전에 True 됐으면 복구
             return
@@ -542,7 +570,7 @@ class KiwoomAPI(QAxWidget):
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "PROFIT_SAFE")
                 if ok:
                     pos.last_sell_attempt_ts = now
-                    pos.selling = True
+                    # pos.selling = True
                 else:
                     pos.selling = False
             return
@@ -560,7 +588,7 @@ class KiwoomAPI(QAxWidget):
 
             if ret:
                 pos.tp1_done = True
-                pos.selling = True
+                # pos.selling = True
             else:
                 # ✅ 실패했으면 락 걸지 말고, TP1도 완료 처리하지 말기
                 pos.selling = False
@@ -580,7 +608,7 @@ class KiwoomAPI(QAxWidget):
             if ok:
                 pos.tp2_done = True
                 pos.trailing_active = True
-                pos.selling = True
+                # pos.selling = True
             else:
                 pos.selling = False  # 실패 시 락 금지
 
@@ -601,7 +629,7 @@ class KiwoomAPI(QAxWidget):
 
                 if ok:
                     pos.trailing_active = False  # 성공 후에만 끄는 게 안전
-                    pos.selling = True
+                    # pos.selling = True
                 else:
                     pos.selling = False
 
@@ -639,7 +667,7 @@ class KiwoomAPI(QAxWidget):
 
                 if ok:
                     pos.time_stop_done = True
-                    pos.selling = True
+                    # pos.selling = True
                 else:
                     pos.selling = False
 
@@ -774,6 +802,7 @@ class KiwoomAPI(QAxWidget):
                 # pending은 Chejan에서 "취소완료" 이벤트를 받으면 지우는게 베스트지만
                 # 간단하게는 여기서 제거해도 됨:
                 self.pending_orders.pop(code, None)
+                self._resume_scan_if_possible()
 
     # ==================================================
     # 재매수 함수
@@ -895,8 +924,17 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # 1. 실시간 등록
     def register_real(self, code):
+        fid_list = "10;15"  # 체결시간, 거래량
+        
+        # codes = list(self.positions.keys())
+        # code_str = ";".join(codes)
+        
         self.dynamicCall("SetRealReg(QString, QString, QString, QString)",
-                         "9300", code, "10;15", "0")
+                         "9300", code, fid_list, "1") # 1: 추가등록, 0: 해제
+
+        self.log_system.info(
+        f"[REAL_REG] total={len(self.positions)} codes={self.positions.keys()}"
+        )
 
     # 2. 1분봉 파싱
     def parse_1min(self, code):
@@ -908,7 +946,7 @@ class KiwoomAPI(QAxWidget):
         """
 
         rqname = "RQ_1MIN"
-        trcode = "opt10080"
+        trcode = "OPT10080"
 
         candles = []
 
@@ -983,9 +1021,9 @@ class KiwoomAPI(QAxWidget):
                 )
                 return candles
 
-            self.log_system.info(
-                f"[1MIN_PARSE] {code} rows={len(candles)} (OHLCV)"
-            )
+            # self.log_system.info(
+            #     f"[1MIN_PARSE] {code} rows={len(candles)} (OHLCV)"
+            # )
 
             return candles
 
@@ -1127,11 +1165,26 @@ class KiwoomAPI(QAxWidget):
                 )
                 return
             if code in self.candidates:
-                self.log_trade.info(
-                    f"[COND_IN_IGNORE] code={code} reason=already_candidate"
-                )                
-                return
+                info = self.candidates[code]
 
+                # =========================
+                # ⭐ 재편입 처리
+                # =========================
+                info["retry"] = 0
+                info["state"] = "NEW"
+                info["last_try"] = None
+                info.pop("cond_out_ts", None)
+
+                # scan_queue 없으면 다시 등록
+                if code not in self.scan_queue:
+                    self.scan_queue.append(code)
+
+                self.log_trade.info(
+                    f"[COND_REENTRY_RESET] {code} retry_reset"
+                )             
+                return
+            
+            # 신규 후보 등록
             self.candidates[code] = {
                 "state": "NEW",
                 "retry": 0,
@@ -1167,14 +1220,64 @@ class KiwoomAPI(QAxWidget):
 
             # 2️⃣ candidates에서 제거
             if code in self.candidates:
-                self.candidates.pop(code, None)
+                # self.candidates.pop(code, None)
+                self.candidates[code]["cond_out_ts"] = pytime.time()
+                self.log_signal.info(f"[COND_OUT_MARK] {code}")
 
             # 3️⃣ 현재 TR 대상이면 안전 해제
-            if self.current_scan_code == code:
-                self.current_scan_code = None
-                self.tr_inflight = False            
+            # if self.current_scan_code == code:
+            #     self.current_scan_code = None
+            #     self.tr_inflight = False            
             
+    # ==================================================
+    # Candidates 정리 (TTL + Retry)
+    # ==================================================
+    def purge_candidates(self):
+        """
+        candidates 메모리 정리
+        - COND_OUT 이후 TTL 60초 경과 시 삭제
+        - retry 15회 초과 시 삭제
+        """
 
+        now = pytime.time()
+        TTL = 60          # 초
+        MAX_RETRY = 15   # 재시도 한도
+
+        for code, info in list(self.candidates.items()):
+
+            # -------------------------
+            # 1️⃣ retry 초과 삭제
+            # -------------------------
+            if info.get("retry", 0) >= MAX_RETRY:
+                self.log_signal.info(
+                    f"[CANDIDATE_DROP_RETRY] {code} retry={info['retry']}"
+                )
+
+                self.candidates.pop(code, None)
+                self.scan_queue = [c for c in self.scan_queue if c != code]
+
+                if self.current_scan_code == code:
+                    self.current_scan_code = None
+                    self.tr_inflight = False
+
+                continue
+
+            # -------------------------
+            # 2️⃣ COND_OUT TTL 삭제
+            # -------------------------
+            cond_out_ts = info.get("cond_out_ts")
+            if cond_out_ts and now - cond_out_ts >= TTL:
+
+                self.log_signal.info(
+                    f"[CANDIDATE_DROP_TTL] {code} ttl={TTL}s"
+                )
+
+                self.candidates.pop(code, None)
+                self.scan_queue = [c for c in self.scan_queue if c != code]
+
+                if self.current_scan_code == code:
+                    self.current_scan_code = None
+                    self.tr_inflight = False
     # ==================================================
     # 메시지 수신
     # ==================================================

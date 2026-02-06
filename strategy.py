@@ -78,7 +78,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     - candles: 이미 kiwoom_api에서 candles[1:]로 슬라이싱되어 넘어온 완성봉 리스트
     - candles[0]: 가장 최근 완성봉
     """
-    print("is_entry_candidate_VER2 called with code:", code, len(candles), "candles")
+    # print("is_entry_candidate_VER2 called with code:", code, len(candles), "candles")
     # 1. 이동평균선 계산을 위해 최소 25개 이상의 데이터가 필요함
     if len(candles) < 25:
         if logger:

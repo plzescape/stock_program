@@ -10,7 +10,7 @@ MOCK_ACCOUNT_NO = "8118694111"
 QTY = 10  # 분할익절을 쓰려면 10주 이상 권장
 
 # ===== 손절 / 익절 / 트레일링 =====
-STOP_LOSS_RATE = 0.01   # -1%
+STOP_LOSS_RATE = 0.007   # -1% -> -0.7%
 
 TP1_RATE = 0.01         # +1%
 TP1_RATIO = 0.5         # 50% 매도
@@ -27,7 +27,7 @@ CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
 # 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "AUTO_CANDI_KOSDAQ_SCALP", "DANTA_1", "DANTA_2"
-CONDITION_NAME = "DANTA_1"
+CONDITION_NAME = "AUTO_CANDI_BREAKOUT"
 # CONDITION_INDEX = 0
 
 # ===== 스캔 설정 =====
@@ -35,7 +35,7 @@ SCAN_MAX_CODES = 30        # 조건검색 결과 중 최대 몇 종목만 스캔
 SCAN_TR_DELAY_MS = 300     # 종목별 TR 요청 간 최소 딜레이(밀리초)
 
 # ===== 매수/매도 포지션 최대 개수 =====
-MAX_POSITIONS = 5
+MAX_POSITIONS = 10
 
 # ===== 자가진단 =====
 TIME_STOP_SEC = 600        # 10분

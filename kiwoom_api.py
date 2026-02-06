@@ -41,7 +41,7 @@ class PositionState:
     trailing_active: bool = False
     ordering: bool = False
     selling: bool = False
-    
+    last_pnl_log_ts = 0.0
     # ⭐ Time Stop용
     entry_ts: float = field(default_factory=lambda: pytime.time())
     time_stop_done: bool = False
@@ -542,12 +542,14 @@ class KiwoomAPI(QAxWidget):
         now = pytime.time()
         pnl_rate = (cur - entry) / entry  # 현재 수익률
 
-        self.log_trade.info(
-            f"[PNL_CHECK] code={code} "
-            f"entry={pos.entry_price} "
-            f"current={cur} "
-            f"pnl={pnl_rate:.4f}"
-        )
+        if now - pos.last_pnl_log_ts >= 2: # 2초마다 이득률 로그 찍기
+            self.log_trade.info(
+                f"[PNL_CHECK] code={code} "
+                f"entry={pos.entry_price} "
+                f"current={cur} "
+                f"pnl={pnl_rate:.4f}"
+            )
+            pos.last_pnl_log_ts = now
 
         # STOP
         # if cur <= entry * (1 - STOP_LOSS_RATE):
@@ -858,6 +860,15 @@ class KiwoomAPI(QAxWidget):
         )        
         
         if side == "BUY":
+            # =========================
+            # ⭐ 동시 BUY 차단
+            # =========================
+            if any(o["side"] == "BUY" for o in self.pending_orders.values()):
+                self.log_trade.warning(
+                    f"[BUY_BLOCK_PENDING] code={code} reason=existing_pending"
+                )
+                return False 
+            
             # 포지션 슬롯 체크
             current_slots = len(self.positions) + sum(
                 1 for p in self.pending_orders.values() if p.get("side") == "BUY"

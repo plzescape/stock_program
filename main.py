@@ -76,16 +76,17 @@ def test_account(api: KiwoomAPI):
 
 #===== 자동매매 활성화 =====
 def enable_auto_trade(api: KiwoomAPI):
-    #if api.auto_trade_enabled:
-   #     return  # 이미 활성화됨
+    if api.auto_trade_enabled:
+       return  # 이미 활성화됨
         
     ok = api.self_check("POST_MARKET_OPEN")
     if ok:
-        #api.auto_trade_enabled = True
+        api.auto_trade_enabled = True
         notify_operator(
             "self-check 통과\n자동매매가 활성화되었습니다.",
             level="INFO"
         )
+        api.run_condition_cycle()
         return
 
     notify_operator(
@@ -115,10 +116,10 @@ def main():
         print("⚠️ 장전 self-check 실패 (재시도는 장 시작 후)")
     else:
         print("🟢 장전 self-check 통과")
-        notify_operator(
-            "self-check 통과\n자동매매가 활성화되었습니다.",
-            level="INFO"
-        )
+        # notify_operator(
+        #     "self-check 통과\n자동매매가 활성화되었습니다.",
+        #     level="INFO"
+        # )
            
     # 2-2) 장 시작 후 자동매매 활성화 예약
     now = datetime.now()
@@ -128,7 +129,7 @@ def main():
     QTimer.singleShot(delay_ms + 3000,  lambda: enable_auto_trade(api))    
     # enable_auto_trade(api)
     # 2-3) 조건검색 실행
-    api.run_condition_cycle()
+    # api.run_condition_cycle()
 
     sys.exit(app.exec_())
 

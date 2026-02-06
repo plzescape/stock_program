@@ -50,3 +50,5 @@ VOL_AVG_MIN = 50            # 평균 거래량 50 이하 = 사실상 정지
 BUY_FILL_TIMEOUT_SEC = 10     # 체결 대기 최대 8초 (너 환경에 맞게 5~15초 추천)
 CANCEL_RETRY_COOLDOWN_SEC = 2
 MAX_CANCEL_RETRIES = 2
+MAX_REENTRY_RETRIES = 2   # 취소 후 재매수 횟수
+REENTRY_DELAY_SEC = 1     # 재매수 딜레이

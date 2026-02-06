@@ -17,7 +17,7 @@ from collections import deque
 import time as pytime
 
 from config import (
-    IS_REAL, ACCOUNT_NO, QTY,
+    IS_REAL, ACCOUNT_NO, MAX_REENTRY_RETRIES, QTY, REENTRY_DELAY_SEC,
     STOP_LOSS_RATE, TP1_RATE, TP1_RATIO, TP2_RATE, TP2_RATIO,
     TRAIL_GAP,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
@@ -58,6 +58,8 @@ class KiwoomAPI(QAxWidget):
     def __init__(self):
         super().__init__()
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
+        # ----- Login state -----
+        self.auto_trade_enabled = False
 
         # ---- logger ----
         self.log_system = setup_logger("system", "system.log")
@@ -100,6 +102,7 @@ class KiwoomAPI(QAxWidget):
         #   order_no: str|None,
         #   cancel_retries: int,
         #   last_cancel_ts: float
+        #   "reentry_retries": int
         # }
         self.pending_orders: dict[str, dict] = {}
 
@@ -131,36 +134,37 @@ class KiwoomAPI(QAxWidget):
         - 일일 거래 횟수 제한
         - 시장 시간 / 진입 시간 방어
         """
-        # # 일일 리셋
-        # today = datetime.now().date()
-        # if today != self._today:
-        #     self._today = today
-        #     self.daily_trade_count = 0
-        #     self.traded_today.clear()
+        # 일일 리셋
+        today = datetime.now().date()
+        if today != self._today:
+            self._today = today
+            self.daily_trade_count = 0
+            self.traded_today.clear()
 
         # # 포지션 가득 차면 조건검색 중단
-        # if len(self.positions) >= MAX_POSITIONS:
-        #     return
+        if len(self.positions) >= MAX_POSITIONS:
+            return
 
         # # 일일 거래 제한
-        # if self.daily_trade_count >= MAX_TRADES_PER_DAY:
-        #     return
+        if self.daily_trade_count >= MAX_TRADES_PER_DAY:
+            return
 
-        # # 시장 시간 방어
-        # if not is_market_time():
-        #     return
+        # 시장 시간 방어
+        if not is_market_time():
+            self.log_system.info("[CONDITION] market closed")
+            return
 
-        # # 너무 늦은 시간 신규 진입 방지 (14:50 이후 차단)
-        # t = datetime.now().time()
-        # if t > time(14, 50):
-        #     return
+        # 너무 늦은 시간 신규 진입 방지 (14:50 이후 차단)
+        t = datetime.now().time()
+        if t > time(14, 50):
+            return
 
-        # # 조건검색 주기 제한
-        # now = datetime.now()
-        # if hasattr(self, "_last_condition_run") and self._last_condition_run:
-        #     diff = (now - self._last_condition_run).total_seconds() / 60.0
-        #     if diff < CONDITION_INTERVAL_MIN:
-        #         return
+        # 조건검색 주기 제한
+        now = datetime.now()
+        if hasattr(self, "_last_condition_run") and self._last_condition_run:
+            diff = (now - self._last_condition_run).total_seconds() / 60.0
+            if diff < CONDITION_INTERVAL_MIN:
+                return
         # self._last_condition_run = now
 
         idx = self.condition_map.get(CONDITION_NAME)
@@ -254,7 +258,7 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     def _scan_next(self):
         active_slots = len(self.positions) + self._count_pending_buys()
-        
+        print("Active slots:", active_slots, "Positions:", len(self.positions), "Pending buys:", self._count_pending_buys())
         if active_slots >= MAX_POSITIONS:
             self._scan_running = False
             return
@@ -268,7 +272,7 @@ class KiwoomAPI(QAxWidget):
         if pytime.time() - last_time < 30: # 마지막 조회 후 30초가 안 지났다면
             self.scan_queue.append(code)   # 다시 큐의 맨 뒤로 보냄
             # 0.2초 정도 쉬었다가 다음 종목 확인 (CPU 과부하 방지)
-            QTimer.singleShot(200, self._scan_next) 
+            QTimer.singleShot(1000, self._scan_next) 
             return        
         
         if code in self.positions or code in self.pending_orders:
@@ -278,6 +282,10 @@ class KiwoomAPI(QAxWidget):
         self.current_scan_code = code
         self.tr_inflight = True
         self.request_1min(code)
+        
+        # 타임아웃 타이머 관리
+        if hasattr(self, "_tr_timeout_timer") and self._tr_timeout_timer.isActive():
+            self._tr_timeout_timer.stop()
 
         self._tr_timeout_timer = QTimer()
         self._tr_timeout_timer.setSingleShot(True)
@@ -302,14 +310,7 @@ class KiwoomAPI(QAxWidget):
         self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
         screen = f"{9000 + (self._screen_seq % 100)}"
         self._screen_seq += 1
-      
-        # self.dynamicCall(
-        #     "CommRqData(QString, QString, int, QString)",
-        #     "opt10080_req",
-        #     "opt10080",
-        #     0,
-        #     screen
-        # )        
+         
         self.dynamicCall("CommRqData(QString, QString, int, QString)",
                          "RQ_1MIN", "OPT10080", 0, screen)
 
@@ -338,7 +339,7 @@ class KiwoomAPI(QAxWidget):
         completed_candles = candles[1:] if len(candles) > 1 else []
 
         # === ENTRY 성공 ===
-        if len(completed_candles) >= 3 and is_entry_candidate_VER2(completed_candles, self.log_signal, code):
+        if len(completed_candles) >= 25 and is_entry_candidate_VER2(completed_candles, self.log_signal, code):
             if len(self.positions) < MAX_POSITIONS:
                 self.send_market_order("BUY", code, QTY, "ENTRY")
             info["state"] = "DONE"
@@ -367,7 +368,7 @@ class KiwoomAPI(QAxWidget):
     def _finish_tr(self, delay=True):
         self.tr_inflight = False
         self.current_scan_code = None
-        self._scan_running = False
+        # self._scan_running = False
         QTimer.singleShot(
             SCAN_TR_DELAY_MS if delay else 0,
             self._scan_next
@@ -400,6 +401,18 @@ class KiwoomAPI(QAxWidget):
         
         # CANCEL_DONE
         if "취소" in order_gubun or "취소" in status:
+            pend = self.pending_orders.get(code)
+            if pend and pend.get("side") == "BUY":
+                retries = pend.get("reentry_retries", 0)
+                if retries < MAX_REENTRY_RETRIES:
+                    # 재매수 시도
+                    self.log_trade.info(f"[REENTRY_TRIGGER] {code} retry={retries+1}")
+                    QTimer.singleShot(
+                        REENTRY_DELAY_SEC * 1000,
+                        lambda c=code, q=pend["qty"], r=pend["reason"]: self._reentry_buy(c, q, r, retries+1)
+                    )
+                    pend["reentry_retries"] = retries + 1
+                    self.log_trade.info(f"[CANCEL_RETRY_BUY] code={code} retry={retries + 1}")
             self.pending_orders.pop(code, None)
             # self.ordering = False
             self.last_order_ts = None
@@ -508,6 +521,7 @@ class KiwoomAPI(QAxWidget):
 
         entry = pos.entry_price
         now = pytime.time()
+        pnl_rate = (cur - entry) / entry  # 현재 수익률
 
         # STOP
         if cur <= entry * (1 - STOP_LOSS_RATE):
@@ -519,6 +533,18 @@ class KiwoomAPI(QAxWidget):
                 pos.selling = True
             else:
                 pos.selling = False  # 혹시라도 이전에 True 됐으면 복구
+            return
+
+        # 조건: TP1(1%)을 이미 달성한 상태에서, 수익률이 0.5% 이하로 밀리면 본절가에서 탈출
+        if pos.tp1_done and pnl_rate <= 0.005: # 0.5% 기준
+            if self.can_try_sell(pos):
+                self.log_trade.info(f"[PROFIT_SAFEGUARD] {code} 수익 보존을 위해 본절 매도 (현재가:{cur})")
+                ok = self.send_market_order("SELL", code, pos.remain_qty, "PROFIT_SAFE")
+                if ok:
+                    pos.last_sell_attempt_ts = now
+                    pos.selling = True
+                else:
+                    pos.selling = False
             return
 
         # TP1
@@ -750,6 +776,37 @@ class KiwoomAPI(QAxWidget):
                 self.pending_orders.pop(code, None)
 
     # ==================================================
+    # 재매수 함수
+    # ==================================================
+    def _reentry_buy(self, code, qty, reason, retry_cnt):
+
+        # 이미 포지션 생겼으면 중단
+        if code in self.positions:
+            return
+
+        # 슬롯 초과 방지
+        active_slots = len(self.positions) + self._count_pending_buys()
+        if active_slots >= MAX_POSITIONS:
+            return
+
+        self.log_trade.info(
+            f"[REENTRY_BUY] code={code} retry={retry_cnt}"
+        )
+
+        ok = self.send_market_order(
+            "BUY",
+            code,
+            qty,
+            f"{reason}_RETRY{retry_cnt}"
+        )
+
+        if ok:
+            # pending 갱신
+            if code in self.pending_orders:
+                self.pending_orders[code]["reentry_retries"] = retry_cnt
+
+
+    # ==================================================
     # 매도 / 매수 주문 함수
     # ==================================================
     def send_market_order(self, side, code, qty, reason=""):
@@ -758,6 +815,11 @@ class KiwoomAPI(QAxWidget):
                 f"[ORDER_ABORT] side={side} code={code} qty={qty} reason={reason}"
             )            
             return False
+        
+        now = pytime.time()        
+        if self.last_order_ts and now - self.last_order_ts < 0.5:
+            self.log_trade.warning(f"[ORDER_THROTTLE] side={side} code={code} qty={qty}")
+            return False        
         
         order_type = 1 if side == "BUY" else 2
         screen = "9200" if side == "BUY" else "9100"
@@ -814,6 +876,8 @@ class KiwoomAPI(QAxWidget):
                            
             return False
         else:
+            # 주문 접수 성공
+            self.last_order_ts = now # 주문 성공 시 시점 기록
             self.pending_orders[code] = {
                 "side": side,
                 "qty": qty,
@@ -821,7 +885,8 @@ class KiwoomAPI(QAxWidget):
                 "reason": reason,
                 "order_no": None,       # 주문번호 (체결시 채워짐)
                 "cancel_retries": 0,
-                "last_cancel_ts": 0.0
+                "last_cancel_ts": 0.0,
+                "reentry_retries": 0
             }
         return True
 
@@ -842,7 +907,7 @@ class KiwoomAPI(QAxWidget):
         - 최신봉 → 과거봉 순서 유지
         """
 
-        rqname = "opt10080_req"
+        rqname = "RQ_1MIN"
         trcode = "opt10080"
 
         candles = []
@@ -851,7 +916,10 @@ class KiwoomAPI(QAxWidget):
             rows = self.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
 
             if rows <= 0:
-                self.log_system.warning(f"[1MIN_PARSE_EMPTY] {code}")
+                # 새벽 시간이나 서버 점검 시에는 rows가 0으로 올 수 있습니다.
+                # 현재 시간을 같이 찍어주면 '아, 지금은 장외 시간이라 그렇구나'라고 확신할 수 있습니다.
+                now_str = datetime.now().strftime('%H:%M:%S')
+                self.log_system.warning(f"[1MIN_PARSE_EMPTY] {code} - Time: {now_str}")
                 return []
 
             # ✔ 최소 30개 확보 (여유 두고 60까지 가져와도 OK)

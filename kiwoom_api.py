@@ -169,7 +169,7 @@ class KiwoomAPI(QAxWidget):
             diff = (now - self._last_condition_run).total_seconds() / 60.0
             if diff < CONDITION_INTERVAL_MIN:
                 return
-        # self._last_condition_run = now
+        self._last_condition_run = now
 
         idx = self.condition_map.get(CONDITION_NAME)
         if idx is None:
@@ -578,7 +578,7 @@ class KiwoomAPI(QAxWidget):
             return
 
         # TP1
-        if not pos.tp1_done and cur >= entry * (1 + TP1_RATE):
+        if not pos.tp1_done and pnl_rate >= TP1_RATE:
             if not self.can_try_sell(pos):
                 return  
             
@@ -597,7 +597,7 @@ class KiwoomAPI(QAxWidget):
             return
 
         # TP2
-        if pos.tp1_done and not pos.tp2_done and cur >= entry * (1 + TP2_RATE):
+        if pos.tp1_done and not pos.tp2_done and pnl_rate >= TP2_RATE:
             if not self.can_try_sell(pos):
                 return
 

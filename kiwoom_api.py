@@ -41,7 +41,7 @@ class PositionState:
     trailing_active: bool = False
     ordering: bool = False
     selling: bool = False
-    last_pnl_log_ts = 0.0
+    last_pnl_log_ts: float = 0.0
     
     tp1_order_no: str | None = None
     tp2_order_no: str | None = None
@@ -764,86 +764,85 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # 주문 취소 함수
     # ==================================================
-    def send_cancel_order(self, code: str, org_order_no: str) -> bool:
-        """
-        원주문번호 기반 BUY 취소
-        nOrderType: 3(매수취소), 4(매도취소)
-        """
+    def send_cancel_order(self, code: str, org_order_no: str, cancel_side: str = "SELL") -> bool:
+
         if not org_order_no:
             self.log_system.error(f"[CANCEL_ABORT] no org_order_no code={code}")
             return False
 
-        pend = self.pending_orders.get(code)
-
-        # TP 주문번호 저장
-        if pend and pend["side"] == "SELL":
-            if pend["reason"] == "TP1_LIMIT":
-                pos.tp1_order_no = pend["order_no"]
-            elif pend["reason"] == "TP2_LIMIT":
-                pos.tp2_order_no = pend["order_no"]
+        order_type = 3 if cancel_side == "BUY" else 4
 
         ret = self.dynamicCall(
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [
-                "BUY_CANCEL",          # sRQName (아무 문자열 가능)
-                "9200",                # sScreenNo
-                self.get_account(),    # sAccNo
-                3,                     # nOrderType: 매수취소
-                code,                  # sCode
-                pend["qty"],           # nQty (0으로도 취소 동작하는 경우 많음)
-                0,                     # nPrice
-                "00",                  # sHogaGb (취소는 보통 "00")
-                org_order_no           # sOrgOrderNo
+                "CANCEL",
+                "9200",
+                self.get_account(),
+                order_type,
+                code,
+                0,      # 취소는 qty 0 허용
+                0,
+                "00",
+                org_order_no
             ]
         )
 
-        self.log_trade.info(f"[CANCEL_SEND] code={code} org={org_order_no} ret={ret}")
-        return (ret == 0)
+        if ret != 0:
+            self.log_trade.error(
+                f"[CANCEL_FAIL] code={code} org={org_order_no} ret={ret}"
+            )
+            return False
+
+        self.log_trade.info(
+            f"[CANCEL_SEND] code={code} org={org_order_no} side={cancel_side}"
+        )
+
+        return True
     
     # ==================================================
     # TP 주문 취소 함수 (pending 분리 구조 대응)
     # ==================================================
     def cancel_tp_orders(self, code):
-    
+
         pos = self.positions.get(code)
         if not pos:
             return
-    
+
         cancel_list = [
             pos.tp1_order_no,
             pos.tp2_order_no
         ]
-    
+
         for order_no in cancel_list:
-        
+
             if not order_no:
                 continue
-            
+
             # ------------------------
             # 주문 취소 전송
             # ------------------------
-            self.send_cancel_order(code, order_no)
-    
+            self.send_cancel_order(code, order_no, cancel_side="SELL")
+
             # ------------------------
             # 확정 pending 제거
             # ------------------------
             self.tp_pending_orders.pop(order_no, None)
-    
+
             self.log_trade.info(
                 f"[TP_CANCEL_REQ] code={code} order_no={order_no}"
             )
-    
+
         # ------------------------
         # temp pending 제거
         # ------------------------
         self.tp_pending_temp.pop(code, None)
-    
+
         # ------------------------
         # 포지션 order_no 초기화
         # ------------------------
         pos.tp1_order_no = None
         pos.tp2_order_no = None
-    
+
         self.log_trade.info(f"[TP_CANCEL_DONE] code={code}")
 
     # ==================================================
@@ -953,7 +952,7 @@ class KiwoomAPI(QAxWidget):
                 continue
             
             # 취소 시도
-            ok = self.send_cancel_order(code, org)
+            ok = self.send_cancel_order(code, org, cancel_side="BUY")
             pend["last_cancel_ts"] = now
             pend["cancel_retries"] = int(pend.get("cancel_retries", 0)) + 1
     
@@ -1245,7 +1244,7 @@ class KiwoomAPI(QAxWidget):
             # 너무 오래된 BUY → 취소 시도
             if pend["side"] == "BUY" and age > 30:
                 if pend.get("order_no"):
-                    self.send_cancel_order(code, pend["order_no"])    
+                    self.send_cancel_order(code, pend["order_no"], cancel_side="BUY")    
 
     # ==================================================
     # 소프트 리셋

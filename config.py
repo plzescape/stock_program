@@ -10,7 +10,7 @@ MOCK_ACCOUNT_NO = "8118694111"
 QTY = 20  # 분할익절을 쓰려면 10주 이상 권장
 
 # ===== 손절 / 익절 / 트레일링 =====
-STOP_LOSS_RATE = 0.01   # -1%
+STOP_LOSS_RATE = 0.015   # -1.5%
 
 TP1_RATE = 0.01         # +1%
 TP1_RATIO = 0.5         # 50% 매도
@@ -19,7 +19,7 @@ TP2_RATE = 0.02         # +2%
 TP2_RATIO = 0.3         # 30% 매도
 
 TRAIL_START_RATE = 0.02 # +2%부터 트레일링 활성화
-TRAIL_GAP = 0.01        # 고점 대비 1% 하락 시 청산
+TRAIL_GAP = 0.015        # 고점 대비 1.5% 하락 시 청산
 
 # ===== 제한 =====
 MAX_TRADES_PER_DAY = 100

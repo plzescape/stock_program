@@ -53,3 +53,7 @@ MAX_CANCEL_RETRIES = 2
 MAX_REENTRY_RETRIES = 2   # 취소 후 재매수 횟수
 REENTRY_DELAY_SEC = 1     # 재매수 딜레이
 FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
+
+# ===== TP 지정가 재시도 =====
+TP_LIMIT_MAX_RETRIES = 2   # 지정가 재시도 최대 횟수
+TP_RETRY_DELAY_SEC = 2     # 재시도 간 딜레이(초)

@@ -52,7 +52,7 @@ def is_entry_candidate_1min(candles, logger=None, code=None) -> bool:
 #   ===========================
 def is_entry_candidate(candles, logger=None, code=None) -> bool:
     """candles: 최신봉이 index 0 (최근 3개 필요)"""
-    print("is_entry_candidate called with code:", code, len(candles), "candles")
+    # print("is_entry_candidate called with code:", code, len(candles), "candles")
     if len(candles) < 3:
         return False
 

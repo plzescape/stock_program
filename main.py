@@ -10,6 +10,8 @@ MAX_SELF_CHECK_RETRY = 10   # 최대 재시도 횟수
 SELF_CHECK_RETRY_SEC = 60
 
 #===== 디스코드 웹훅 URL =====
+# 보안을 위해 환경변수 또는 config 파일에서 관리 권장
+# 예: DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1465022221994037339/mOln_VqVzMAQRInrUic86Ysr482ZDIjMFB6EoUR9U3dUpMkqTw-Keyf0InVpUwE2IkTu"
 
 #===== 운영자 알림 - 디스코드 =====

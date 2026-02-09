@@ -32,7 +32,8 @@ CONDITION_NAME = "AUTO_CANDI_BREAKOUT"
 
 # ===== 스캔 설정 =====
 SCAN_MAX_CODES = 30        # 조건검색 결과 중 최대 몇 종목만 스캔할지
-SCAN_TR_DELAY_MS = 300     # 종목별 TR 요청 간 최소 딜레이(밀리초)
+SCAN_TR_DELAY_MS = 700     # 종목별 TR 요청 간 최소 딜레이(밀리초)
+SCAN_CODE_COOLDOWN_SEC = 30  # 같은 종목 재스캔 방지 쿨타임(초)
 
 # ===== 매수/매도 포지션 최대 개수 =====
 MAX_POSITIONS = 10

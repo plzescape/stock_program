@@ -21,7 +21,7 @@ from config import (
     CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
     MAX_POSITIONS, TP_RETRY_DELAY_SEC, TP_LIMIT_MAX_RETRIES,
-    BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT
+    BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2
@@ -296,7 +296,7 @@ class KiwoomAPI(QAxWidget):
         
     # 🟢 추가된 쿨타임 체크 로직
         last_time = self.last_scan_times.get(code, 0)
-        if pytime.time() - last_time < 30: # 마지막 조회 후 30초가 안 지났다면
+        if pytime.time() - last_time < SCAN_CODE_COOLDOWN_SEC:
             self.scan_queue.append(code)   # 다시 큐의 맨 뒤로 보냄
             # 0.2초 정도 쉬었다가 다음 종목 확인 (CPU 과부하 방지)
             QTimer.singleShot(1000, self._scan_next) 
@@ -657,7 +657,7 @@ class KiwoomAPI(QAxWidget):
             ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             if ok:
                 pos.last_sell_attempt_ts = now
-                # pos.selling = True
+                pos.selling = True
             else:
                 pos.selling = False  # 혹시라도 이전에 True 됐으면 복구
             return
@@ -670,7 +670,7 @@ class KiwoomAPI(QAxWidget):
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "PROFIT_SAFE")
                 if ok:
                     pos.last_sell_attempt_ts = now
-                    # pos.selling = True
+                    pos.selling = True
                 else:
                     pos.selling = False
             return
@@ -693,7 +693,7 @@ class KiwoomAPI(QAxWidget):
 
                 if ok:
                     pos.trailing_active = False  # 성공 후에만 끄는 게 안전
-                    # pos.selling = True
+                    pos.selling = True
                 else:
                     pos.selling = False
 
@@ -731,7 +731,7 @@ class KiwoomAPI(QAxWidget):
 
                 if ok:
                     pos.time_stop_done = True
-                    # pos.selling = True
+                    pos.selling = True
                 else:
                     pos.selling = False
 
@@ -842,11 +842,12 @@ class KiwoomAPI(QAxWidget):
             return
 
         cancel_list = [
-            pos.tp1_order_no,
-            pos.tp2_order_no
+            ("tp1", pos.tp1_order_no),
+            ("tp2", pos.tp2_order_no)
         ]
 
-        for order_no in cancel_list:
+        all_ok = True
+        for tp_tag, order_no in cancel_list:
 
             if not order_no:
                 continue
@@ -854,29 +855,36 @@ class KiwoomAPI(QAxWidget):
             # ------------------------
             # 주문 취소 전송
             # ------------------------
-            self.send_cancel_order(code, order_no, cancel_side="SELL")
+            ok = self.send_cancel_order(code, order_no, cancel_side="SELL")
 
-            # ------------------------
-            # 확정 pending 제거
-            # ------------------------
-            self.tp_pending_orders.pop(order_no, None)
+            if ok:
+                # 취소 성공 시에만 정리
+                self.tp_pending_orders.pop(order_no, None)
+                if tp_tag == "tp1":
+                    pos.tp1_order_no = None
+                elif tp_tag == "tp2":
+                    pos.tp2_order_no = None
 
-            self.log_trade.info(
-                f"[TP_CANCEL_REQ] code={code} order_no={order_no}"
-            )
+                self.log_trade.info(
+                    f"[TP_CANCEL_OK] code={code} order_no={order_no}"
+                )
+            else:
+                # 취소 실패 → order_no 유지 (다음 틱에서 재시도 가능)
+                all_ok = False
+                self.log_trade.error(
+                    f"[TP_CANCEL_FAIL_KEEP] code={code} order_no={order_no} "
+                    f"- keeping order_no for retry"
+                )
 
         # ------------------------
-        # temp pending 제거
+        # temp pending 제거 (이건 아직 주문번호 배정 전이므로 무조건 정리)
         # ------------------------
         self.tp_pending_temp.pop(code, None)
 
-        # ------------------------
-        # 포지션 order_no 초기화
-        # ------------------------
-        pos.tp1_order_no = None
-        pos.tp2_order_no = None
-
-        self.log_trade.info(f"[TP_CANCEL_DONE] code={code}")
+        if all_ok:
+            self.log_trade.info(f"[TP_CANCEL_DONE] code={code}")
+        else:
+            self.log_trade.warning(f"[TP_CANCEL_PARTIAL] code={code} some cancels failed")
 
     # ==================================================
     # 지정가 매도 함수

@@ -134,3 +134,36 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
         )
 
     return is_valid
+
+
+def get_entry_signal_data(candles) -> dict | None:
+    """
+    is_entry_candidate_VER2와 동일한 조건으로 전략 지표를 계산하여 반환.
+    디스코드 알림용. 진입 조건 불충분이면 None 반환.
+    """
+    if len(candles) < 25:
+        return None
+
+    c1 = candles[0]
+    c2 = candles[1]
+    prev_5_candles = candles[1:6]
+
+    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
+
+    avg_vol = sum(c['volume'] for c in prev_5_candles) / len(prev_5_candles)
+    vol_ratio = c1['volume'] / avg_vol if avg_vol > 0 else 0
+
+    candle_range = c1['high'] - c1['low']
+    body_size = c1['close'] - c1['open']
+    candle_strength = (body_size / candle_range * 100) if candle_range > 0 else 0
+
+    trend = "MA20 상승" if ma20_now > ma20_prev else "MA20 하락"
+    breakout = "직전 고점 돌파" if c1['close'] > c2['high'] else "돌파 미달"
+
+    return {
+        "vol_ratio": vol_ratio,
+        "trend": trend,
+        "breakout": breakout,
+        "candle_strength": candle_strength,
+    }

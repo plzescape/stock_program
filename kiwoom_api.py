@@ -24,7 +24,7 @@ from config import (
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
 )
 from logger_util import setup_logger
-from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2
+from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data
 
 
 @dataclass
@@ -137,6 +137,10 @@ class KiwoomAPI(QAxWidget):
         # ===== TR 요청 간격 관리 =====        
         self.TR_REQ_INTERVAL = 1
         self._last_tr_time = 0
+
+        # ===== 진입 신호 데이터 (디스코드 알림용) =====
+        # code -> { vol_ratio, trend, breakout, candle_strength }
+        self._entry_signals: dict[str, dict] = {}
 
     # ==================================================
     # Login / condition
@@ -368,6 +372,10 @@ class KiwoomAPI(QAxWidget):
         # === ENTRY 성공 ===
         if len(completed_candles) >= 25 and is_entry_candidate_VER2(completed_candles, self.log_signal, code):
             if len(self.positions) < MAX_POSITIONS:
+                # 전략 지표 저장 (디스코드 알림용)
+                sig = get_entry_signal_data(completed_candles)
+                if sig:
+                    self._entry_signals[code] = sig
                 self.send_market_order("BUY", code, QTY, "ENTRY")
             info["state"] = "DONE"
             self._finish_tr(delay=True)
@@ -545,7 +553,22 @@ class KiwoomAPI(QAxWidget):
                 self.log_trade.info(
                     f"[TP_REGISTERED] code={code} "
                     f"tp1={tp1_price} tp2={tp2_price}"
-                )                
+                )
+
+                # ── 디스코드 매수 체결 알림 ──
+                try:
+                    from discord_notify import notify_buy_fill
+                    notify_buy_fill(
+                        code=code,
+                        name=self.get_stock_name(code),
+                        qty=pos.total_qty,
+                        price=pos.entry_price,
+                        tp1_price=tp1_price,
+                        tp2_price=tp2_price,
+                        signal_data=self._entry_signals.pop(code, None)
+                    )
+                except Exception as e:
+                    self.log_system.warning(f"[DISCORD_FAIL] BUY notify: {e}")                
                 
             return
 
@@ -577,6 +600,17 @@ class KiwoomAPI(QAxWidget):
                     f"[TP1_FILLED] code={code} "
                     f"remain={pos.remain_qty}"
                 )
+                # ── 디스코드 TP1 알림 ──
+                try:
+                    from discord_notify import notify_tp1_fill
+                    notify_tp1_fill(
+                        code=code, name=self.get_stock_name(code),
+                        qty=qty, sell_price=price,
+                        entry_price=pos.entry_price,
+                        remain_qty=pos.remain_qty
+                    )
+                except Exception as e:
+                    self.log_system.warning(f"[DISCORD_FAIL] TP1: {e}")
 
             elif order_no == pos.tp2_order_no:
                 pos.tp2_done = True
@@ -586,6 +620,17 @@ class KiwoomAPI(QAxWidget):
                     f"[TP2_FILLED] code={code} "
                     f"trailing_active=ON"
                 )
+                # ── 디스코드 TP2 알림 ──
+                try:
+                    from discord_notify import notify_tp2_fill
+                    notify_tp2_fill(
+                        code=code, name=self.get_stock_name(code),
+                        qty=qty, sell_price=price,
+                        entry_price=pos.entry_price,
+                        remain_qty=pos.remain_qty
+                    )
+                except Exception as e:
+                    self.log_system.warning(f"[DISCORD_FAIL] TP2: {e}")
             
             # 🔴 핵심: 체결 발생했으면 일단 selling 해제
             # (부분체결이든 전량체결이든 다시 매도 시도 가능해야 함)            
@@ -601,6 +646,34 @@ class KiwoomAPI(QAxWidget):
             
             # 전량 매도 완료
             # pos.selling = False
+            sell_reason = ""
+            sell_pend = self.pending_orders.get(code)
+            if sell_pend:
+                sell_reason = sell_pend.get("reason", "")
+
+            # ── 디스코드 매도 알림 (reason별 분기) ──
+            try:
+                stock_name = self.get_stock_name(code)
+                entry_p = pos.entry_price if hasattr(pos, 'entry_price') else price
+
+                if "STOP_LOSS" in sell_reason:
+                    from discord_notify import notify_stop_loss
+                    notify_stop_loss(code, stock_name, qty, price, entry_p)
+                elif "PROFIT_SAFE" in sell_reason:
+                    from discord_notify import notify_profit_safe
+                    notify_profit_safe(code, stock_name, qty, price, entry_p)
+                elif "TRAIL_STOP" in sell_reason:
+                    from discord_notify import notify_trail_stop
+                    notify_trail_stop(code, stock_name, qty, price, entry_p)
+                elif "TIME_STOP" in sell_reason or "VOL_TIME_STOP" in sell_reason:
+                    from discord_notify import notify_time_stop
+                    notify_time_stop(code, stock_name, qty, price, entry_p, sell_reason)
+                elif "FORCE_LIQUIDATION" in sell_reason:
+                    from discord_notify import notify_force_liquidation
+                    notify_force_liquidation(code, stock_name, qty, entry_p)
+            except Exception as e:
+                self.log_system.warning(f"[DISCORD_FAIL] SELL notify: {e}")
+
             self.positions.pop(code, None)
             self.pending_orders.pop(code, None)
             self.traded_today.add(code)
@@ -1363,6 +1436,16 @@ class KiwoomAPI(QAxWidget):
             return ACCOUNT_NO
         return MOCK_ACCOUNT_NO
 
+    # 3-1. 종목명 조회
+    def get_stock_name(self, code: str) -> str:
+        try:
+            name = self.dynamicCall(
+                "GetMasterCodeName(QString)", code
+            ).strip()
+            return name if name else code
+        except Exception:
+            return code
+
     # 4. 매도 시도 가능 여부
     def can_try_sell(self, pos: PositionState) -> bool:
         now = pytime.time()
@@ -1665,3 +1748,50 @@ class KiwoomAPI(QAxWidget):
                         lambda c=code, t=rqname, q=item["qty"], p=item["price"]:
                             self._retry_tp_order(c, t, q, p)
                     )
+                    
+    # ==================================================
+    # 14:50 강제 전량 청산
+    # ==================================================                    
+    def force_liquidation_all(self):
+        """
+        14:50 강제 전량 청산
+        """
+        self.log_system.warning("[FORCE_LIQUIDATION_START]")
+
+        for code, pos in list(self.positions.items()):
+
+            if pos.remain_qty <= 0:
+                continue
+
+            if pos.selling:
+                continue
+
+            self.log_trade.warning(
+                f"[FORCE_SELL] code={code} qty={pos.remain_qty}"
+            )
+
+            # ── 디스코드 강제청산 알림 ──
+            try:
+                from discord_notify import notify_force_liquidation
+                notify_force_liquidation(
+                    code=code,
+                    name=self.get_stock_name(code),
+                    qty=pos.remain_qty,
+                    entry_price=pos.entry_price
+                )
+            except Exception as e:
+                self.log_system.warning(f"[DISCORD_FAIL] FORCE_LIQ: {e}")
+
+            # TP 취소
+            self.cancel_tp_orders(code)
+
+            # 시장가 전량 매도
+            ok = self.send_market_order(
+                "SELL",
+                code,
+                pos.remain_qty,
+                "FORCE_LIQUIDATION"
+            )
+
+            if ok:
+                pos.selling = True                    

@@ -22,7 +22,7 @@ TRAIL_START_RATE = 0.02 # +2%부터 트레일링 활성화
 TRAIL_GAP = 0.015        # 고점 대비 1.5% 하락 시 청산
 
 # ===== 제한 =====
-MAX_TRADES_PER_DAY = 100
+MAX_TRADES_PER_DAY = 1000
 CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====

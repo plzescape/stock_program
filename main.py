@@ -7,59 +7,6 @@ from datetime import datetime, time
 import requests
 
 MAX_SELF_CHECK_RETRY = 10   # 최대 재시도 횟수
-SELF_CHECK_RETRY_SEC = 60
-
-#===== 디스코드 웹훅 URL =====
-# 보안을 위해 환경변수 또는 config 파일에서 관리 권장
-# 예: DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1465022221994037339/mOln_VqVzMAQRInrUic86Ysr482ZDIjMFB6EoUR9U3dUpMkqTw-Keyf0InVpUwE2IkTu"
-
-#===== 운영자 알림 - 디스코드 =====
-def notify_operator(
-    msg: str,
-    level: str = "WARNING",
-    retry_info: str | None = None
-):
-    """
-    level: INFO | WARNING | CRITICAL
-    """
-
-    color_map = {
-        "INFO": 0x2ECC71,      # 초록
-        "WARNING": 0xF1C40F,   # 노랑
-        "CRITICAL": 0xE74C3C   # 빨강
-    }
-
-    embed = {
-        "title": "🚨 AUTO-TRADE ALERT",
-        "description": msg,
-        "color": color_map.get(level, 0xF1C40F),
-        "fields": [],
-        "footer": {
-            "text": "Kiwoom Auto-Trade Monitor"
-        },
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-    if retry_info:
-        embed["fields"].append({
-            "name": "Retry Status",
-            "value": retry_info,
-            "inline": False
-        })
-
-    payload = {
-        "embeds": [embed]
-    }
-
-    try:
-        requests.post(
-            DISCORD_WEBHOOK_URL,
-            json=payload,
-            timeout=3
-        )
-    except Exception as e:
-        print("⚠️ Discord 알림 실패:", e)
 
 #===== 계좌 테스트 =====
 def test_account(api: KiwoomAPI):
@@ -84,20 +31,42 @@ def enable_auto_trade(api: KiwoomAPI):
     ok = api.self_check("POST_MARKET_OPEN")
     if ok:
         api.auto_trade_enabled = True
-        notify_operator(
-            "self-check 통과\n자동매매가 활성화되었습니다.",
-            level="INFO"
-        )
+
+        # ── 디스코드 장 시작 알림 ──
+        try:
+            from discord_notify import notify_market_open
+            notify_market_open(
+                account_no=api.get_account(),
+                is_real=IS_REAL,
+                position_count=len(api.positions)
+            )
+        except Exception as e:
+            print(f"⚠️ Discord 장시작 알림 실패: {e}")
+
         api.run_condition_cycle()
+        
         return
 
-    notify_operator(
-        "self-check 실패\n계좌 / 포지션 / 주문 상태 확인 필요",
-        level="WARNING",
-        retry_info=f"{api.self_check_retry_count}/{MAX_SELF_CHECK_RETRY}"
+#===== 강제 청산 예약 =====        
+def schedule_force_liquidation(api):
+
+    now = datetime.now()
+
+    liquidation_time = datetime.combine(
+        now.date(),
+        time(14, 50)
     )
-        
-   
+
+    delay_ms = max(
+        0,
+        int((liquidation_time - now).total_seconds() * 1000)
+    )
+
+    QTimer.singleShot(
+        delay_ms,
+        lambda: api.force_liquidation_all()
+    )
+
 #===== 메인 함수 =====        
 def main():
     app = QApplication(sys.argv)
@@ -118,10 +87,6 @@ def main():
         print("⚠️ 장전 self-check 실패 (재시도는 장 시작 후)")
     else:
         print("🟢 장전 self-check 통과")
-        # notify_operator(
-        #     "self-check 통과\n자동매매가 활성화되었습니다.",
-        #     level="INFO"
-        # )
            
     # 2-2) 장 시작 후 자동매매 활성화 예약
     now = datetime.now()
@@ -132,6 +97,11 @@ def main():
     # enable_auto_trade(api)
     # 2-3) 조건검색 실행
     # api.run_condition_cycle()
+
+    # =========================
+    # ⏰ 14:50 강제청산 예약
+    # =========================
+    schedule_force_liquidation(api)
 
     sys.exit(app.exec_())
 

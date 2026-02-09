@@ -126,6 +126,7 @@ class KiwoomAPI(QAxWidget):
         self.tr_inflight = False
         self.current_scan_code = None
         self._screen_seq = 0
+        self._order_screen_seq = 0   # 주문 전용 화면번호 시퀀스
         self.TR_TIMEOUT_MS = 2000
 
         # ===== 스캔 타임스탬프 =====
@@ -762,6 +763,21 @@ class KiwoomAPI(QAxWidget):
                 return
 
     # ==================================================
+    # 주문 화면번호 생성 (고유값)
+    # ==================================================
+    def _next_order_screen(self, prefix: str = "92") -> str:
+        """
+        주문마다 고유 화면번호 반환.
+        prefix="92" → "9200"~"9299", prefix="91" → "9100"~"9199"
+        같은 화면번호를 재사용하면 이전 주문의 OnReceiveMsg/Chejan이
+        유실되거나 충돌할 수 있으므로 순환 사용.
+        """
+        base = int(prefix) * 100
+        seq = self._order_screen_seq % 100
+        self._order_screen_seq += 1
+        return str(base + seq)
+
+    # ==================================================
     # 주문 취소 함수
     # ==================================================
     def send_cancel_order(self, code: str, org_order_no: str, cancel_side: str = "SELL") -> bool:
@@ -776,7 +792,7 @@ class KiwoomAPI(QAxWidget):
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [
                 "CANCEL",
-                "9200",
+                self._next_order_screen("93"),
                 self.get_account(),
                 order_type,
                 code,
@@ -874,7 +890,7 @@ class KiwoomAPI(QAxWidget):
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [
                 tag,                   # sRQName
-                "9100",                # screen
+                self._next_order_screen("91"),  # screen
                 self.get_account(),
                 2,                     # SELL
                 code,
@@ -910,7 +926,7 @@ class KiwoomAPI(QAxWidget):
     # pending BUY 취소 감시 함수
     # ==================================================
     def check_pending_buy_cancel(self):
-        from config import BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES
+        from config import BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT
     
         now = pytime.time()
     
@@ -931,12 +947,31 @@ class KiwoomAPI(QAxWidget):
             if age < BUY_FILL_TIMEOUT_SEC:
                 continue
             
-            # 주문번호 아직 없으면 취소 불가 → 로그만
+            # 주문번호 아직 없으면 취소 불가
             org = pend.get("order_no")
             if not org:
+                # ⭐ 강제 포기: order_no 없이 FORCE_ABANDON_TIMEOUT 초과 시 제거
                 self.log_system.warning(
                     f"[CANCEL_WAIT] code={code} no order_no yet age={age:.1f}s"
                 )
+               # ⭐ 강제 포기: order_no 없이 FORCE_ABANDON_TIMEOUT 초과 시 제거
+                if age > FORCE_ABANDON_TIMEOUT:
+                    self.log_system.error(
+                        f"[FORCE_ABANDON] code={code} no order_no after {age:.1f}s - removing from pending"
+                    )
+                    self.pending_orders.pop(code, None)
+                    self.ordering = False
+                    self._pending_buy_code = None
+                    self._pending_buy_qty = 0
+                    self._resume_scan_if_possible()
+                    continue
+                # 로그 스팸 방지: 5초마다 한 번만 경고
+                last_warn = float(pend.get("_last_warn_ts", 0.0))
+                if now - last_warn >= 5.0:
+                    self.log_system.warning(
+                        f"[CANCEL_WAIT] code={code} no order_no yet age={age:.1f}s (abandon in {FORCE_ABANDON_TIMEOUT - age:.0f}s)"
+                    )
+                    pend["_last_warn_ts"] = now
                 continue
             
             # 취소 재시도 쿨다운/횟수 제한
@@ -1012,7 +1047,7 @@ class KiwoomAPI(QAxWidget):
             return False        
         
         order_type = 1 if side == "BUY" else 2
-        screen = "9200" if side == "BUY" else "9100"
+        screen = self._next_order_screen("92" if side == "BUY" else "91")
         
         self.log_trade.info(
             f"[ORDER_TRY] side={side} code={code} qty={qty} reason={reason}"
@@ -1452,5 +1487,39 @@ class KiwoomAPI(QAxWidget):
     # 메시지 수신
     # ==================================================
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
+        self.log_system.info(f"[RECV_MSG] screen={screen_no} rq={rqname} tr={trcode} msg={msg}")
+
         if "주문완료" in msg:
             self.last_order_ts = pytime.time()
+            return
+
+        # ── 주문 거부/실패 감지 ──
+        # 키움 서버가 주문을 거부하면 Chejan 이벤트는 발생하지 않으므로
+        # 여기서 pending_orders를 직접 정리해야 무한 대기를 방지할 수 있다.
+        reject_keywords = ["거부", "오류", "실패", "제한", "정지", "불가", "초과", "부족"]
+        is_reject = any(kw in msg for kw in reject_keywords)
+
+        if not is_reject:
+            return
+
+        self.log_system.error(
+            f"[ORDER_REJECT] screen={screen_no} rq={rqname} msg={msg}"
+        )
+
+        # rqname이 "BUY" 또는 "SELL"인 경우 → send_market_order에서 발송
+        # pending_orders 중 해당 side와 매칭되는 항목 정리
+        # (screen_no로는 code를 특정할 수 없으므로, 가장 최근 pending을 대상으로 처리)
+        if rqname in ("BUY", "SELL"):
+            # order_no가 아직 None인 pending 중 side가 일치하는 것을 찾아 제거
+            for code, pend in list(self.pending_orders.items()):
+                if pend.get("side") == rqname and pend.get("order_no") is None:
+                    self.log_system.error(
+                        f"[REJECT_CLEANUP] code={code} side={rqname} msg={msg}"
+                    )
+                    self.pending_orders.pop(code, None)
+                    if rqname == "BUY":
+                        self.ordering = False
+                        self._pending_buy_code = None
+                        self._pending_buy_qty = 0
+                        self._resume_scan_if_possible()
+                    break  # 동시 BUY 차단 로직상 1개만 있을 수 있음

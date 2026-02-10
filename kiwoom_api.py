@@ -142,6 +142,12 @@ class KiwoomAPI(QAxWidget):
         # code -> { vol_ratio, trend, breakout, candle_strength }
         self._entry_signals: dict[str, dict] = {}
 
+        # ===== 계좌 잔고(주문가능금액) =====
+        self._available_cash: int = 0        # 주문가능금액 (opw00001 조회)
+        self._cash_query_ts: float = 0       # 마지막 조회 시각
+        self._cash_query_result: int | None = None  # TR 응답 임시 저장
+        self._cash_query_loop: QEventLoop | None = None
+
     # ==================================================
     # Login / condition
     # ==================================================
@@ -346,6 +352,20 @@ class KiwoomAPI(QAxWidget):
                          "RQ_1MIN", "OPT10080", 0, screen)
 
     def _on_receive_tr_data(self, screen_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
+        # ── 계좌 잔고 조회 응답 (별도 처리) ──
+        if rq_name == "RQ_CASH" and tr_code == "opw00001":
+            try:
+                raw = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, rq_name, 0, "주문가능금액"
+                ).strip()
+                self._cash_query_result = int(raw) if raw else -1
+            except Exception:
+                self._cash_query_result = -1
+            if self._cash_query_loop:
+                self._cash_query_loop.quit()
+            return
+
         if not self.tr_inflight:
             return
         # print(rq_name, tr_code)
@@ -403,9 +423,26 @@ class KiwoomAPI(QAxWidget):
                         return
                     buy_qty = min(QTY, max(1, MAX_BUY_AMOUNT // cur_price))
 
+                # ── 총 투자한도(TOTAL_BUDGET) 체크 ──
+                remaining = self.get_remaining_budget()
+                est_amount = cur_price * buy_qty
+                if est_amount > remaining:
+                    # 잔여 예산으로 살 수 있는 만큼 줄이기
+                    buy_qty = remaining // cur_price
+                    if buy_qty <= 0:
+                        self.log_trade.info(
+                            f"[ENTRY_SKIP_BUDGET] code={code} price={cur_price} "
+                            f"remaining={remaining} < 1주 금액"
+                        )
+                        info["state"] = "DONE"
+                        self._finish_tr(delay=True)
+                        return
+                    est_amount = cur_price * buy_qty
+
                 self.log_trade.info(
                     f"[ENTRY_QTY] code={code} price={cur_price} "
-                    f"mode={BUY_MODE} qty={buy_qty} amount={cur_price * buy_qty}"
+                    f"mode={BUY_MODE} qty={buy_qty} amount={est_amount} "
+                    f"budget_remaining={remaining}"
                 )
 
                 # 전략 지표 저장 (디스코드 알림용)
@@ -413,6 +450,9 @@ class KiwoomAPI(QAxWidget):
                 if sig:
                     self._entry_signals[code] = sig
                 self.send_market_order("BUY", code, buy_qty, "ENTRY")
+                # 예산 추적용: pending에 예상 매수금액 저장
+                if code in self.pending_orders:
+                    self.pending_orders[code]["est_amount"] = est_amount
             info["state"] = "DONE"
             self._finish_tr(delay=True)
             return
@@ -1368,6 +1408,57 @@ class KiwoomAPI(QAxWidget):
     # 기본 유틸리티 함수 모음
     # ==================================================
     # ==================================================
+    # 계좌 주문가능금액 조회 (opw00001)
+    # ==================================================
+    def query_available_cash(self) -> int:
+        """
+        키움 opw00001 TR로 주문가능금액(D+2)을 조회.
+        30초 캐시 → 빈번한 호출에도 TR 부하 없음.
+        조회 실패 시 마지막 성공값 반환.
+        """
+        now = pytime.time()
+        # 30초 이내 재조회 방지
+        if now - self._cash_query_ts < 30 and self._available_cash > 0:
+            return self._available_cash
+
+        try:
+            acc = self.get_account()
+            self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", acc)
+            self.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
+            self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
+            self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
+
+            self._cash_query_result = None
+            self._cash_query_loop = QEventLoop()
+
+            self.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                "RQ_CASH", "opw00001", 0, "9500"
+            )
+
+            # 3초 타임아웃
+            QTimer.singleShot(3000, lambda: self._cash_query_loop.quit() if self._cash_query_loop else None)
+            self._cash_query_loop.exec_()
+            self._cash_query_loop = None
+
+            if self._cash_query_result is not None and self._cash_query_result >= 0:
+                self._available_cash = self._cash_query_result
+                self._cash_query_ts = now
+                self.log_system.info(
+                    f"[CASH_QUERY_OK] available={self._available_cash:,}"
+                )
+            else:
+                self.log_system.warning(
+                    f"[CASH_QUERY_FAIL] keeping last={self._available_cash:,}"
+                )
+
+        except Exception as e:
+            self.log_system.error(f"[CASH_QUERY_ERROR] {e}")
+            self._cash_query_loop = None
+
+        return self._available_cash
+
+    # ==================================================
     # 호가단위 보정 (한국 주식시장)
     # ==================================================
     @staticmethod
@@ -1523,7 +1614,24 @@ class KiwoomAPI(QAxWidget):
             return False
         if now - pos.last_sell_attempt_ts < SELL_COOLDOWN_SEC:
             return False
-        return True    
+        return True
+
+    def get_used_budget(self) -> int:
+        """미체결 BUY 주문의 예상 금액 합산 (잔고에 아직 반영 안 된 것)"""
+        used = 0
+        for pend in self.pending_orders.values():
+            if pend.get("side") == "BUY":
+                used += pend.get("est_amount", 0)
+        return used
+
+    def get_remaining_budget(self) -> int:
+        """
+        실제 주문가능금액 조회 (opw00001) - 미체결 BUY 예약분 차감.
+        계좌 잔고를 직접 조회하므로 TOTAL_BUDGET 설정 불필요.
+        """
+        cash = self.query_available_cash()
+        pending_buy_amount = self.get_used_budget()
+        return max(0, cash - pending_buy_amount)    
 
     # 5. 대기 중인 매수 주문 수
     def _count_pending_buys(self) -> int:

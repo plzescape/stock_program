@@ -539,8 +539,8 @@ class KiwoomAPI(QAxWidget):
             
                 entry = pos.entry_price
 
-                tp1_price = int(entry * (1 + TP1_RATE))
-                tp2_price = int(entry * (1 + TP2_RATE))
+                tp1_price = self.adjust_tick_size(int(entry * (1 + TP1_RATE)))
+                tp2_price = self.adjust_tick_size(int(entry * (1 + TP2_RATE)))
 
                 tp1_qty = max(1, int(pos.total_qty * TP1_RATIO))
                 tp2_qty = max(1, int(pos.total_qty * TP2_RATIO))
@@ -578,16 +578,27 @@ class KiwoomAPI(QAxWidget):
             if not pos:
                 return
             
-            # ── 체결수량 안전처리 (BUY와 동일 로직) ──
-            # FID 911이 증분이 아닌 누적으로 올 수 있으므로 두 케이스 모두 처리
-            new_remain = pos.remain_qty - qty
-            if new_remain >= 0:
-                # 일반적인 "증분 체결수량" 케이스
-                pos.remain_qty = new_remain
+            # ── 체결수량 안전처리 ──
+            # 키움 FID 911은 "해당 주문의 누적 체결수량"으로 올 수 있음.
+            # 구 로직(total_qty - qty)은 이전 SELL 주문 체결분을 무시하여
+            # remain_qty가 복원되는 치명적 버그를 유발함.
+            # → pending_orders의 filled_qty로 주문별 누적을 추적하여 증분 계산.
+            pend = self.pending_orders.get(code)
+            if pend and pend.get("side") == "SELL":
+                prev_filled = pend.get("filled_qty", 0)
+                if qty > prev_filled:
+                    # qty가 이전 기록보다 크면 → 누적 체결수량으로 해석
+                    delta = qty - prev_filled
+                    pend["filled_qty"] = qty
+                else:
+                    # qty가 이전 기록 이하 → 증분 체결수량으로 해석
+                    delta = qty
+                    pend["filled_qty"] = prev_filled + qty
             else:
-                # "누적 체결수량" 케이스 → 이미 반영된 것으로 간주
-                # total_qty에서 누적 체결수량을 빼서 남은 수량 계산
-                pos.remain_qty = max(0, pos.total_qty - qty)
+                # pending이 없으면 증분으로 해석 (안전)
+                delta = qty
+
+            pos.remain_qty = max(0, pos.remain_qty - delta)
             
             # =========================
             # TP 체결 상태 반영 (주문번호 기준)
@@ -645,7 +656,6 @@ class KiwoomAPI(QAxWidget):
                 return                
             
             # 전량 매도 완료
-            # pos.selling = False
             sell_reason = ""
             sell_pend = self.pending_orders.get(code)
             if sell_pend:
@@ -654,23 +664,24 @@ class KiwoomAPI(QAxWidget):
             # ── 디스코드 매도 알림 (reason별 분기) ──
             try:
                 stock_name = self.get_stock_name(code)
-                entry_p = pos.entry_price if hasattr(pos, 'entry_price') else price
+                entry_p = pos.entry_price
+                sold_qty = pos.total_qty  # 전량 매도이므로 total_qty 사용
 
                 if "STOP_LOSS" in sell_reason:
                     from discord_notify import notify_stop_loss
-                    notify_stop_loss(code, stock_name, qty, price, entry_p)
+                    notify_stop_loss(code, stock_name, sold_qty, price, entry_p)
                 elif "PROFIT_SAFE" in sell_reason:
                     from discord_notify import notify_profit_safe
-                    notify_profit_safe(code, stock_name, qty, price, entry_p)
+                    notify_profit_safe(code, stock_name, sold_qty, price, entry_p)
                 elif "TRAIL_STOP" in sell_reason:
                     from discord_notify import notify_trail_stop
-                    notify_trail_stop(code, stock_name, qty, price, entry_p)
+                    notify_trail_stop(code, stock_name, sold_qty, price, entry_p)
                 elif "TIME_STOP" in sell_reason or "VOL_TIME_STOP" in sell_reason:
                     from discord_notify import notify_time_stop
-                    notify_time_stop(code, stock_name, qty, price, entry_p, sell_reason)
+                    notify_time_stop(code, stock_name, sold_qty, price, entry_p, sell_reason)
                 elif "FORCE_LIQUIDATION" in sell_reason:
                     from discord_notify import notify_force_liquidation
-                    notify_force_liquidation(code, stock_name, qty, entry_p)
+                    notify_force_liquidation(code, stock_name, sold_qty, entry_p)
             except Exception as e:
                 self.log_system.warning(f"[DISCORD_FAIL] SELL notify: {e}")
 
@@ -1312,13 +1323,36 @@ class KiwoomAPI(QAxWidget):
                 "order_no": None,       # 주문번호 (체결시 채워짐)
                 "cancel_retries": 0,
                 "last_cancel_ts": 0.0,
-                "reentry_retries": 0
+                "reentry_retries": 0,
+                "filled_qty": 0         # SELL 주문별 누적 체결수량 추적
             }
         return True
 
     # ==================================================
     # 기본 유틸리티 함수 모음
     # ==================================================
+    # ==================================================
+    # 호가단위 보정 (한국 주식시장)
+    # ==================================================
+    @staticmethod
+    def adjust_tick_size(price: int) -> int:
+        """주어진 가격을 올바른 호가단위로 내림 보정"""
+        if price < 2000:
+            tick = 1
+        elif price < 5000:
+            tick = 5
+        elif price < 20000:
+            tick = 10
+        elif price < 50000:
+            tick = 50
+        elif price < 200000:
+            tick = 100
+        elif price < 500000:
+            tick = 500
+        else:
+            tick = 1000
+        return (price // tick) * tick
+
     # 1. 실시간 등록
     def register_real(self, code):
         fid_list = "10;15"  # 체결시간, 거래량
@@ -1712,9 +1746,10 @@ class KiwoomAPI(QAxWidget):
         # pending_orders 중 해당 side와 매칭되는 항목 정리
         # (screen_no로는 code를 특정할 수 없으므로, 가장 최근 pending을 대상으로 처리)
         if rqname in ("BUY", "SELL"):
-            # order_no가 아직 None인 pending 중 side가 일치하는 것을 찾아 제거
+            # side가 일치하는 pending을 찾아 제거
+            # order_no 유무 관계없이 매칭 (주문번호 배정 후에도 거부될 수 있음)
             for code, pend in list(self.pending_orders.items()):
-                if pend.get("side") == rqname and pend.get("order_no") is None:
+                if pend.get("side") == rqname:
                     self.log_system.error(
                         f"[REJECT_CLEANUP] code={code} side={rqname} msg={msg}"
                     )
@@ -1724,6 +1759,11 @@ class KiwoomAPI(QAxWidget):
                         self._pending_buy_code = None
                         self._pending_buy_qty = 0
                         self._resume_scan_if_possible()
+                    elif rqname == "SELL":
+                        pos = self.positions.get(code)
+                        if pos:
+                            pos.selling = False
+                        self.ordering = bool(self.pending_orders)
                     break  # 동시 BUY 차단 로직상 1개만 있을 수 있음
 
         # rqname이 TP 지정가(TP1_LIMIT, TP2_LIMIT 등)인 경우 → send_limit_sell에서 발송

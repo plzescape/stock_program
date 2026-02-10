@@ -7,7 +7,13 @@ ACCOUNT_NO = ""  # IS_REAL=True일 때만 사용 (예: "12345678")
 MOCK_ACCOUNT_NO = "8118694111"
 
 # ===== 매매 수량 =====
-QTY = 20  # 분할익절을 쓰려면 10주 이상 권장
+# BUY_MODE 옵션:
+#   "AMOUNT"   → MAX_BUY_AMOUNT 이내로 수량 자동 계산 (1주 > MAX_BUY_AMOUNT이면 매수 스킵)
+#   "QTY"      → 무조건 QTY 만큼 매수 (금액 무시)
+#   "BOTH"     → MAX_BUY_AMOUNT 이내 + 최대 QTY개 (둘 중 적은 쪽)
+BUY_MODE = "BOTH"
+QTY = 20                   # 고정 수량 / 최대 수량
+MAX_BUY_AMOUNT = 300000    # 종목당 최대 매수금액 (원)
 
 # ===== 손절 / 익절 / 트레일링 =====
 STOP_LOSS_RATE = 0.015   # -1.5%

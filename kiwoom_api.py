@@ -14,7 +14,7 @@ from collections import deque
 import time as pytime
 
 from config import (
-    IS_REAL, ACCOUNT_NO, MAX_REENTRY_RETRIES, QTY, REENTRY_DELAY_SEC,
+    IS_REAL, ACCOUNT_NO, MAX_REENTRY_RETRIES, QTY, MAX_BUY_AMOUNT, BUY_MODE, REENTRY_DELAY_SEC,
     STOP_LOSS_RATE, TP1_RATE, TP1_RATIO, TP2_RATE, TP2_RATIO,
     TRAIL_GAP,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
@@ -372,11 +372,47 @@ class KiwoomAPI(QAxWidget):
         # === ENTRY 성공 ===
         if len(completed_candles) >= 25 and is_entry_candidate_VER2(completed_candles, self.log_signal, code):
             if len(self.positions) < MAX_POSITIONS:
+                # ── 매수수량 계산: BUY_MODE에 따라 분기 ──
+                cur_price = completed_candles[0]["close"]
+
+                if BUY_MODE == "QTY":
+                    # 모드1: 고정 수량
+                    buy_qty = QTY
+
+                elif BUY_MODE == "AMOUNT":
+                    # 모드2: 금액 기준 (1주 > MAX_BUY_AMOUNT이면 스킵)
+                    if cur_price <= 0 or cur_price > MAX_BUY_AMOUNT:
+                        self.log_trade.info(
+                            f"[ENTRY_SKIP_PRICE] code={code} price={cur_price} "
+                            f"exceeds MAX_BUY_AMOUNT={MAX_BUY_AMOUNT}"
+                        )
+                        info["state"] = "DONE"
+                        self._finish_tr(delay=True)
+                        return
+                    buy_qty = max(1, MAX_BUY_AMOUNT // cur_price)
+
+                else:
+                    # 모드3 (BOTH): 금액 + 수량 상한 둘 다 적용
+                    if cur_price <= 0 or cur_price > MAX_BUY_AMOUNT:
+                        self.log_trade.info(
+                            f"[ENTRY_SKIP_PRICE] code={code} price={cur_price} "
+                            f"exceeds MAX_BUY_AMOUNT={MAX_BUY_AMOUNT}"
+                        )
+                        info["state"] = "DONE"
+                        self._finish_tr(delay=True)
+                        return
+                    buy_qty = min(QTY, max(1, MAX_BUY_AMOUNT // cur_price))
+
+                self.log_trade.info(
+                    f"[ENTRY_QTY] code={code} price={cur_price} "
+                    f"mode={BUY_MODE} qty={buy_qty} amount={cur_price * buy_qty}"
+                )
+
                 # 전략 지표 저장 (디스코드 알림용)
                 sig = get_entry_signal_data(completed_candles)
                 if sig:
                     self._entry_signals[code] = sig
-                self.send_market_order("BUY", code, QTY, "ENTRY")
+                self.send_market_order("BUY", code, buy_qty, "ENTRY")
             info["state"] = "DONE"
             self._finish_tr(delay=True)
             return

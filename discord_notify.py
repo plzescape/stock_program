@@ -80,8 +80,8 @@ def notify_buy_fill(
         {"name": "수량", "value": f"{qty}주", "inline": True},
         {"name": "체결가", "value": _fmt_price(price), "inline": True},
         {"name": "매수금액", "value": _fmt_price(total_amount), "inline": True},
-        {"name": "익절 지정가 1", "value": _fmt_price(tp1_price), "inline": True},
-        {"name": "익절 지정가 2", "value": _fmt_price(tp2_price), "inline": True},
+        {"name": "익절 시장가 1", "value": _fmt_price(tp1_price), "inline": True},
+        {"name": "익절 시장가 2", "value": _fmt_price(tp2_price), "inline": True},
     ]
 
     # 전략 지표 (signal_data가 있으면 추가)

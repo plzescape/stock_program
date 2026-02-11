@@ -48,10 +48,12 @@ class PositionState:
     # ⭐ 최근 매도 시도 시간 기록
     last_sell_attempt_ts: float = 0.0
 
-    # ⭐ 추가
+    # ⭐ 거래량 추적
     recent_volumes: deque = field(
         default_factory=lambda: deque(maxlen=VOL_CHECK_TICKS)
     )
+    peak_avg_vol: float = 0.0     # 진입~TP1 구간 최고 평균거래량
+    tp1_done_ts: float = 0.0      # TP1 체결 시각 (보호시간용)
 
 class KiwoomAPI(QAxWidget):
     def __init__(self):
@@ -608,6 +610,7 @@ class KiwoomAPI(QAxWidget):
                 reason = pend.get("reason", "")
                 if "TP1" in reason and not pos.tp1_done:
                     pos.tp1_done = True
+                    pos.tp1_done_ts = pytime.time()
                     self.log_trade.info(f"[TP1_FILLED] code={code} remain={pos.remain_qty}")
                     try:
                         from discord_notify import notify_tp1_fill
@@ -689,6 +692,12 @@ class KiwoomAPI(QAxWidget):
         # 거래량 FID = 15
         vol = abs(int(self.dynamicCall("GetCommRealData(QString, int)", code, 15) or 0))
         pos.recent_volumes.append(vol)
+
+        # 평균거래량 피크 갱신 (진입~TP1 구간만, TP1 후 왜곡 방지)
+        if not pos.tp1_done and len(pos.recent_volumes) == VOL_CHECK_TICKS:
+            cur_avg = sum(pos.recent_volumes) / VOL_CHECK_TICKS
+            if cur_avg > pos.peak_avg_vol:
+                pos.peak_avg_vol = cur_avg
         
         if cur <= 0:
             return
@@ -800,24 +809,30 @@ class KiwoomAPI(QAxWidget):
                 return
 
         # =========================
-        # ⚠️ 거래량 급감 즉시 TIME STOP
+        # ⚠️ 거래량 급감 TIME STOP (TP1 익절 후에만)
+        # 조건: 피크 평균거래량 대비 50% 이하 + TP1 후 10초 보호
         # =========================
+        VOL_DROP_PROTECT_SEC = 10  # TP1 후 보호시간
         if (
-            not pos.time_stop_done
+            pos.tp1_done
+            and not pos.time_stop_done
             and not pos.selling
             and len(pos.recent_volumes) == VOL_CHECK_TICKS
+            and pos.peak_avg_vol > 0
+            and (now - pos.tp1_done_ts) >= VOL_DROP_PROTECT_SEC
         ):
             avg_vol = sum(pos.recent_volumes) / VOL_CHECK_TICKS
+            vol_ratio = avg_vol / pos.peak_avg_vol
             pnl_rate = (cur - pos.entry_price) / pos.entry_price
 
-            if avg_vol <= VOL_AVG_MIN and pnl_rate >= TIME_STOP_MAX_LOSS:
+            if vol_ratio <= 0.5 and pnl_rate >= TIME_STOP_MAX_LOSS:
                 if not self.can_try_sell(pos):
                     return
 
                 self.log_trade.info(
                     f"[VOL_TIME_STOP] code={code} "
-                    f"avg_vol={avg_vol:.2f} "
-                    f"pnl={pnl_rate:.4f}"
+                    f"avg_vol={avg_vol:.2f} peak={pos.peak_avg_vol:.2f} "
+                    f"ratio={vol_ratio:.2f} pnl={pnl_rate:.4f}"
                 )
                 ok = self.send_market_order(
                     side="SELL",
@@ -1023,6 +1038,7 @@ class KiwoomAPI(QAxWidget):
                 pos = self.positions.get(code)
                 if pos:
                     pos.selling = False
+                    pos.time_stop_done = False  # stuck 후 재시도 가능하도록 리셋
                 self.ordering = bool(self.pending_orders)
 
     # ==================================================

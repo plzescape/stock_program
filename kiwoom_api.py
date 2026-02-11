@@ -24,7 +24,7 @@ from config import (
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
 )
 from logger_util import setup_logger
-from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data
+from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data
 
 
 @dataclass
@@ -361,9 +361,15 @@ class KiwoomAPI(QAxWidget):
         # 최신봉 제외한 완성봉들
         completed_candles = candles[1:] if len(candles) > 1 else []
 
-        # === ENTRY 성공 ===
-        if len(completed_candles) >= 25 and is_entry_candidate_VER2(completed_candles, self.log_signal, code):
-            if len(self.positions) < MAX_POSITIONS:
+        # === ENTRY 판정: 돌파 전략 OR 눌림목 전략 ===
+        entry_type = None
+        if len(completed_candles) >= 25:
+            if is_entry_candidate_VER2(completed_candles, self.log_signal, code):
+                entry_type = "BREAKOUT"
+            elif is_pullback_entry(completed_candles, self.log_signal, code):
+                entry_type = "PULLBACK"
+
+        if entry_type and len(self.positions) < MAX_POSITIONS:
                 # ── 매수수량 계산: BUY_MODE에 따라 분기 ──
                 cur_price = completed_candles[0]["close"]
 
@@ -409,12 +415,15 @@ class KiwoomAPI(QAxWidget):
 
                 self.log_trade.info(
                     f"[ENTRY_QTY] code={code} price={cur_price} "
-                    f"mode={BUY_MODE} qty={buy_qty} amount={est_amount} "
+                    f"type={entry_type} mode={BUY_MODE} qty={buy_qty} amount={est_amount} "
                     f"budget_remaining={remaining}"
                 )
 
                 # 전략 지표 저장 (디스코드 알림용)
-                sig = get_entry_signal_data(completed_candles)
+                if entry_type == "PULLBACK":
+                    sig = get_pullback_signal_data(completed_candles)
+                else:
+                    sig = get_entry_signal_data(completed_candles)
                 if sig:
                     self._entry_signals[code] = sig
                 self.send_market_order("BUY", code, buy_qty, "ENTRY")
@@ -422,9 +431,9 @@ class KiwoomAPI(QAxWidget):
                 if code in self.pending_orders:
                     self.pending_orders[code]["est_amount"] = est_amount
 
-            info["state"] = "DONE"
-            self._finish_tr(delay=True)
-            return
+                info["state"] = "DONE"
+                self._finish_tr(delay=True)
+                return
         
         # === ENTRY 실패 ===
         info["retry"] += 1

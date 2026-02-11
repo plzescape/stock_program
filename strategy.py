@@ -167,3 +167,122 @@ def get_entry_signal_data(candles) -> dict | None:
         "breakout": breakout,
         "candle_strength": candle_strength,
     }
+
+
+# ===========================
+# 전략: 눌림목 진입 (MA20 지지 반등)
+# ===========================
+def is_pullback_entry(candles, logger=None, code=None) -> bool:
+    """
+    눌림목 진입 전략:
+    상승 추세(MA20 우상향) 중 조정을 받다가 MA20 부근에서 반등하는 시점에 진입.
+
+    조건:
+    1. MA20 우상향 (추세 유지)
+    2. 최근 고점 대비 조정 (고점에서 -2%~-7% 눌림)
+    3. MA20 근접 또는 터치 (종가가 MA20의 ±1.5% 이내)
+    4. 반등 양봉 (직전봉 대비 종가 상승 + 양봉)
+    5. 거래량 축소 후 회복 (조정 구간 거래량 < 이전 평균, 반등봉은 평균 이상)
+    """
+    if len(candles) < 25:
+        if logger:
+            logger.info(f"[PULLBACK_SKIP] {code} 데이터 부족 (필요:25, 현재:{len(candles)})")
+        return False
+
+    c1 = candles[0]   # 직전 완성봉 (반등 봉)
+    c2 = candles[1]   # 전전 봉 (조정 구간)
+
+    # --- MA20 계산 ---
+    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
+
+    # 1. MA20 우상향 (추세 유지 중이어야 눌림목 의미 있음) + 하락 눌림 진입 판단
+    price_above_ma = c1['close'] > ma20_now
+    trend_ok = ma20_now > ma20_prev and price_above_ma
+
+    # --- 최근 10봉 내 고점 ---
+    recent_high = max(c['high'] for c in candles[0:10])
+
+    # 2. 고점 대비 조정폭 (-2% ~ -7%)
+    pullback_pct = (c1['close'] - recent_high) / recent_high
+    pullback_ok = -0.07 <= pullback_pct <= -0.02
+
+    # 3. MA20 근접 (종가가 MA20의 ±1.5% 이내)
+    ma_distance = abs(c1['close'] - ma20_now) / ma20_now
+    near_ma_ok = ma_distance <= 0.015
+
+    # 4-1. 반등 양봉 (전봉 대비 종가 상승 + 양봉)
+    bounce_ok = (
+        c1['close'] > c2['close'] and
+        c1['close'] > c1['open']
+    )
+
+    # 4-2. 캔들 강도 판단
+    candle_range = c1['high'] - c1['low']
+    body_size = c1['close'] - c1['open']
+    strength_ok = (body_size / candle_range) >= 0.5 if candle_range > 0 else False
+
+    # 5. 거래량 조건:
+    #    - 조정 구간(2~5봉) 평균거래량 < 이전(6~10봉) 평균거래량 (거래량 축소)
+    #    - 반등봉 거래량 ≥ 조정 구간 평균 (거래량 회복)
+    pullback_vols = [c['volume'] for c in candles[1:5]]
+    prior_vols = [c['volume'] for c in candles[5:10]]
+
+    avg_pullback_vol = sum(pullback_vols) / len(pullback_vols) if pullback_vols else 1
+    avg_prior_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+
+    vol_contracted = avg_pullback_vol < avg_prior_vol  # 조정 중 거래량 축소
+    vol_recovery = c1['volume'] >= avg_pullback_vol     # 반등봉에서 회복
+
+    vol_ok = vol_contracted and vol_recovery and c1['volume'] >= 1000
+
+    # --- 최종 판정 ---
+    is_valid = trend_ok and pullback_ok and near_ma_ok and bounce_ok and vol_ok and strength_ok
+
+    if logger:
+        if is_valid:
+            logger.info(
+                f"[PULLBACK_CONFIRMED] {code} | "
+                f"종가:{c1['close']} MA20:{ma20_now:.0f} | "
+                f"눌림:{pullback_pct*100:.1f}% | "
+                f"MA거리:{ma_distance*100:.2f}% | "
+                f"반등거래량:{c1['volume']}"
+                f"체결강도={strength_ok}"
+            )
+        else:
+            logger.info(
+                f"[PULLBACK_CHECK] {code} "
+                f"trend={trend_ok} pullback={pullback_ok}({pullback_pct*100:.1f}%) "
+                f"near_ma={near_ma_ok}({ma_distance*100:.2f}%) "
+                f"bounce={bounce_ok} vol={vol_ok}"
+            )
+
+    return is_valid
+
+
+def get_pullback_signal_data(candles) -> dict | None:
+    """눌림목 진입 시 디스코드 알림용 지표"""
+    if len(candles) < 25:
+        return None
+
+    c1 = candles[0]
+    c2 = candles[1]
+
+    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
+
+    recent_high = max(c['high'] for c in candles[0:10])
+    pullback_pct = (c1['close'] - recent_high) / recent_high
+
+    ma_distance = abs(c1['close'] - ma20_now) / ma20_now
+
+    pullback_vols = [c['volume'] for c in candles[1:5]]
+    avg_pullback_vol = sum(pullback_vols) / len(pullback_vols) if pullback_vols else 1
+    vol_ratio = c1['volume'] / avg_pullback_vol if avg_pullback_vol > 0 else 0
+
+    return {
+        "vol_ratio": vol_ratio,
+        "trend": "MA20 상승" if ma20_now > ma20_prev else "MA20 하락",
+        "breakout": f"눌림목 반등 ({pullback_pct*100:.1f}%)",
+        "candle_strength": ma_distance * 100,
+    }

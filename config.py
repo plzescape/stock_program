@@ -8,12 +8,13 @@ MOCK_ACCOUNT_NO = "8118694111"
 
 # ===== 매매 수량 =====
 # BUY_MODE 옵션:
-#   "AMOUNT"   → MAX_BUY_AMOUNT 이내로 수량 자동 계산 (1주 > MAX_BUY_AMOUNT이면 매수 스킵)
+#   "AMOUNT"   → MAX_BUY_AMOUNT 이내로 수량 자동 계산 (1주 > MAX_BUY_AMOUNT이면 스킵)
 #   "QTY"      → 무조건 QTY 만큼 매수 (금액 무시)
 #   "BOTH"     → MAX_BUY_AMOUNT 이내 + 최대 QTY개 (둘 중 적은 쪽)
 BUY_MODE = "BOTH"
 QTY = 20                   # 고정 수량 / 최대 수량
-MAX_BUY_AMOUNT = 300000    # 종목당 최대 매수금액 (원)
+MAX_BUY_AMOUNT = 200000    # 종목당 최대 매수금액 (원)
+TOTAL_BUDGET = 5000000     # 총 투자 한도 (원)
 
 # ===== 손절 / 익절 / 트레일링 =====
 STOP_LOSS_RATE = 0.015   # -1.5%
@@ -33,7 +34,7 @@ CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
 # 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "AUTO_CANDI_KOSDAQ_SCALP", "DANTA_1", "DANTA_2"
-CONDITION_NAME = "AUTO_CANDI_BREAKOUT"
+CONDITION_NAME = "AUTO_CANDI_VOL_SPIKE"
 # CONDITION_INDEX = 0
 
 # ===== 스캔 설정 =====
@@ -61,6 +62,4 @@ MAX_REENTRY_RETRIES = 2   # 취소 후 재매수 횟수
 REENTRY_DELAY_SEC = 1     # 재매수 딜레이
 FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
 
-# ===== TP 지정가 재시도 =====
-TP_LIMIT_MAX_RETRIES = 2   # 지정가 재시도 최대 횟수
-TP_RETRY_DELAY_SEC = 2     # 재시도 간 딜레이(초)
+# (TP 지정가 제거됨 - 모두 시장가 매도)

@@ -20,7 +20,7 @@ from config import (
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
     CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
-    MAX_POSITIONS, TP_RETRY_DELAY_SEC, TP_LIMIT_MAX_RETRIES,
+    MAX_POSITIONS, TOTAL_BUDGET,
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
 )
 from logger_util import setup_logger
@@ -40,15 +40,7 @@ class PositionState:
     ordering: bool = False
     selling: bool = False
     last_pnl_log_ts: float = 0.0
-    
-    tp1_order_no: str | None = None
-    tp2_order_no: str | None = None
-    tp_orders_registered: bool = False  
 
-    # ⭐ TP 재시도 카운터
-    tp1_retry: int = 0
-    tp2_retry: int = 0
-      
     # ⭐ Time Stop용
     entry_ts: float = field(default_factory=lambda: pytime.time())
     time_stop_done: bool = False
@@ -112,8 +104,6 @@ class KiwoomAPI(QAxWidget):
         #   "reentry_retries": int
         # }
         self.pending_orders: dict[str, dict] = {}
-        self.tp_pending_orders = {}
-        self.tp_pending_temp = {}
         
         # ===== 일일 제한 =====
         self._today = datetime.now().date()
@@ -403,9 +393,22 @@ class KiwoomAPI(QAxWidget):
                         return
                     buy_qty = min(QTY, max(1, MAX_BUY_AMOUNT // cur_price))
 
+                # ── 총 투자한도 체크 ──
+                remaining = self.get_remaining_budget()
+                est_amount = cur_price * buy_qty
+                if est_amount > remaining:
+                    buy_qty = remaining // cur_price
+                    if buy_qty <= 0:
+                        self.log_trade.info(f"[ENTRY_SKIP_BUDGET] code={code} remaining={remaining}")
+                        info["state"] = "DONE"
+                        self._finish_tr(delay=True)
+                        return
+                    est_amount = cur_price * buy_qty
+
                 self.log_trade.info(
                     f"[ENTRY_QTY] code={code} price={cur_price} "
-                    f"mode={BUY_MODE} qty={buy_qty} amount={cur_price * buy_qty}"
+                    f"mode={BUY_MODE} qty={buy_qty} amount={est_amount} "
+                    f"budget_remaining={remaining}"
                 )
 
                 # 전략 지표 저장 (디스코드 알림용)
@@ -413,6 +416,10 @@ class KiwoomAPI(QAxWidget):
                 if sig:
                     self._entry_signals[code] = sig
                 self.send_market_order("BUY", code, buy_qty, "ENTRY")
+                # 예산 추적용
+                if code in self.pending_orders:
+                    self.pending_orders[code]["est_amount"] = est_amount
+
             info["state"] = "DONE"
             self._finish_tr(delay=True)
             return
@@ -464,38 +471,11 @@ class KiwoomAPI(QAxWidget):
         
         pend = self.pending_orders.get(code)
         pos = self.positions.get(code)
-        
-        temp_list = self.tp_pending_temp.get(code, [])
 
-        if order_no and temp_list:
-        
-            temp = temp_list.pop(0)   # FIFO 매핑
-            tag = temp["tag"]
-
-            # 확정 pending 저장
-            self.tp_pending_orders[order_no] = {
-                "code": code,
-                "tag": tag
-            }
-
-            # 포지션에도 저장
-            if pos:
-                if tag == "TP1_LIMIT":
-                    pos.tp1_order_no = order_no
-
-                elif tag == "TP2_LIMIT":
-                    pos.tp2_order_no = order_no
-
-            self.log_trade.info(
-                f"[TP_ORDERNO_MAP] {code} {tag} → {order_no}"
-            )
-        if not temp_list:
-            self.tp_pending_temp.pop(code, None)        
-        
         if pend and order_no and pend.get("order_no") is None:
-            pend["order_no"] = order_no                        
-            self.log_trade.info(f"[PENDING_ORDERNO] code={code} order_no={order_no}")        
-        
+            pend["order_no"] = order_no
+            self.log_trade.info(f"[PENDING_ORDERNO] code={code} order_no={order_no}")
+
         if not code or qty <= 0:
             return
 
@@ -569,26 +549,18 @@ class KiwoomAPI(QAxWidget):
                 self.log_trade.info(f"[BUY_DONE] code={code} remain={pos.remain_qty}/{pos.total_qty}")
                 
             # =========================
-            # TP 지정가 등록
+            # TP 목표가 설정 (시장가 매도 - 실시간 데이터에서 트리거)
             # =========================
-            if pos.remain_qty >= pos.total_qty and not pos.tp_orders_registered:
-            
+            if pos.remain_qty >= pos.total_qty and not pos.tp1_done:
+
                 entry = pos.entry_price
-
-                tp1_price = self.adjust_tick_size(int(entry * (1 + TP1_RATE)))
-                tp2_price = self.adjust_tick_size(int(entry * (1 + TP2_RATE)))
-
-                tp1_qty = max(1, int(pos.total_qty * TP1_RATIO))
-                tp2_qty = max(1, int(pos.total_qty * TP2_RATIO))
-
-                self.send_limit_sell(code, tp1_qty, tp1_price, "TP1_LIMIT")
-                self.send_limit_sell(code, tp2_qty, tp2_price, "TP2_LIMIT")
-
-                pos.tp_orders_registered = True
+                tp1_target = self.adjust_tick_size(int(entry * (1 + TP1_RATE)))
+                tp2_target = self.adjust_tick_size(int(entry * (1 + TP2_RATE)))
 
                 self.log_trade.info(
-                    f"[TP_REGISTERED] code={code} "
-                    f"tp1={tp1_price} tp2={tp2_price}"
+                    f"[TP_TARGET_SET] code={code} "
+                    f"tp1={tp1_target}(+{TP1_RATE*100:.1f}%) "
+                    f"tp2={tp2_target}(+{TP2_RATE*100:.1f}%)"
                 )
 
                 # ── 디스코드 매수 체결 알림 ──
@@ -599,13 +571,13 @@ class KiwoomAPI(QAxWidget):
                         name=self.get_stock_name(code),
                         qty=pos.total_qty,
                         price=pos.entry_price,
-                        tp1_price=tp1_price,
-                        tp2_price=tp2_price,
+                        tp1_price=tp1_target,
+                        tp2_price=tp2_target,
                         signal_data=self._entry_signals.pop(code, None)
                     )
                 except Exception as e:
-                    self.log_system.warning(f"[DISCORD_FAIL] BUY notify: {e}")                
-                
+                    self.log_system.warning(f"[DISCORD_FAIL] BUY notify: {e}")
+
             return
 
         # SELL
@@ -613,84 +585,53 @@ class KiwoomAPI(QAxWidget):
             pos = self.positions.get(code)
             if not pos:
                 return
-            
+
             # ── 체결수량 안전처리 ──
             # 키움 FID 911은 "해당 주문의 누적 체결수량"으로 올 수 있음.
-            # 구 로직(total_qty - qty)은 이전 SELL 주문 체결분을 무시하여
-            # remain_qty가 복원되는 치명적 버그를 유발함.
-            # → pending_orders의 filled_qty로 주문별 누적을 추적하여 증분 계산.
+            # pending_orders의 filled_qty로 주문별 누적을 추적하여 증분 계산.
             pend = self.pending_orders.get(code)
             if pend and pend.get("side") == "SELL":
                 prev_filled = pend.get("filled_qty", 0)
                 if qty > prev_filled:
-                    # qty가 이전 기록보다 크면 → 누적 체결수량으로 해석
                     delta = qty - prev_filled
                     pend["filled_qty"] = qty
                 else:
-                    # qty가 이전 기록 이하 → 증분 체결수량으로 해석
                     delta = qty
                     pend["filled_qty"] = prev_filled + qty
             else:
-                # pending이 없으면 증분으로 해석 (안전)
                 delta = qty
 
             pos.remain_qty = max(0, pos.remain_qty - delta)
-            
-            # =========================
-            # TP 체결 상태 반영 (주문번호 기준)
-            # =========================
 
-            if order_no == pos.tp1_order_no:
-                pos.tp1_done = True
+            # ── TP 체결 상태 반영 (reason 기준) ──
+            if pend:
+                reason = pend.get("reason", "")
+                if "TP1" in reason and not pos.tp1_done:
+                    pos.tp1_done = True
+                    self.log_trade.info(f"[TP1_FILLED] code={code} remain={pos.remain_qty}")
+                    try:
+                        from discord_notify import notify_tp1_fill
+                        notify_tp1_fill(code, self.get_stock_name(code), delta, price, pos.entry_price, pos.remain_qty)
+                    except Exception as e:
+                        self.log_system.warning(f"[DISCORD_FAIL] TP1: {e}")
 
-                self.log_trade.info(
-                    f"[TP1_FILLED] code={code} "
-                    f"remain={pos.remain_qty}"
-                )
-                # ── 디스코드 TP1 알림 ──
-                try:
-                    from discord_notify import notify_tp1_fill
-                    notify_tp1_fill(
-                        code=code, name=self.get_stock_name(code),
-                        qty=qty, sell_price=price,
-                        entry_price=pos.entry_price,
-                        remain_qty=pos.remain_qty
-                    )
-                except Exception as e:
-                    self.log_system.warning(f"[DISCORD_FAIL] TP1: {e}")
+                elif "TP2" in reason and not pos.tp2_done:
+                    pos.tp2_done = True
+                    pos.trailing_active = True
+                    self.log_trade.info(f"[TP2_FILLED] code={code} trailing_active=ON")
+                    try:
+                        from discord_notify import notify_tp2_fill
+                        notify_tp2_fill(code, self.get_stock_name(code), delta, price, pos.entry_price, pos.remain_qty)
+                    except Exception as e:
+                        self.log_system.warning(f"[DISCORD_FAIL] TP2: {e}")
 
-            elif order_no == pos.tp2_order_no:
-                pos.tp2_done = True
-                pos.trailing_active = True
-
-                self.log_trade.info(
-                    f"[TP2_FILLED] code={code} "
-                    f"trailing_active=ON"
-                )
-                # ── 디스코드 TP2 알림 ──
-                try:
-                    from discord_notify import notify_tp2_fill
-                    notify_tp2_fill(
-                        code=code, name=self.get_stock_name(code),
-                        qty=qty, sell_price=price,
-                        entry_price=pos.entry_price,
-                        remain_qty=pos.remain_qty
-                    )
-                except Exception as e:
-                    self.log_system.warning(f"[DISCORD_FAIL] TP2: {e}")
-            
-            # 🔴 핵심: 체결 발생했으면 일단 selling 해제
-            # (부분체결이든 전량체결이든 다시 매도 시도 가능해야 함)            
+            # 체결 발생 → selling 해제
             pos.selling = False
-            
+
             if pos.remain_qty > 0:
-                # pending이 아직 SELL이면 selling 유지
-                # pend = getattr(self, "pending_orders", {}).get(code)
-                # if not pend or pend.get("side") != "SELL":
-                #     pos.selling = False  # 예외적으로 pending이 없으면 풀어줌
                 self.log_trade.info(f"[SELL_PARTIAL] code={code} remain={pos.remain_qty}/{pos.total_qty}")
-                return                
-            
+                return
+
             # 전량 매도 완료
             sell_reason = ""
             sell_pend = self.pending_orders.get(code)
@@ -701,7 +642,7 @@ class KiwoomAPI(QAxWidget):
             try:
                 stock_name = self.get_stock_name(code)
                 entry_p = pos.entry_price
-                sold_qty = pos.total_qty  # 전량 매도이므로 total_qty 사용
+                sold_qty = pos.total_qty
 
                 if "STOP_LOSS" in sell_reason:
                     from discord_notify import notify_stop_loss
@@ -709,7 +650,7 @@ class KiwoomAPI(QAxWidget):
                 elif "PROFIT_SAFE" in sell_reason:
                     from discord_notify import notify_profit_safe
                     notify_profit_safe(code, stock_name, sold_qty, price, entry_p)
-                elif "TRAIL_STOP" in sell_reason:
+                elif "TRAIL" in sell_reason:
                     from discord_notify import notify_trail_stop
                     notify_trail_stop(code, stock_name, sold_qty, price, entry_p)
                 elif "TIME_STOP" in sell_reason or "VOL_TIME_STOP" in sell_reason:
@@ -773,20 +714,64 @@ class KiwoomAPI(QAxWidget):
             self.log_trade.info(f"[STOP_LOSS] {code} 손절 매도 트리거 (현재가:{cur})")
             if not self.can_try_sell(pos):
                 return
-            self.cancel_tp_orders(code)
             ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             if ok:
                 pos.last_sell_attempt_ts = now
                 pos.selling = True
             else:
-                pos.selling = False  # 혹시라도 이전에 True 됐으면 복구
+                pos.selling = False
             return
 
-        # 조건: TP1(1%)을 이미 달성한 상태에서, 수익률이 0.5% 이하로 밀리면 본절가에서 탈출
-        if pos.tp1_done and pnl_rate <= 0.005: # 0.5% 기준
+        # =========================
+        # TP1 시장가 익절 (가격 도달 시)
+        # =========================
+        tp1_target = self.adjust_tick_size(int(pos.entry_price * (1 + TP1_RATE)))
+        if not pos.tp1_done and cur >= tp1_target:
+            if not self.can_try_sell(pos):
+                return
+            # TP1 수량 계산 (총 수량이 3주 이하면 분할 없이 전량 매도)
+            if pos.remain_qty <= 3:
+                tp1_qty = pos.remain_qty
+            else:
+                tp1_qty = max(1, int(pos.total_qty * TP1_RATIO))
+                tp1_qty = min(tp1_qty, pos.remain_qty)
+
+            self.log_trade.info(
+                f"[TP1_TRIGGER] code={code} cur={cur} target={tp1_target} qty={tp1_qty}"
+            )
+            ok = self.send_market_order("SELL", code, tp1_qty, "TP1")
+            if ok:
+                pos.last_sell_attempt_ts = now
+                pos.selling = True
+            return
+
+        # =========================
+        # TP2 시장가 익절 (가격 도달 시)
+        # =========================
+        tp2_target = self.adjust_tick_size(int(pos.entry_price * (1 + TP2_RATE)))
+        if pos.tp1_done and not pos.tp2_done and cur >= tp2_target:
+            if not self.can_try_sell(pos):
+                return
+            # TP2 수량 계산
+            if pos.remain_qty <= 2:
+                tp2_qty = pos.remain_qty
+            else:
+                tp2_qty = max(1, int(pos.total_qty * TP2_RATIO))
+                tp2_qty = min(tp2_qty, pos.remain_qty)
+
+            self.log_trade.info(
+                f"[TP2_TRIGGER] code={code} cur={cur} target={tp2_target} qty={tp2_qty}"
+            )
+            ok = self.send_market_order("SELL", code, tp2_qty, "TP2")
+            if ok:
+                pos.last_sell_attempt_ts = now
+                pos.selling = True
+            return
+
+        # 조건: TP1 달성 후 수익률이 0.5% 이하로 밀리면 본절 탈출
+        if pos.tp1_done and pnl_rate <= 0.005:
             if self.can_try_sell(pos):
-                self.log_trade.info(f"[PROFIT_SAFEGUARD] {code} 수익 보존을 위해 본절 매도 (현재가:{cur})")
-                self.cancel_tp_orders(code)
+                self.log_trade.info(f"[PROFIT_SAFEGUARD] {code} 본절 매도 (현재가:{cur})")
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "PROFIT_SAFE")
                 if ok:
                     pos.last_sell_attempt_ts = now
@@ -795,9 +780,6 @@ class KiwoomAPI(QAxWidget):
                     pos.selling = False
             return
 
-        # TP1 - 체결 함수에서 진행
-        # TP2 - 체결 함수에서 진행
-        
         # TRAIL
         if pos.trailing_active:
             stop = int(pos.highest_price * (1 - TRAIL_GAP))
@@ -805,14 +787,12 @@ class KiwoomAPI(QAxWidget):
             if cur <= stop:
                 if not self.can_try_sell(pos):
                     return
-                self.cancel_tp_orders(code)
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "TRAIL_STOP")
 
-                # 시도 시각 기록
                 pos.last_sell_attempt_ts = now
 
                 if ok:
-                    pos.trailing_active = False  # 성공 후에만 끄는 게 안전
+                    pos.trailing_active = False
                     pos.selling = True
                 else:
                     pos.selling = False
@@ -839,7 +819,6 @@ class KiwoomAPI(QAxWidget):
                     f"avg_vol={avg_vol:.2f} "
                     f"pnl={pnl_rate:.4f}"
                 )
-                self.cancel_tp_orders(code)
                 ok = self.send_market_order(
                     side="SELL",
                     code=code,
@@ -880,7 +859,6 @@ class KiwoomAPI(QAxWidget):
                     f"pnl={pnl_rate:.4f}"
                 )
                 
-                self.cancel_tp_orders(code)
                 ok = self.send_market_order(
                     side="SELL",
                     code=code,
@@ -953,202 +931,6 @@ class KiwoomAPI(QAxWidget):
         return True
     
     # ==================================================
-    # TP 주문 취소 함수 (pending 분리 구조 대응)
-    # ==================================================
-    def cancel_tp_orders(self, code):
-
-        pos = self.positions.get(code)
-        if not pos:
-            return
-
-        cancel_list = [
-            ("tp1", pos.tp1_order_no),
-            ("tp2", pos.tp2_order_no)
-        ]
-
-        all_ok = True
-        for tp_tag, order_no in cancel_list:
-
-            if not order_no:
-                continue
-
-            # ------------------------
-            # 주문 취소 전송
-            # ------------------------
-            ok = self.send_cancel_order(code, order_no, cancel_side="SELL")
-
-            if ok:
-                # 취소 성공 시에만 정리
-                self.tp_pending_orders.pop(order_no, None)
-                if tp_tag == "tp1":
-                    pos.tp1_order_no = None
-                elif tp_tag == "tp2":
-                    pos.tp2_order_no = None
-
-                self.log_trade.info(
-                    f"[TP_CANCEL_OK] code={code} order_no={order_no}"
-                )
-            else:
-                # 취소 실패 → order_no 유지 (다음 틱에서 재시도 가능)
-                all_ok = False
-                self.log_trade.error(
-                    f"[TP_CANCEL_FAIL_KEEP] code={code} order_no={order_no} "
-                    f"- keeping order_no for retry"
-                )
-
-        # ------------------------
-        # temp pending 제거 (이건 아직 주문번호 배정 전이므로 무조건 정리)
-        # ------------------------
-        self.tp_pending_temp.pop(code, None)
-
-        if all_ok:
-            self.log_trade.info(f"[TP_CANCEL_DONE] code={code}")
-        else:
-            self.log_trade.warning(f"[TP_CANCEL_PARTIAL] code={code} some cancels failed")
-
-    # ==================================================
-    # 지정가 매도 함수
-    # ==================================================
-    def send_limit_sell(self, code: str, qty: int, price: int, tag: str) -> bool:
-        """
-        지정가 매도 + pending_orders 연동
-
-        tag:
-            "TP1_LIMIT"
-            "TP2_LIMIT"
-        """
-
-        if qty <= 0:
-            self.log_trade.warning(
-                f"[LIMIT_SELL_ABORT] code={code} qty={qty}"
-            )
-            return False
-
-        if code not in self.positions:
-            self.log_trade.warning(
-                f"[LIMIT_SELL_ABORT] no position code={code}"
-            )
-            return False
-
-        # 주문 전송
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [
-                tag,                   # sRQName
-                self._next_order_screen("91"),  # screen
-                self.get_account(),
-                2,                     # SELL
-                code,
-                qty,
-                price,
-                "00",                  # 지정가
-                ""
-            ]
-        )
-        
-        if ret != 0:
-            return False
-        
-        # ------------------------
-        # 임시 pending 저장
-        # ------------------------
-        if code not in self.tp_pending_temp:
-            self.tp_pending_temp[code] = []
-
-        self.tp_pending_temp[code].append({
-            "tag": tag,
-            "qty": qty,
-            "price": price
-        })
-
-        self.log_trade.info(
-            f"[TP_TEMP_PENDING] {code} {tag}"
-        )
-
-        return True
-
-    # ==================================================
-    # TP 지정가 재시도 / 시장가 전환
-    # ==================================================
-    def _retry_tp_order(self, code: str, tag: str, qty: int, price: int):
-        """
-        TP 지정가 거부 시 재시도 로직.
-        - TP_LIMIT_MAX_RETRIES 이내: 동일 지정가로 재시도
-        - 초과: 시장가로 즉시 매도 (익절 포기 방지)
-        """
-
-        pos = self.positions.get(code)
-        if not pos:
-            self.log_trade.warning(f"[TP_RETRY_SKIP] code={code} tag={tag} no position")
-            return
-
-        if pos.remain_qty <= 0:
-            return
-
-        # 재시도 카운터 확인
-        if tag == "TP1_LIMIT":
-            pos.tp1_retry += 1
-            retry_cnt = pos.tp1_retry
-        elif tag == "TP2_LIMIT":
-            pos.tp2_retry += 1
-            retry_cnt = pos.tp2_retry
-        else:
-            return
-
-        # 실제 매도 수량: 포지션 잔량 이하로 클램프
-        sell_qty = min(qty, pos.remain_qty)
-        if sell_qty <= 0:
-            return
-
-        if retry_cnt <= TP_LIMIT_MAX_RETRIES:
-            # ── 지정가 재시도 ──
-            self.log_trade.info(
-                f"[TP_RETRY_LIMIT] code={code} tag={tag} retry={retry_cnt}/{TP_LIMIT_MAX_RETRIES} "
-                f"price={price} qty={sell_qty}"
-            )
-            ok = self.send_limit_sell(code, sell_qty, price, tag)
-            if not ok:
-                self.log_trade.error(
-                    f"[TP_RETRY_LIMIT_FAIL] code={code} tag={tag} SendOrder failed - falling back to market"
-                )
-                # SendOrder 자체가 실패하면 바로 시장가 전환
-                self._tp_fallback_market(code, tag, sell_qty)
-        else:
-            # ── 재시도 초과 → 시장가 전환 ──
-            self._tp_fallback_market(code, tag, sell_qty)
-
-    def _tp_fallback_market(self, code: str, tag: str, qty: int):
-        """
-        TP 지정가 재시도 소진 → 시장가로 즉시 익절.
-        """
-        pos = self.positions.get(code)
-        if not pos or pos.remain_qty <= 0:
-            return
-
-        sell_qty = min(qty, pos.remain_qty)
-
-        self.log_trade.warning(
-            f"[TP_FALLBACK_MARKET] code={code} tag={tag} qty={sell_qty} "
-            f"- limit retries exhausted, switching to market order"
-        )
-
-        # 혹시 남아있는 TP 주문들 취소
-        self.cancel_tp_orders(code)
-
-        # 시장가 매도
-        ok = self.send_market_order("SELL", code, sell_qty, f"{tag}_MARKET_FALLBACK")
-        if ok:
-            pos.last_sell_attempt_ts = pytime.time()
-            self.log_trade.info(
-                f"[TP_FALLBACK_MARKET_OK] code={code} tag={tag} qty={sell_qty}"
-            )
-        else:
-            pos.selling = False
-            self.log_trade.error(
-                f"[TP_FALLBACK_MARKET_FAIL] code={code} tag={tag} qty={sell_qty}"
-            )
-
-    # ==================================================
     # pending BUY 취소 감시 함수
     # ==================================================
     def check_pending_buy_cancel(self):
@@ -1214,25 +996,29 @@ class KiwoomAPI(QAxWidget):
             pend["cancel_retries"] = int(pend.get("cancel_retries", 0)) + 1
     
             if ok:
-                self.log_trade.info(f"[CANCEL_OK] code={code} org={org}")
-                # 취소 접수됐으니 ordering/pending 정리(체결 이벤트로도 정리 가능)
+                self.log_trade.info(f"[CANCEL_SENT] code={code} org={org}")
+                # ✅ pending은 제거하지 않음 - Chejan "취소완료"에서 재매수 트리거 필요
+                pend["cancel_sent"] = True
                 self.ordering = False
-                # pending은 Chejan에서 "취소완료" 이벤트를 받으면 지우는게 베스트지만
-                # 간단하게는 여기서 제거해도 됨:
-                self.pending_orders.pop(code, None)
+                self._pending_buy_code = None
+                self._pending_buy_qty = 0
                 self._resume_scan_if_possible()
 
         # ── SELL pending 타임아웃 처리 ──
-        # SELL 주문도 Chejan이 안 올 수 있으므로 일정 시간 후 정리
+        # SELL 주문이 체결 안 되고 남아있을 수 있으므로 마킹 후 재매도 허용
         SELL_PENDING_TIMEOUT = 30  # 30초
         for code, pend in list(self.pending_orders.items()):
             if pend.get("side") != "SELL":
                 continue
             age = now - float(pend.get("ts", now))
-            if age > SELL_PENDING_TIMEOUT:
+            if age > SELL_PENDING_TIMEOUT and not pend.get("stuck"):
                 self.log_system.error(
-                    f"[SELL_PENDING_TIMEOUT] code={code} age={age:.1f}s - removing stale SELL pending"
+                    f"[SELL_STUCK] code={code} age={age:.1f}s - "
+                    f"marking stuck (주문이 살아있을 수 있음)"
                 )
+                pend["stuck"] = True
+                # pending 제거 + selling 해제하여 재시도 허용
+                # (중복 매도 방지: send_market_order에서 remain_qty 체크)
                 self.pending_orders.pop(code, None)
                 pos = self.positions.get(code)
                 if pos:
@@ -1280,8 +1066,10 @@ class KiwoomAPI(QAxWidget):
             )            
             return False
         
-        now = pytime.time()        
-        if self.last_order_ts and now - self.last_order_ts < 0.5:
+        now = pytime.time()
+        # SELL은 빠른 방어가 중요하므로 스로틀 완화 (0.2초)
+        throttle = 0.2 if side == "SELL" else 0.5
+        if self.last_order_ts and now - self.last_order_ts < throttle:
             self.log_trade.warning(f"[ORDER_THROTTLE] side={side} code={code} qty={qty}")
             return False        
         
@@ -1367,31 +1155,9 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # 기본 유틸리티 함수 모음
     # ==================================================
-    # ==================================================
-    # 호가단위 보정 (한국 주식시장)
-    # ==================================================
-    @staticmethod
-    def adjust_tick_size(price: int) -> int:
-        """주어진 가격을 올바른 호가단위로 내림 보정"""
-        if price < 2000:
-            tick = 1
-        elif price < 5000:
-            tick = 5
-        elif price < 20000:
-            tick = 10
-        elif price < 50000:
-            tick = 50
-        elif price < 200000:
-            tick = 100
-        elif price < 500000:
-            tick = 500
-        else:
-            tick = 1000
-        return (price // tick) * tick
-
     # 1. 실시간 등록
     def register_real(self, code):
-        fid_list = "10;15"  # 체결시간, 거래량
+        fid_list = "10;15"  # 10=현재가, 15=거래량
         
         # codes = list(self.positions.keys())
         # code_str = ";".join(codes)
@@ -1516,14 +1282,41 @@ class KiwoomAPI(QAxWidget):
         except Exception:
             return code
 
-    # 4. 매도 시도 가능 여부
+    # 4. 호가단위 보정 (한국 주식시장)
+    @staticmethod
+    def adjust_tick_size(price: int) -> int:
+        """주어진 가격을 올바른 호가단위로 올림 보정 (TP 목표가용)"""
+        if price < 2000:     tick = 1
+        elif price < 5000:   tick = 5
+        elif price < 20000:  tick = 10
+        elif price < 50000:  tick = 50
+        elif price < 200000: tick = 100
+        elif price < 500000: tick = 500
+        else:                tick = 1000
+        return ((price + tick - 1) // tick) * tick
+
+    # 5. 매도 시도 가능 여부
     def can_try_sell(self, pos: PositionState) -> bool:
         now = pytime.time()
         if pos.selling:
             return False
         if now - pos.last_sell_attempt_ts < SELL_COOLDOWN_SEC:
             return False
-        return True    
+        return True
+
+    def get_used_budget(self) -> int:
+        """현재 포지션 + 미체결 BUY 주문의 총 사용금액"""
+        used = 0
+        for pos in self.positions.values():
+            used += pos.entry_price * pos.total_qty
+        for pend in self.pending_orders.values():
+            if pend.get("side") == "BUY":
+                used += pend.get("est_amount", 0)
+        return used
+
+    def get_remaining_budget(self) -> int:
+        """잔여 투자 가능 금액"""
+        return max(0, TOTAL_BUDGET - self.get_used_budget())    
 
     # 5. 대기 중인 매수 주문 수
     def _count_pending_buys(self) -> int:
@@ -1802,29 +1595,6 @@ class KiwoomAPI(QAxWidget):
                         self.ordering = bool(self.pending_orders)
                     break  # 동시 BUY 차단 로직상 1개만 있을 수 있음
 
-        # rqname이 TP 지정가(TP1_LIMIT, TP2_LIMIT 등)인 경우 → send_limit_sell에서 발송
-        elif "TP" in rqname and "LIMIT" in rqname:
-            # tp_pending_temp에서 거부된 주문 정보를 꺼내고 재시도 예약
-            for code, temp_list in list(self.tp_pending_temp.items()):
-                rejected = [t for t in temp_list if t.get("tag") == rqname]
-                self.tp_pending_temp[code] = [
-                    t for t in temp_list if t.get("tag") != rqname
-                ]
-                if not self.tp_pending_temp[code]:
-                    self.tp_pending_temp.pop(code, None)
-
-                for item in rejected:
-                    self.log_system.error(
-                        f"[TP_REJECT] code={code} tag={rqname} msg={msg} "
-                        f"- scheduling retry in {TP_RETRY_DELAY_SEC}s"
-                    )
-                    # 딜레이 후 재시도 (지정가 → 시장가 전환 포함)
-                    QTimer.singleShot(
-                        TP_RETRY_DELAY_SEC * 1000,
-                        lambda c=code, t=rqname, q=item["qty"], p=item["price"]:
-                            self._retry_tp_order(c, t, q, p)
-                    )
-                    
     # ==================================================
     # 14:50 강제 전량 청산
     # ==================================================                    
@@ -1858,8 +1628,6 @@ class KiwoomAPI(QAxWidget):
             except Exception as e:
                 self.log_system.warning(f"[DISCORD_FAIL] FORCE_LIQ: {e}")
 
-            # TP 취소
-            self.cancel_tp_orders(code)
 
             # 시장가 전량 매도
             ok = self.send_market_order(

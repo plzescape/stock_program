@@ -1009,6 +1009,10 @@ class KiwoomAPI(QAxWidget):
                 continue
             
             # 취소 재시도 쿨다운/횟수 제한
+            if pend.get("cancel_sent"):
+                # ⭐ 이미 취소 접수 성공한 주문 → Chejan 응답 대기 중, 재시도 불필요
+                continue
+
             if pend.get("cancel_retries", 0) >= MAX_CANCEL_RETRIES:
                 self.log_system.error(f"[CANCEL_GIVEUP] code={code} org={org}")
                 self.pending_orders.pop(code, None)

@@ -278,7 +278,14 @@ class KiwoomAPI(QAxWidget):
         if active_slots >= MAX_POSITIONS:
             self._scan_running = False
             return
-        if self.tr_inflight or not self.scan_queue:
+        if self.tr_inflight:
+            return
+        if not self.scan_queue:
+            self._scan_running = False  # ⭐ 큐 비면 확실히 False
+            self.log_signal.info(
+                f"[SCAN_IDLE] queue empty, _scan_running=False "
+                f"positions={len(self.positions)} candidates={len(self.candidates)}"
+            )
             return
 
         # 🔴 TR 간격 제한
@@ -457,9 +464,7 @@ class KiwoomAPI(QAxWidget):
     def _finish_tr(self, delay=True):
         self.tr_inflight = False
         self.current_scan_code = None
-        # self._scan_running = False
-        if self.scan_queue:
-            self._scan_running = True
+        self._scan_running = bool(self.scan_queue)  # ⭐ 큐 상태 기반으로 확실히 갱신
         QTimer.singleShot(
             SCAN_TR_DELAY_MS if delay else 0,
             self._scan_next
@@ -637,14 +642,16 @@ class KiwoomAPI(QAxWidget):
                     except Exception as e:
                         self.log_system.warning(f"[DISCORD_FAIL] TP2: {e}")
 
-            # 체결 발생 → selling 해제
-            pos.selling = False
-
             if pos.remain_qty > 0:
+                # ⭐ 부분체결: selling 유지 (중복 매도 방지)
+                # TP1/TP2 부분체결은 의도된 것이므로 selling 해제
+                if pend and ("TP1" in pend.get("reason", "") or "TP2" in pend.get("reason", "")):
+                    pos.selling = False  # TP 분할매도 완료 → 다음 단계 진행 허용
                 self.log_trade.info(f"[SELL_PARTIAL] code={code} remain={pos.remain_qty}/{pos.total_qty}")
                 return
 
             # 전량 매도 완료
+            pos.selling = False
             sell_reason = ""
             sell_pend = self.pending_orders.get(code)
             if sell_pend:
@@ -1092,6 +1099,17 @@ class KiwoomAPI(QAxWidget):
             return False
         
         now = pytime.time()
+
+        # ⭐ SELL 주문 시 보유수량 체크 (중복 매도 방어)
+        if side == "SELL":
+            pos = self.positions.get(code)
+            if not pos or pos.remain_qty <= 0:
+                self.log_trade.warning(f"[ORDER_SKIP_NO_POS] SELL code={code} qty={qty} - no position")
+                return False
+            if qty > pos.remain_qty:
+                self.log_trade.warning(f"[ORDER_QTY_ADJ] SELL code={code} qty={qty}→{pos.remain_qty}")
+                qty = pos.remain_qty
+
         # SELL은 빠른 방어가 중요하므로 스로틀 완화 (0.2초)
         throttle = 0.2 if side == "SELL" else 0.5
         if self.last_order_ts and now - self.last_order_ts < throttle:
@@ -1442,8 +1460,17 @@ class KiwoomAPI(QAxWidget):
             and self.scan_queue
         ):
             self._scan_running = True
-            self.log_signal.info("[SCAN_TRIGGER] by TR_CONDITION")
+            self.log_signal.info(
+                f"[SCAN_TRIGGER] by TR_CONDITION "
+                f"queue={len(self.scan_queue)} positions={len(self.positions)}"
+            )
             QTimer.singleShot(0, self._scan_next)
+        else:
+            self.log_signal.info(
+                f"[SCAN_NO_TRIGGER] TR_CONDITION "
+                f"queue={len(self.scan_queue)} scanning={self._scan_running} "
+                f"positions={len(self.positions)}"
+            )
 
     # ==================================================
     # 실시간 조건검색 수신
@@ -1475,29 +1502,34 @@ class KiwoomAPI(QAxWidget):
                     self.scan_queue.append(code)
 
                 self.log_trade.info(
-                    f"[COND_REENTRY_RESET] {code} retry_reset"
-                )             
-                return
-            
-            # 신규 후보 등록
-            self.candidates[code] = {
-                "state": "NEW",
-                "retry": 0,
-                "last_try": None,
-                "added_at": datetime.now(),
-            }
-            
-            self.scan_queue.append(code)
-            self.log_signal.info(f"[COND_IN] {code}")
-            self.log_trade.info(
-                f"[CANDIDATE_ADD] code={code} queue_size={len(self.scan_queue)}"
-            )
+                    f"[COND_REENTRY_RESET] {code} retry_reset "
+                    f"queue={len(self.scan_queue)} scanning={self._scan_running}"
+                )
+                # ⭐ 재편입도 스캔 트리거 (기존 구멍 수정)
+                # → return 전에 트리거 체크
+            else:
+                # 신규 후보 등록
+                self.candidates[code] = {
+                    "state": "NEW",
+                    "retry": 0,
+                    "last_try": None,
+                    "added_at": datetime.now(),
+                }
 
-            if len(self.positions) < MAX_POSITIONS and not self._scan_running:
+                self.scan_queue.append(code)
+                self.log_signal.info(f"[COND_IN] {code}")
+                self.log_trade.info(
+                    f"[CANDIDATE_ADD] code={code} queue_size={len(self.scan_queue)} "
+                    f"scanning={self._scan_running}"
+                )
+
+            # ⭐ 공통 스캔 트리거 (신규 + 재편입 모두)
+            if len(self.positions) < MAX_POSITIONS and not self._scan_running and self.scan_queue:
                 self._scan_running = True
                 self.log_trade.info(
-                    f"[SCAN_TRIGGER] reason=REAL_CONDITION positions={len(self.positions)}"
-                )                
+                    f"[SCAN_TRIGGER] reason=REAL_CONDITION positions={len(self.positions)} "
+                    f"queue={len(self.scan_queue)}"
+                )
                 QTimer.singleShot(0, self._scan_next)
 
         # =========================

@@ -44,6 +44,13 @@ def enable_auto_trade(api: KiwoomAPI):
             print(f"⚠️ Discord 장시작 알림 실패: {e}")
 
         api.run_condition_cycle()
+
+        # ⭐ 조건검색 주기 타이머 (CONDITION_INTERVAL_MIN마다 자동 재실행)
+        from config import CONDITION_INTERVAL_MIN
+        api._cond_cycle_timer = QTimer()
+        api._cond_cycle_timer.timeout.connect(api.run_condition_cycle)
+        api._cond_cycle_timer.start(CONDITION_INTERVAL_MIN * 60 * 1000)
+        print(f"🔄 조건검색 주기 타이머 시작 ({CONDITION_INTERVAL_MIN}분)")
         
         return
 

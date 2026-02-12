@@ -12,8 +12,8 @@ MOCK_ACCOUNT_NO = "8118694111"
 #   "QTY"      → 무조건 QTY 만큼 매수 (금액 무시)
 #   "BOTH"     → MAX_BUY_AMOUNT 이내 + 최대 QTY개 (둘 중 적은 쪽)
 BUY_MODE = "BOTH"
-QTY = 20                   # 고정 수량 / 최대 수량
-MAX_BUY_AMOUNT = 200000    # 종목당 최대 매수금액 (원)
+QTY = 100                   # 고정 수량 / 최대 수량
+MAX_BUY_AMOUNT = 500000    # 종목당 최대 매수금액 (원)
 TOTAL_BUDGET = 5000000     # 총 투자 한도 (원)
 
 # ===== 손절 / 익절 / 트레일링 =====
@@ -34,7 +34,7 @@ CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
 # 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "AUTO_CANDI_KOSDAQ_SCALP", "DANTA_1", "DANTA_2"
-CONDITION_NAME = "AUTO_CANDI_VOL_SPIKE"
+CONDITION_NAME = "AUTO_CANDI_BREAKOUT"
 # CONDITION_INDEX = 0
 
 # ===== 스캔 설정 =====

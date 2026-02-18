@@ -170,19 +170,28 @@ def get_entry_signal_data(candles) -> dict | None:
 
 
 # ===========================
-# 전략: 눌림목 진입 (MA20 지지 반등)
+# 전략: 눌림목 진입 (MA20 지지 반등) - 개선판
 # ===========================
 def is_pullback_entry(candles, logger=None, code=None) -> bool:
     """
-    눌림목 진입 전략:
-    상승 추세(MA20 우상향) 중 조정을 받다가 MA20 부근에서 반등하는 시점에 진입.
+    눌림목 진입 전략 (개선판):
 
-    조건:
-    1. MA20 우상향 (추세 유지)
-    2. 최근 고점 대비 조정 (고점에서 -2%~-7% 눌림) -> -1% ~ -9%로 완화
-    3. MA20 근접 또는 터치 (종가가 MA20의 ±1.5% 이내) -> 2.5%로 완화
-    4. 반등 양봉 (직전봉 대비 종가 상승 + 양봉)
-    5. 거래량 축소 후 회복 (조정 구간 거래량 < 이전 평균, 반등봉은 평균 이상)
+    핵심 철학:
+    - 상승 추세 중 조정이 온 뒤, 지지 구간(MA20 or 직전 저점)에서 반등이 확인될 때 진입
+    - 진입 조건은 완화하되, 거짓 눌림(하락 추세 착각) 필터를 강화
+
+    조건 구성:
+    1. [추세] MA20 우상향 + 최근 고점이 MA20보다 충분히 위 (상승세 확인)
+    2. [조정] 고점 대비 -1% ~ -10% 눌림 (기존보다 완화)
+    3. [지지] MA20 or 최근 저점 근접 (±3.5% 이내, 기존보다 완화)
+    4. [반등] 직전 완성봉 기준 양봉 + 전봉 대비 종가 상승
+    5. [캔들] 몸통 비율 ≥ 40% (기존 50%에서 완화, 반등 초기 포착)
+    6. [거래량] 조정 구간 대비 반등봉 거래량 ≥ 1.0배 (회복 확인, 기존보다 완화)
+
+    거짓 눌림 필터 (신규 추가):
+    F1. 최근 5봉 중 음봉이 3개 이상이면서 종가가 점진 하락 → 하락 추세로 판정, 제외
+    F2. 반등봉 윗꼬리가 몸통의 2배 초과 → 매도 압력 강한 페이크 반등, 제외
+    F3. 조정 저점이 MA20보다 5% 이상 아래 → 지지선 이탈, 눌림목 아닌 하락 추세, 제외
     """
     if len(candles) < 25:
         if logger:
@@ -190,54 +199,97 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
         return False
 
     c1 = candles[0]   # 직전 완성봉 (반등 봉)
-    c2 = candles[1]   # 전전 봉 (조정 구간)
+    c2 = candles[1]   # 전전 봉
 
     # --- MA20 계산 ---
-    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_now  = sum(c['close'] for c in candles[0:20]) / 20
     ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
 
-    # 1. MA20 우상향 (추세 유지 중이어야 눌림목 의미 있음) + 하락 눌림 진입 판단
-    price_above_ma = c1['close'] > ma20_now
-    trend_ok = ma20_now > ma20_prev and price_above_ma
+    # ──────────────────────────────────────────
+    # 1. 추세 조건
+    # ──────────────────────────────────────────
+    # MA20 우상향 (기울기 양수)
+    ma_rising = ma20_now > ma20_prev
 
-    # --- 최근 10봉 내 고점 ---
+    # 최근 10봉 고점이 MA20보다 최소 2% 위 → 실질적인 상승 추세 존재 확인
     recent_high = max(c['high'] for c in candles[0:10])
+    high_above_ma = (recent_high - ma20_now) / ma20_now >= 0.02
 
-    # 2. 고점 대비 조정폭 (-2% ~ -7%) -> -1% ~ -9%로 완화
+    trend_ok = ma_rising and high_above_ma
+
+    # ──────────────────────────────────────────
+    # 2. 조정 폭 조건 (-1% ~ -10%)
+    # ──────────────────────────────────────────
     pullback_pct = (c1['close'] - recent_high) / recent_high
-    pullback_ok = -0.09 <= pullback_pct <= -0.01
+    pullback_ok = -0.10 <= pullback_pct <= -0.01
 
-    # 3. MA20 근접 (종가가 MA20의 ±1.5% 이내) -> 2.5%로 완화
+    # ──────────────────────────────────────────
+    # 3. 지지선 근접 조건 (MA20 ±3.5% 이내)
+    # ──────────────────────────────────────────
     ma_distance = abs(c1['close'] - ma20_now) / ma20_now
-    near_ma_ok = ma_distance <= 0.025
+    near_ma_ok = ma_distance <= 0.035
 
-    # 4-1. 반등 양봉 (전봉 대비 종가 상승 + 양봉)
+    # ──────────────────────────────────────────
+    # 4. 반등 양봉
+    # ──────────────────────────────────────────
     bounce_ok = (
-        c1['close'] > c2['close'] and
-        c1['close'] > c1['open']
+        c1['close'] > c2['close'] and   # 전봉 대비 종가 상승
+        c1['close'] > c1['open']         # 양봉
     )
 
-    # 4-2. 캔들 강도 판단
+    # ──────────────────────────────────────────
+    # 5. 캔들 강도 (몸통 ≥ 40%)
+    # ──────────────────────────────────────────
     candle_range = c1['high'] - c1['low']
-    body_size = c1['close'] - c1['open']
-    strength_ok = (body_size / candle_range) >= 0.5 if candle_range > 0 else False
+    body_size    = c1['close'] - c1['open']
+    strength_ok  = (body_size / candle_range) >= 0.4 if candle_range > 0 else False
 
-    # 5. 거래량 조건:
-    #    - 조정 구간(2~5봉) 평균거래량 < 이전(6~10봉) 평균거래량 (거래량 축소)
-    #    - 반등봉 거래량 ≥ 조정 구간 평균 (거래량 회복)
+    # ──────────────────────────────────────────
+    # 6. 거래량 조건 (조정 구간 대비 반등봉 회복)
+    # ──────────────────────────────────────────
     pullback_vols = [c['volume'] for c in candles[1:5]]
-    prior_vols = [c['volume'] for c in candles[5:10]]
-
     avg_pullback_vol = sum(pullback_vols) / len(pullback_vols) if pullback_vols else 1
-    avg_prior_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
 
-    vol_contracted = avg_pullback_vol < avg_prior_vol  # 조정 중 거래량 축소
-    vol_recovery = c1['volume'] >= avg_pullback_vol     # 반등봉에서 회복
+    # 반등봉 거래량이 조정 평균 이상 (기존보다 완화: 1.0배)
+    vol_recovery = c1['volume'] >= avg_pullback_vol * 1.0 and c1['volume'] >= 1000
 
-    vol_ok = vol_contracted and vol_recovery and c1['volume'] >= 1000
+    # ──────────────────────────────────────────
+    # [거짓 눌림 필터 F1] 최근 5봉 연속 하락 추세
+    # ──────────────────────────────────────────
+    recent5 = candles[0:5]
+    bearish_count = sum(1 for c in recent5 if c['close'] < c['open'])  # 음봉 개수
+    closes5 = [c['close'] for c in recent5]
+    # 종가가 단조 감소(점진 하락)인지 확인
+    is_falling = all(closes5[i] <= closes5[i+1] for i in range(len(closes5)-1))  # 인덱스0이 최신
+    fake_downtrend = (bearish_count >= 3 and is_falling)
 
-    # --- 최종 판정 ---
-    is_valid = trend_ok and pullback_ok and near_ma_ok and bounce_ok and vol_ok and strength_ok
+    # ──────────────────────────────────────────
+    # [거짓 눌림 필터 F2] 반등봉 윗꼬리 과다
+    # 윗꼬리 = high - close, 몸통의 2배 초과면 매도세 강함
+    # ──────────────────────────────────────────
+    upper_wick = c1['high'] - c1['close']
+    fake_wick = (upper_wick > body_size * 2.0) if body_size > 0 else False
+
+    # ──────────────────────────────────────────
+    # [거짓 눌림 필터 F3] 조정 저점이 MA20보다 5% 이상 아래 → 지지 이탈
+    # ──────────────────────────────────────────
+    recent_low = min(c['low'] for c in candles[0:10])
+    support_broken = (ma20_now - recent_low) / ma20_now > 0.05
+
+    # ──────────────────────────────────────────
+    # 최종 판정
+    # ──────────────────────────────────────────
+    filter_ok = not fake_downtrend and not fake_wick and not support_broken
+
+    is_valid = (
+        trend_ok and
+        pullback_ok and
+        near_ma_ok and
+        bounce_ok and
+        strength_ok and
+        vol_recovery and
+        filter_ok
+    )
 
     if logger:
         if is_valid:
@@ -246,29 +298,30 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
                 f"종가:{c1['close']} MA20:{ma20_now:.0f} | "
                 f"눌림:{pullback_pct*100:.1f}% | "
                 f"MA거리:{ma_distance*100:.2f}% | "
-                f"반등거래량:{c1['volume']}"
-                f"체결강도={strength_ok}"
+                f"반등거래량:{c1['volume']} | "
+                f"캔들강도:{body_size/candle_range*100:.0f}%"
             )
         else:
             logger.info(
                 f"[PULLBACK_CHECK] {code} "
-                f"trend={trend_ok} pullback={pullback_ok}({pullback_pct*100:.1f}%) "
+                f"trend={trend_ok}(rising={ma_rising},high_above={high_above_ma}) "
+                f"pullback={pullback_ok}({pullback_pct*100:.1f}%) "
                 f"near_ma={near_ma_ok}({ma_distance*100:.2f}%) "
-                f"bounce={bounce_ok} vol={vol_ok}"
+                f"bounce={bounce_ok} strength={strength_ok} vol={vol_recovery} "
+                f"f1_fake_trend={fake_downtrend} f2_fake_wick={fake_wick} f3_support_broken={support_broken}"
             )
 
     return is_valid
 
 
 def get_pullback_signal_data(candles) -> dict | None:
-    """눌림목 진입 시 디스코드 알림용 지표"""
+    """눌림목 진입 시 디스코드 알림용 지표 (개선판)"""
     if len(candles) < 25:
         return None
 
     c1 = candles[0]
-    c2 = candles[1]
 
-    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_now  = sum(c['close'] for c in candles[0:20]) / 20
     ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
 
     recent_high = max(c['high'] for c in candles[0:10])
@@ -280,9 +333,13 @@ def get_pullback_signal_data(candles) -> dict | None:
     avg_pullback_vol = sum(pullback_vols) / len(pullback_vols) if pullback_vols else 1
     vol_ratio = c1['volume'] / avg_pullback_vol if avg_pullback_vol > 0 else 0
 
+    candle_range = c1['high'] - c1['low']
+    body_size    = c1['close'] - c1['open']
+    candle_strength = (body_size / candle_range * 100) if candle_range > 0 else 0
+
     return {
         "vol_ratio": vol_ratio,
         "trend": "MA20 상승" if ma20_now > ma20_prev else "MA20 하락",
-        "breakout": f"눌림목 반등 ({pullback_pct*100:.1f}%)",
-        "candle_strength": ma_distance * 100,
+        "breakout": f"눌림목 반등 ({pullback_pct*100:.1f}%) MA거리:{ma_distance*100:.1f}%",
+        "candle_strength": candle_strength,
     }

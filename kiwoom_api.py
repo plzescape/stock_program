@@ -830,13 +830,24 @@ class KiwoomAPI(QAxWidget):
 
         # =========================
         # ⚠️ 거래량 급감 TIME STOP (TP1 익절 후에만)
-        # 조건: 피크 평균거래량 대비 50% 이하 + TP1 후 10초 보호
+        # 개선사항:
+        #  - TP2 진행 중(tp1_done=True, tp2_done=False, 가격이 TP2 미달)이면 비활성화
+        #    → TP1→TP2 구간 상승 중 거래량 일시 감소 오발동 방지
+        #  - TP2 완료 후(trailing 구간)에는 다시 활성화
+        #  - 보호 시간: 10초 → 30초 (TP1 직후 거래량 재집결 여유 확보)
+        #  - 급락 비율: 0.5 → 0.35 (기준 강화, 일시적 감소에 흔들리지 않도록)
         # =========================
-        VOL_DROP_PROTECT_SEC = 10  # TP1 후 보호시간
+        VOL_DROP_PROTECT_SEC = 30   # TP1 후 보호시간 (10→30초)
+        VOL_DROP_RATIO = 0.35       # 피크 대비 35% 이하일 때만 급락 판정 (0.5→0.35)
+
+        tp2_target_for_vol = self.adjust_tick_size(int(pos.entry_price * (1 + TP2_RATE)))
+        in_tp1_to_tp2_run = pos.tp1_done and not pos.tp2_done and cur < tp2_target_for_vol
+
         if (
             pos.tp1_done
             and not pos.time_stop_done
             and not pos.selling
+            and not in_tp1_to_tp2_run          # TP1→TP2 상승 구간 중에는 발동 안 함
             and len(pos.recent_volumes) == VOL_CHECK_TICKS
             and pos.peak_avg_vol > 0
             and (now - pos.tp1_done_ts) >= VOL_DROP_PROTECT_SEC
@@ -845,14 +856,15 @@ class KiwoomAPI(QAxWidget):
             vol_ratio = avg_vol / pos.peak_avg_vol
             pnl_rate = (cur - pos.entry_price) / pos.entry_price
 
-            if vol_ratio <= 0.5 and pnl_rate >= TIME_STOP_MAX_LOSS:
+            if vol_ratio <= VOL_DROP_RATIO and pnl_rate >= TIME_STOP_MAX_LOSS:
                 if not self.can_try_sell(pos):
                     return
 
                 self.log_trade.info(
                     f"[VOL_TIME_STOP] code={code} "
                     f"avg_vol={avg_vol:.2f} peak={pos.peak_avg_vol:.2f} "
-                    f"ratio={vol_ratio:.2f} pnl={pnl_rate:.4f}"
+                    f"ratio={vol_ratio:.2f} pnl={pnl_rate:.4f} "
+                    f"tp2_done={pos.tp2_done}"
                 )
                 ok = self.send_market_order(
                     side="SELL",

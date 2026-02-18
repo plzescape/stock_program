@@ -492,12 +492,10 @@ class KiwoomAPI(QAxWidget):
             pend["order_no"] = order_no
             self.log_trade.info(f"[PENDING_ORDERNO] code={code} order_no={order_no}")
 
-        if not code or qty <= 0:
+        if not code:
             return
 
-        self.log_trade.info(f"[CHEJAN] {order_gubun} code={code} price={price} qty={qty}")
-        
-        # CANCEL_DONE
+        # ⭐ CANCEL_DONE 처리는 qty=0이어도 실행해야 함 (취소 chejan은 체결수량=0)
         if "취소" in order_gubun or "취소" in status:
             pend = self.pending_orders.get(code)
             if pend and pend.get("side") == "BUY":
@@ -517,6 +515,12 @@ class KiwoomAPI(QAxWidget):
             self.ordering = bool(self.pending_orders) # 주문락 해제 여부 재계산
             self.log_trade.info(f"[CANCEL_DONE] code={code} status={status}")
             return
+
+        # ⭐ 취소 이외의 체결은 qty > 0이어야 함
+        if qty <= 0:
+            return
+
+        self.log_trade.info(f"[CHEJAN] {order_gubun} code={code} price={price} qty={qty}")
 
         # BUY
         if "매수" in order_gubun:
@@ -736,9 +740,9 @@ class KiwoomAPI(QAxWidget):
 
         # STOP LOSS
         if pnl_rate <= -STOP_LOSS_RATE:
-            self.log_trade.info(f"[STOP_LOSS] {code} 손절 매도 트리거 (현재가:{cur})")
             if not self.can_try_sell(pos):
                 return
+            self.log_trade.info(f"[STOP_LOSS] {code} 손절 매도 트리거 (현재가:{cur} pnl={pnl_rate:.4f})")
             ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             if ok:
                 pos.last_sell_attempt_ts = now
@@ -1011,6 +1015,18 @@ class KiwoomAPI(QAxWidget):
             # 취소 재시도 쿨다운/횟수 제한
             if pend.get("cancel_sent"):
                 # ⭐ 이미 취소 접수 성공한 주문 → Chejan 응답 대기 중, 재시도 불필요
+                # 단, Chejan이 안 올 수 있으므로 타임아웃으로 강제 제거
+                cancel_age = now - float(pend.get("last_cancel_ts", now))
+                if cancel_age > FORCE_ABANDON_TIMEOUT:
+                    self.log_system.error(
+                        f"[CANCEL_ZOMBIE] code={code} org={org} "
+                        f"cancel_sent but no chejan after {cancel_age:.1f}s - force removing"
+                    )
+                    self.pending_orders.pop(code, None)
+                    self.ordering = bool(self.pending_orders)
+                    self._pending_buy_code = None
+                    self._pending_buy_qty = 0
+                    self._resume_scan_if_possible()
                 continue
 
             if pend.get("cancel_retries", 0) >= MAX_CANCEL_RETRIES:
@@ -1047,6 +1063,18 @@ class KiwoomAPI(QAxWidget):
                 continue
             age = now - float(pend.get("ts", now))
             if age > SELL_PENDING_TIMEOUT and not pend.get("stuck"):
+                pos = self.positions.get(code)
+                # ⭐ 부분체결이 이미 됐으면 거래소에서 나머지도 체결 진행 중
+                # → selling 해제하면 중복 매도 위험! 더 기다림
+                if pos and pos.remain_qty < pos.total_qty:
+                    # 부분체결 진행 중 → 타임아웃을 60초로 연장
+                    if age <= SELL_PENDING_TIMEOUT * 2:
+                        continue
+                    self.log_system.error(
+                        f"[SELL_STUCK_PARTIAL] code={code} age={age:.1f}s "
+                        f"remain={pos.remain_qty}/{pos.total_qty} - force cleanup"
+                    )
+
                 self.log_system.error(
                     f"[SELL_STUCK] code={code} age={age:.1f}s - "
                     f"marking stuck (주문이 살아있을 수 있음)"
@@ -1055,7 +1083,6 @@ class KiwoomAPI(QAxWidget):
                 # pending 제거 + selling 해제하여 재시도 허용
                 # (중복 매도 방지: send_market_order에서 remain_qty 체크)
                 self.pending_orders.pop(code, None)
-                pos = self.positions.get(code)
                 if pos:
                     pos.selling = False
                     pos.time_stop_done = False  # stuck 후 재시도 가능하도록 리셋

@@ -179,8 +179,8 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
 
     조건:
     1. MA20 우상향 (추세 유지)
-    2. 최근 고점 대비 조정 (고점에서 -2%~-7% 눌림)
-    3. MA20 근접 또는 터치 (종가가 MA20의 ±1.5% 이내)
+    2. 최근 고점 대비 조정 (고점에서 -2%~-7% 눌림) -> -1% ~ -9%로 완화
+    3. MA20 근접 또는 터치 (종가가 MA20의 ±1.5% 이내) -> 2.5%로 완화
     4. 반등 양봉 (직전봉 대비 종가 상승 + 양봉)
     5. 거래량 축소 후 회복 (조정 구간 거래량 < 이전 평균, 반등봉은 평균 이상)
     """
@@ -203,13 +203,13 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     # --- 최근 10봉 내 고점 ---
     recent_high = max(c['high'] for c in candles[0:10])
 
-    # 2. 고점 대비 조정폭 (-2% ~ -7%)
+    # 2. 고점 대비 조정폭 (-2% ~ -7%) -> -1% ~ -9%로 완화
     pullback_pct = (c1['close'] - recent_high) / recent_high
-    pullback_ok = -0.07 <= pullback_pct <= -0.02
+    pullback_ok = -0.09 <= pullback_pct <= -0.01
 
-    # 3. MA20 근접 (종가가 MA20의 ±1.5% 이내)
+    # 3. MA20 근접 (종가가 MA20의 ±1.5% 이내) -> 2.5%로 완화
     ma_distance = abs(c1['close'] - ma20_now) / ma20_now
-    near_ma_ok = ma_distance <= 0.015
+    near_ma_ok = ma_distance <= 0.025
 
     # 4-1. 반등 양봉 (전봉 대비 종가 상승 + 양봉)
     bounce_ok = (

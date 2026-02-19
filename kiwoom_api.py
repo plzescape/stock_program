@@ -21,8 +21,10 @@ from config import (
     CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
     MAX_POSITIONS, TOTAL_BUDGET,
-    BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
+    BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC,
+    MARKET_BAD_THRESHOLD,  # 섹터 필터용
 )
+from sector_filter import SectorFilter
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data
 
@@ -134,6 +136,10 @@ class KiwoomAPI(QAxWidget):
         # ===== 진입 신호 데이터 (디스코드 알림용) =====
         # code -> { vol_ratio, trend, breakout, candle_strength }
         self._entry_signals: dict[str, dict] = {}
+
+        # ===== 섹터 필터 =====
+        # 로그인 완료 후 self.sector_filter.initialize() 호출 필요
+        self.sector_filter: SectorFilter = SectorFilter(self)
 
     # ==================================================
     # Login / condition
@@ -346,6 +352,11 @@ class KiwoomAPI(QAxWidget):
                          "RQ_1MIN", "OPT10080", 0, screen)
 
     def _on_receive_tr_data(self, screen_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
+        # ── OPT90001: 섹터 등락률 수신 (tr_inflight 와 무관하게 처리) ──
+        if rq_name == "RQ_SECTOR" and tr_code == "OPT90001":
+            self.sector_filter.on_tr_sector(screen_no)
+            return
+
         if not self.tr_inflight:
             return
         # print(rq_name, tr_code)
@@ -369,13 +380,43 @@ class KiwoomAPI(QAxWidget):
         # 최신봉 제외한 완성봉들
         completed_candles = candles[1:] if len(candles) > 1 else []
 
-        # === ENTRY 판정: 돌파 전략 OR 눌림목 전략 ===
+        # ================================================================
+        # ENTRY 판정: 4단계 섹터 분류 → 진입 전략 결정
+        # ================================================================
+        # [1단계] 시장 분위기 확인
+        #   BAD 시장: SECTOR_HOT 종목만 진입 허용 (강세 섹터 + 0162 교집합)
+        # [2단계] 종목 분류
+        #   SECTOR_HOT  → 완화된 섹터 전용 조건 우선 적용
+        #   SECTOR_ONLY / COND_ONLY / NORMAL → 기존 BREAKOUT / PULLBACK
+        # ================================================================
         entry_type = None
         if len(completed_candles) >= 25:
-            if is_entry_candidate_VER2(completed_candles, self.log_signal, code):
-                entry_type = "BREAKOUT"
-            elif is_pullback_entry(completed_candles, self.log_signal, code):
-                entry_type = "PULLBACK"
+
+            classification = self.sector_filter.classify_code(code)
+
+            self.log_signal.info(
+                f"[CLASSIFY] {code} class={classification} "
+                f"hot_sectors={[s.sector_name for s in self.sector_filter.get_hot_sectors()]}"
+            )
+
+            if classification == "SECTOR_HOT":
+                # 강세섹터 종목 → 완화 조건 우선
+                entry_type = self.sector_filter.is_sector_hot_entry(
+                    completed_candles, self.log_signal, code
+                )
+                # 완화 조건도 미충족 시 기존 전략으로 폴백
+                if entry_type is None:
+                    if is_entry_candidate_VER2(completed_candles, self.log_signal, code):
+                        entry_type = "BREAKOUT"
+                    elif is_pullback_entry(completed_candles, self.log_signal, code):
+                        entry_type = "PULLBACK"
+
+            else:
+                # SECTOR_ONLY / NORMAL → 기존 전략 그대로
+                if is_entry_candidate_VER2(completed_candles, self.log_signal, code):
+                    entry_type = "BREAKOUT"
+                elif is_pullback_entry(completed_candles, self.log_signal, code):
+                    entry_type = "PULLBACK"
 
         if entry_type and len(self.positions) < MAX_POSITIONS:
                 # ── 매수수량 계산: BUY_MODE에 따라 분기 ──
@@ -703,11 +744,12 @@ class KiwoomAPI(QAxWidget):
     def _on_receive_real_data(self, code, real_type, data):
         if real_type != "주식체결":
             return
+
         pos = self.positions.get(code)
         if not pos or pos.remain_qty <= 0:
             self.log_signal.debug(
                 f"[REAL_SKIP] code={code} not in positions"
-            )            
+            )
             return
         cur = int(self.dynamicCall("GetCommRealData(QString, int)", code, 10) or 0)
         cur = abs(cur)
@@ -1490,25 +1532,18 @@ class KiwoomAPI(QAxWidget):
         조건검색 결과 수신 (일괄)
         - codes: '005930;000660;...' 형태
         """
-
         new_codes = [c for c in codes.split(";") if c]
 
         for code in new_codes:
-            # 이미 포지션 있으면 무시
             if code in self.positions:
                 continue
-
-            # 이미 후보에 있으면 무시
             if code in self.candidates:
                 continue
-
-            # 후보 등록
             self.candidates[code] = {
                 "state": "NEW",
                 "retry": 0,
                 "added_at": datetime.now(),
             }
-
             self.scan_queue.append(code)
             self.log_signal.info(f"[COND_IN] {code}")
 
@@ -1536,6 +1571,7 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     def _on_receive_real_condition(self, code, event_type, cond_name, cond_index):
         code = code.strip()
+
         # =========================
         # 조건 진입 (I)
         # =========================

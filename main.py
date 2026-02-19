@@ -88,6 +88,25 @@ def main():
     # 2) 조건검색식 로드 및 등록 - 0 : 현재 기준만, 1 : 조건 + 실시간  
     api.load_conditions()
 
+    # 2-0) 섹터 필터 초기화
+    # GetThemeGroupList() + GetThemeGroupCode() 로 섹터 구성 종목 로드 (동기, 즉시 완료)
+    api.sector_filter.initialize()
+
+    # 2-0-1) 섹터 등락률 주기 갱신 타이머 (OPT90001, 5분 간격)
+    # 첫 갱신은 장 시작 1분 후, 이후 5분마다 자동 갱신
+    sector_timer = QTimer()
+    sector_timer.setInterval(5 * 60 * 1000)  # 5분
+    sector_timer.timeout.connect(api.sector_filter.refresh_sector_status)
+    api._sector_refresh_timer = sector_timer  # GC 방지
+
+    now = datetime.now()
+    market_open = datetime.combine(now.date(), time(9, 0))
+    first_refresh_delay = max(60_000, int((market_open - now).total_seconds() * 1000) + 60_000)
+    QTimer.singleShot(first_refresh_delay, lambda: (
+        api.sector_filter.refresh_sector_status(),
+        sector_timer.start()
+    ))
+
     # 2-1) 장전 자가진단 (필수)
     ok = api.self_check("PRE_MARKET")
     if not ok:

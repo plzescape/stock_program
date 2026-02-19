@@ -74,98 +74,135 @@ def is_entry_candidate(candles, logger=None, code=None) -> bool:
 
 def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     """
-    고신뢰도 + MA20 추세 추종 전략
-    - candles: 이미 kiwoom_api에서 candles[1:]로 슬라이싱되어 넘어온 완성봉 리스트
-    - candles[0]: 가장 최근 완성봉
+    브레이크아웃 진입 전략 VER3 (실전 로그 기반 재설계)
+
+    [기존 VER2의 문제점]
+    1. 직전 1봉 고점만 비교 → 단기 반등봉도 '돌파'로 인식
+    2. MA20 기울기 판단 너무 단순 (5봉 비교, 상승폭 0원도 통과)
+    3. 진입 종가가 MA20에서 이미 너무 멀어 추가 상승 여력 부족
+       → SL 종목 평균 MA갭 1.76% (TP1 목표 2% → 여력 0.24%뿐)
+    4. 거래량 폭증이 '매집봉'인지 '천장봉'인지 구분 불가
+       → 거량 18~30배 종목이 줄줄이 SL
+
+    [VER3 개선 방향]
+    A. 진입 시점 MA갭 상한선 도입: 종가가 MA20 대비 1.5% 이내여야 진입
+       → 이미 많이 오른 종목 차단, 남은 여력 확보
+    B. 다봉 고점 돌파: 최근 5봉 고점 모두 돌파해야 진입
+       → 단기 반등이 아닌 실제 저항 돌파 확인
+    C. MA20 기울기 최소 상승률 도입: 5봉 대비 최소 0.3% 이상 상승
+       → 횡보 구간 '상향 판정' 차단
+    D. 거래량 이상 급등 차단: 20배 이상 폭증 시 '천장봉' 의심 → 제외
+       → 398120(30.5배), 330730(19.5배), 000210(18.8배) 모두 SL이었음
+    E. 연속 상승 확인: c1이 상승봉 + c2도 양봉 → 추세 연속성
     """
-    # print("is_entry_candidate_VER2 called with code:", code, len(candles), "candles")
-    # 1. 이동평균선 계산을 위해 최소 25개 이상의 데이터가 필요함
     if len(candles) < 25:
         if logger:
             logger.info(f"[STRATEGY_SKIP] {code} 데이터 부족 (필요:25, 현재:{len(candles)})")
         return False
 
-    # --- 데이터 정의 ---
-    c1 = candles[0]          # 직전 완성봉 (기준)
-    c2 = candles[1]          # 전전 완성봉
-    prev_5_candles = candles[1:6]  # 최근 5개 봉 (평균 거래량용)
+    c1 = candles[0]   # 직전 완성봉 (진입 기준봉)
+    c2 = candles[1]   # 전전 완성봉
 
-    # 2. 이동평균선(MA20) 계산
-    # 최근 20개 완성봉의 종가 평균
-    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
-    # 5봉 전 시점의 MA20 (기울기 확인용)
-    ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
+    # MA20 계산
+    ma20_now  = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_prev = sum(c['close'] for c in candles[5:25]) / 20   # 5봉 전 시점 MA20
 
-    # 3. [추가] MA20 정배열 및 추세 조건
-    # - 현재 주가가 MA20 위에 있어야 함 (정배열 초입/유지)
-    # - MA20의 수치 자체가 5봉 전보다 높아야 함 (우상향 추세)
+    # ── A. MA20 기울기 (최소 0.3% 이상 상승) ──────────────────────────
+    ma20_slope_pct = (ma20_now - ma20_prev) / ma20_prev * 100
     trend_ok = (
-        c1['close'] > ma20_now and
-        ma20_now > ma20_prev
+        c1['close'] > ma20_now and      # 정배열
+        ma20_slope_pct >= 0.3           # 실질적 우상향 (횡보 제외)
     )
 
-    # 4. 가격 돌파 조건 (직전 고점 돌파 및 양봉)
+    # ── B. 진입 시점 MA갭 상한: MA20 대비 +0.5% ~ +1.5% ───────────────
+    # - 0.5% 미만: 아직 MA20 돌파 초기, 추세 불확실
+    # - 1.5% 초과: 이미 많이 올라서 TP1(+2%)까지 남은 여력 0.5%뿐
+    ma_gap_pct = (c1['close'] - ma20_now) / ma20_now * 100
+    ma_gap_ok = 0.5 <= ma_gap_pct <= 1.5
+
+    # ── C. 다봉 고점 돌파: 최근 5봉(c2~c6) 고점 모두 돌파 ────────────
+    prev_5_high = max(c['high'] for c in candles[1:6])
     price_ok = (
-        c1['close'] > c2['high'] and 
-        c1['close'] > c1['open']
+        c1['close'] > prev_5_high and   # 5봉 고점 저항 돌파
+        c1['close'] > c1['open']        # 양봉
     )
 
-    # 5. 거래량 조건 (과거 5봉 평균 대비 3배 폭증)
-    avg_vol = sum(c['volume'] for c in prev_5_candles) / len(prev_5_candles)
+    # ── D. 거래량: 5봉 평균 대비 3~15배 (20배 초과는 천장봉 의심 차단) ──
+    prev_5_candles = candles[1:6]
+    avg_vol = sum(c['volume'] for c in prev_5_candles) / 5
+    vol_ratio = c1['volume'] / avg_vol if avg_vol > 0 else 0
     vol_ok = (
-        c1['volume'] > avg_vol * 3.0 and
+        3.0 <= vol_ratio <= 15.0 and    # 폭증은 OK, 과도한 폭등은 차단
         c1['volume'] >= 5000
     )
 
-    # 6. 캔들 강도 (윗꼬리가 짧은 장대양봉)
+    # ── E. 캔들 강도: 몸통 70% 이상 (윗꼬리 짧은 장대양봉) ─────────────
     candle_range = c1['high'] - c1['low']
-    body_size = c1['close'] - c1['open']
-    strength_ok = (body_size / candle_range) >= 0.7 if candle_range > 0 else False
+    body_size    = c1['close'] - c1['open']
+    strength_ok  = (body_size / candle_range) >= 0.7 if candle_range > 0 else False
 
-    # --- 최종 판정 ---
-    is_valid = trend_ok and price_ok and vol_ok and strength_ok
+    # ── F. 직전봉(c2)도 양봉: 추세 연속성 확인 ──────────────────────────
+    c2_bull = c2['close'] > c2['open']
 
-    if logger and is_valid:
-        logger.info(
-            f"[ENTRY_CONFIRMED] {code} | "
-            f"종가:{c1['close']} | "
-            f"MA20추세:상향({ma20_now:.1f}) | "
-            f"거래량:{c1['volume']}(평균의 {c1['volume']/avg_vol:.1f}배)"
-        )
+    # ── 최종 판정 ──────────────────────────────────────────────────────
+    is_valid = trend_ok and ma_gap_ok and price_ok and vol_ok and strength_ok and c2_bull
+
+    if logger:
+        if is_valid:
+            logger.info(
+                f"[ENTRY_CONFIRMED] {code} | "
+                f"종가:{c1['close']} | "
+                f"MA20추세:상향({ma20_now:.1f}, 기울기+{ma20_slope_pct:.2f}%) | "
+                f"MA갭:{ma_gap_pct:.2f}% | "
+                f"5봉고점돌파:{prev_5_high} | "
+                f"거래량:{c1['volume']}(평균의 {vol_ratio:.1f}배)"
+            )
+        else:
+            logger.info(
+                f"[ENTRY_CHECK] {code} "
+                f"trend={trend_ok}(slope={ma20_slope_pct:.2f}%) "
+                f"ma_gap={ma_gap_ok}({ma_gap_pct:.2f}%) "
+                f"price={price_ok}(5봉고점={prev_5_high}) "
+                f"vol={vol_ok}({vol_ratio:.1f}배) "
+                f"strength={strength_ok} "
+                f"c2_bull={c2_bull}"
+            )
 
     return is_valid
 
 
 def get_entry_signal_data(candles) -> dict | None:
     """
-    is_entry_candidate_VER2와 동일한 조건으로 전략 지표를 계산하여 반환.
-    디스코드 알림용. 진입 조건 불충분이면 None 반환.
+    is_entry_candidate_VER2(VER3)와 동일한 조건으로 전략 지표를 계산하여 반환.
+    디스코드 알림용.
     """
     if len(candles) < 25:
         return None
 
     c1 = candles[0]
     c2 = candles[1]
-    prev_5_candles = candles[1:6]
 
-    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_now  = sum(c['close'] for c in candles[0:20]) / 20
     ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
 
-    avg_vol = sum(c['volume'] for c in prev_5_candles) / len(prev_5_candles)
+    ma20_slope_pct = (ma20_now - ma20_prev) / ma20_prev * 100
+    ma_gap_pct = (c1['close'] - ma20_now) / ma20_now * 100
+
+    prev_5_candles = candles[1:6]
+    avg_vol = sum(c['volume'] for c in prev_5_candles) / 5
     vol_ratio = c1['volume'] / avg_vol if avg_vol > 0 else 0
 
+    prev_5_high = max(c['high'] for c in candles[1:6])
     candle_range = c1['high'] - c1['low']
     body_size = c1['close'] - c1['open']
     candle_strength = (body_size / candle_range * 100) if candle_range > 0 else 0
 
-    trend = "MA20 상승" if ma20_now > ma20_prev else "MA20 하락"
-    breakout = "직전 고점 돌파" if c1['close'] > c2['high'] else "돌파 미달"
-
     return {
         "vol_ratio": vol_ratio,
-        "trend": trend,
-        "breakout": breakout,
+        "trend": f"MA20 상승 (기울기+{ma20_slope_pct:.2f}%)",
+        "breakout": f"5봉고점({prev_5_high}) 돌파" if c1['close'] > prev_5_high else "5봉고점 돌파 미달",
         "candle_strength": candle_strength,
+        "ma_gap_pct": ma_gap_pct,
     }
 
 

@@ -170,28 +170,22 @@ def get_entry_signal_data(candles) -> dict | None:
 
 
 # ===========================
-# 전략: 눌림목 진입 (MA20 지지 반등) - 개선판
+# 전략: 눌림목 진입 (MA20 지지 반등)
 # ===========================
 def is_pullback_entry(candles, logger=None, code=None) -> bool:
     """
-    눌림목 진입 전략 (개선판):
+    눌림목 진입 전략:
+    상승 추세(MA20 우상향) 중 조정을 받다가 MA20 부근에서 반등하는 시점에 진입.
 
-    핵심 철학:
-    - 상승 추세 중 조정이 온 뒤, 지지 구간(MA20 or 직전 저점)에서 반등이 확인될 때 진입
-    - 진입 조건은 완화하되, 거짓 눌림(하락 추세 착각) 필터를 강화
-
-    조건 구성:
-    1. [추세] MA20 우상향 + 최근 고점이 MA20보다 충분히 위 (상승세 확인)
-    2. [조정] 고점 대비 -1% ~ -10% 눌림 (기존보다 완화)
-    3. [지지] MA20 or 최근 저점 근접 (±3.5% 이내, 기존보다 완화)
-    4. [반등] 직전 완성봉 기준 양봉 + 전봉 대비 종가 상승
-    5. [캔들] 몸통 비율 ≥ 40% (기존 50%에서 완화, 반등 초기 포착)
-    6. [거래량] 조정 구간 대비 반등봉 거래량 ≥ 1.0배 (회복 확인, 기존보다 완화)
-
-    거짓 눌림 필터 (신규 추가):
-    F1. 최근 5봉 중 음봉이 3개 이상이면서 종가가 점진 하락 → 하락 추세로 판정, 제외
-    F2. 반등봉 윗꼬리가 몸통의 2배 초과 → 매도 압력 강한 페이크 반등, 제외
-    F3. 조정 저점이 MA20보다 5% 이상 아래 → 지지선 이탈, 눌림목 아닌 하락 추세, 제외
+    TP2 도달 종목 분석 기반 최적화:
+    1. MA20 우상향 (추세 유지)
+    2. 최근 고점 대비 조정 (-1% ~ -10%)
+    3. MA20 근접 (±3.5% 이내) — 단, TP2 도달 종목은 모두 2% 이내였음
+       → near_ma 조건을 2단계로: STRONG(≤2%) / NORMAL(2~3.5%)
+    4. 반등 양봉 + 캔들강도 ≥ 60% (TP2 도달 평균 ~70%)
+    5. 반등봉 거래량 ≥ 조정 구간 평균 (거래량 회복)
+    6. 위짜 필터, 지지선 붕괴 필터 (F1~F3)
+    7. 최근 10봉 최고점이 MA20보다 2% 이상 위 (실제 상승세 확인)
     """
     if len(candles) < 25:
         if logger:
@@ -199,97 +193,82 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
         return False
 
     c1 = candles[0]   # 직전 완성봉 (반등 봉)
-    c2 = candles[1]   # 전전 봉
+    c2 = candles[1]   # 전전 봉 (조정 구간)
 
     # --- MA20 계산 ---
-    ma20_now  = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
     ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
 
-    # ──────────────────────────────────────────
-    # 1. 추세 조건
-    # ──────────────────────────────────────────
-    # MA20 우상향 (기울기 양수)
-    ma_rising = ma20_now > ma20_prev
+    # 1. MA20 우상향 + 가격 MA20 위
+    price_above_ma = c1['close'] > ma20_now
+    trend_rising = ma20_now > ma20_prev
+    trend_ok = trend_rising and price_above_ma
 
-    # 최근 10봉 고점이 MA20보다 최소 2% 위 → 실질적인 상승 추세 존재 확인
+    # 최근 10봉 내 고점이 MA20보다 2% 이상 위여야 실제 상승 모멘텀 확인
+    recent_10_high = max(c['high'] for c in candles[0:10])
+    high_above_ma = recent_10_high > ma20_now * 1.02
+
+    # --- 최근 10봉 내 고점 ---
     recent_high = max(c['high'] for c in candles[0:10])
-    high_above_ma = (recent_high - ma20_now) / ma20_now >= 0.02
 
-    trend_ok = ma_rising and high_above_ma
-
-    # ──────────────────────────────────────────
-    # 2. 조정 폭 조건 (-1% ~ -10%)
-    # ──────────────────────────────────────────
+    # 2. 고점 대비 조정폭 (-1% ~ -10%)
     pullback_pct = (c1['close'] - recent_high) / recent_high
     pullback_ok = -0.10 <= pullback_pct <= -0.01
 
-    # ──────────────────────────────────────────
-    # 3. 지지선 근접 조건 (MA20 ±3.5% 이내)
-    # ──────────────────────────────────────────
+    # 3. MA20 근접 (±3.5% 이내)
+    #    TP2 도달 종목 기준: 0.81%(241520), 2.05%(023760) → 강할수록 좋음
     ma_distance = abs(c1['close'] - ma20_now) / ma20_now
     near_ma_ok = ma_distance <= 0.035
+    near_ma_strong = ma_distance <= 0.020   # 2% 이내 = 강한 지지 신호
 
-    # ──────────────────────────────────────────
-    # 4. 반등 양봉
-    # ──────────────────────────────────────────
+    # 4-1. 반등 양봉
     bounce_ok = (
-        c1['close'] > c2['close'] and   # 전봉 대비 종가 상승
-        c1['close'] > c1['open']         # 양봉
+        c1['close'] > c2['close'] and
+        c1['close'] > c1['open']
     )
 
-    # ──────────────────────────────────────────
-    # 5. 캔들 강도 (몸통 ≥ 40%)
-    # ──────────────────────────────────────────
+    # 4-2. 캔들 강도 ≥ 60% (TP2 도달 종목 평균 ~70%)
     candle_range = c1['high'] - c1['low']
-    body_size    = c1['close'] - c1['open']
-    strength_ok  = (body_size / candle_range) >= 0.4 if candle_range > 0 else False
+    body_size = c1['close'] - c1['open']
+    strength_pct = (body_size / candle_range) if candle_range > 0 else 0
+    strength_ok = strength_pct >= 0.60
 
-    # ──────────────────────────────────────────
-    # 6. 거래량 조건 (조정 구간 대비 반등봉 회복)
-    # ──────────────────────────────────────────
+    # 5. 거래량 조건: 반등봉 ≥ 조정 구간 평균
     pullback_vols = [c['volume'] for c in candles[1:5]]
     avg_pullback_vol = sum(pullback_vols) / len(pullback_vols) if pullback_vols else 1
+    vol_recovery = c1['volume'] >= avg_pullback_vol * 1.0
+    vol_ok = vol_recovery and c1['volume'] >= 1000
 
-    # 반등봉 거래량이 조정 평균 이상 (기존보다 완화: 1.0배)
-    vol_recovery = c1['volume'] >= avg_pullback_vol * 1.0 and c1['volume'] >= 1000
+    # --- 가짜 신호 필터 (F1~F3) ---
+    # F1: 하락 추세 위장 필터 (최근 5봉 중 3봉 이상 음봉 + 단조 하락)
+    recent_5 = candles[0:5]
+    bear_count = sum(1 for c in recent_5 if c['close'] < c['open'])
+    closes_5 = [c['close'] for c in recent_5]
+    monotonic_down = all(closes_5[i] <= closes_5[i+1] for i in range(len(closes_5)-1))
+    f1_fake_trend = (bear_count >= 3 and monotonic_down)
 
-    # ──────────────────────────────────────────
-    # [거짓 눌림 필터 F1] 최근 5봉 연속 하락 추세
-    # ──────────────────────────────────────────
-    recent5 = candles[0:5]
-    bearish_count = sum(1 for c in recent5 if c['close'] < c['open'])  # 음봉 개수
-    closes5 = [c['close'] for c in recent5]
-    # 종가가 단조 감소(점진 하락)인지 확인
-    is_falling = all(closes5[i] <= closes5[i+1] for i in range(len(closes5)-1))  # 인덱스0이 최신
-    fake_downtrend = (bearish_count >= 3 and is_falling)
-
-    # ──────────────────────────────────────────
-    # [거짓 눌림 필터 F2] 반등봉 윗꼬리 과다
-    # 윗꼬리 = high - close, 몸통의 2배 초과면 매도세 강함
-    # ──────────────────────────────────────────
+    # F2: 위꼬리 과다 필터 (위꼬리 > 몸통 * 2 → 매도세 강함)
     upper_wick = c1['high'] - c1['close']
-    fake_wick = (upper_wick > body_size * 2.0) if body_size > 0 else False
+    f2_fake_wick = (candle_range > 0 and upper_wick > body_size * 2)
 
-    # ──────────────────────────────────────────
-    # [거짓 눌림 필터 F3] 조정 저점이 MA20보다 5% 이상 아래 → 지지 이탈
-    # ──────────────────────────────────────────
-    recent_low = min(c['low'] for c in candles[0:10])
-    support_broken = (ma20_now - recent_low) / ma20_now > 0.05
+    # F3: 지지선 붕괴 필터 (조정 저점이 MA20보다 5% 이상 아래)
+    pullback_low = min(c['low'] for c in candles[0:5])
+    f3_support_broken = (pullback_low < ma20_now * 0.95)
 
-    # ──────────────────────────────────────────
-    # 최종 판정
-    # ──────────────────────────────────────────
-    filter_ok = not fake_downtrend and not fake_wick and not support_broken
+    # --- 최종 판정 ---
+    # near_ma_strong이면 MA거리 필터 완화 혜택
+    # near_ma_strong 아닌 경우: 캔들강도, 거래량 조건 모두 충족해야 함
+    base_ok = trend_ok and high_above_ma and pullback_ok and near_ma_ok and bounce_ok and vol_ok
+    filters_ok = not f1_fake_trend and not f2_fake_wick and not f3_support_broken
 
-    is_valid = (
-        trend_ok and
-        pullback_ok and
-        near_ma_ok and
-        bounce_ok and
-        strength_ok and
-        vol_recovery and
-        filter_ok
-    )
+    if near_ma_strong:
+        # MA20 바로 근처 = 지지 신뢰도 높음 → 캔들강도 조건 약간 완화(0.50)
+        final_strength_ok = strength_pct >= 0.50
+    else:
+        # MA20에서 좀 떨어진 경우 → 캔들강도 엄격(0.60)
+        final_strength_ok = strength_ok
+
+    is_valid = base_ok and final_strength_ok and filters_ok
 
     if logger:
         if is_valid:
@@ -297,49 +276,54 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
                 f"[PULLBACK_CONFIRMED] {code} | "
                 f"종가:{c1['close']} MA20:{ma20_now:.0f} | "
                 f"눌림:{pullback_pct*100:.1f}% | "
-                f"MA거리:{ma_distance*100:.2f}% | "
+                f"MA거리:{ma_distance*100:.2f}% ({'STRONG' if near_ma_strong else 'NORMAL'}) | "
                 f"반등거래량:{c1['volume']} | "
-                f"캔들강도:{body_size/candle_range*100:.0f}%"
+                f"캔들강도:{strength_pct*100:.0f}%"
             )
         else:
             logger.info(
                 f"[PULLBACK_CHECK] {code} "
-                f"trend={trend_ok}(rising={ma_rising},high_above={high_above_ma}) "
+                f"trend={trend_ok}(rising={trend_rising},high_above={high_above_ma}) "
                 f"pullback={pullback_ok}({pullback_pct*100:.1f}%) "
                 f"near_ma={near_ma_ok}({ma_distance*100:.2f}%) "
-                f"bounce={bounce_ok} strength={strength_ok} vol={vol_recovery} "
-                f"f1_fake_trend={fake_downtrend} f2_fake_wick={fake_wick} f3_support_broken={support_broken}"
+                f"bounce={bounce_ok} strength={final_strength_ok}({strength_pct*100:.0f}%) "
+                f"vol={vol_ok} "
+                f"f1_fake_trend={f1_fake_trend} f2_fake_wick={f2_fake_wick} f3_support_broken={f3_support_broken}"
             )
 
     return is_valid
 
 
 def get_pullback_signal_data(candles) -> dict | None:
-    """눌림목 진입 시 디스코드 알림용 지표 (개선판)"""
+    """눌림목 진입 시 디스코드 알림용 지표"""
     if len(candles) < 25:
         return None
 
     c1 = candles[0]
+    c2 = candles[1]
 
-    ma20_now  = sum(c['close'] for c in candles[0:20]) / 20
+    ma20_now = sum(c['close'] for c in candles[0:20]) / 20
     ma20_prev = sum(c['close'] for c in candles[5:25]) / 20
 
     recent_high = max(c['high'] for c in candles[0:10])
     pullback_pct = (c1['close'] - recent_high) / recent_high
 
     ma_distance = abs(c1['close'] - ma20_now) / ma20_now
+    ma_strength = "STRONG" if ma_distance <= 0.020 else "NORMAL"
 
     pullback_vols = [c['volume'] for c in candles[1:5]]
     avg_pullback_vol = sum(pullback_vols) / len(pullback_vols) if pullback_vols else 1
     vol_ratio = c1['volume'] / avg_pullback_vol if avg_pullback_vol > 0 else 0
 
     candle_range = c1['high'] - c1['low']
-    body_size    = c1['close'] - c1['open']
+    body_size = c1['close'] - c1['open']
     candle_strength = (body_size / candle_range * 100) if candle_range > 0 else 0
 
     return {
         "vol_ratio": vol_ratio,
         "trend": "MA20 상승" if ma20_now > ma20_prev else "MA20 하락",
-        "breakout": f"눌림목 반등 ({pullback_pct*100:.1f}%) MA거리:{ma_distance*100:.1f}%",
-        "candle_strength": candle_strength,
+        "breakout": f"눌림목 반등 ({pullback_pct*100:.1f}%)",
+        "candle_strength": candle_strength,   # 실제 캔들강도 %
+        "ma_distance": ma_distance * 100,
+        "ma_strength": ma_strength,
     }

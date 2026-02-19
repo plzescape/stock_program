@@ -54,6 +54,7 @@ class PositionState:
     )
     peak_avg_vol: float = 0.0     # 진입~TP1 구간 최고 평균거래량
     tp1_done_ts: float = 0.0      # TP1 체결 시각 (보호시간용)
+    tp2_done_ts: float = 0.0      # TP2 체결 시각 (트레일링 구간 보호용)
 
 class KiwoomAPI(QAxWidget):
     def __init__(self):
@@ -638,6 +639,7 @@ class KiwoomAPI(QAxWidget):
 
                 elif "TP2" in reason and not pos.tp2_done:
                     pos.tp2_done = True
+                    pos.tp2_done_ts = pytime.time()
                     pos.trailing_active = True
                     self.log_trade.info(f"[TP2_FILLED] code={code} trailing_active=ON")
                     try:
@@ -830,41 +832,55 @@ class KiwoomAPI(QAxWidget):
 
         # =========================
         # ⚠️ 거래량 급감 TIME STOP (TP1 익절 후에만)
-        # 개선사항:
-        #  - TP2 진행 중(tp1_done=True, tp2_done=False, 가격이 TP2 미달)이면 비활성화
-        #    → TP1→TP2 구간 상승 중 거래량 일시 감소 오발동 방지
-        #  - TP2 완료 후(trailing 구간)에는 다시 활성화
-        #  - 보호 시간: 10초 → 30초 (TP1 직후 거래량 재집결 여유 확보)
-        #  - 급락 비율: 0.5 → 0.35 (기준 강화, 일시적 감소에 흔들리지 않도록)
+        # 구간별 보호:
+        #   TP1→TP2 구간: 30초 보호 + 임계값 35%
+        #   TP2→트레일링 구간: 30초 보호 + 임계값 25% (신규)
         # =========================
-        VOL_DROP_PROTECT_SEC = 30   # TP1 후 보호시간 (10→30초)
-        VOL_DROP_RATIO = 0.35       # 피크 대비 35% 이하일 때만 급락 판정 (0.5→0.35)
+        TP1_PROTECT_SEC = 30   # TP1 후 보호시간
+        TP2_PROTECT_SEC = 30   # TP2 후 보호시간 (신규)
 
-        tp2_target_for_vol = self.adjust_tick_size(int(pos.entry_price * (1 + TP2_RATE)))
-        in_tp1_to_tp2_run = pos.tp1_done and not pos.tp2_done and cur < tp2_target_for_vol
+        # TP1→TP2 구간 보호: TP1은 됐지만 TP2는 아직인 경우
+        in_tp1_to_tp2_run = (
+            pos.tp1_done
+            and not pos.tp2_done
+            and (now - pos.tp1_done_ts) < TP1_PROTECT_SEC
+        )
 
+        # TP2→트레일링 구간 보호: TP2 완료 후 초기 안정화 시간
+        in_tp2_trailing_protect = (
+            pos.tp2_done
+            and pos.tp2_done_ts > 0
+            and (now - pos.tp2_done_ts) < TP2_PROTECT_SEC
+        )
+
+        # 어느 보호 구간에도 속하지 않을 때만 거래량 급감 체크
         if (
             pos.tp1_done
             and not pos.time_stop_done
             and not pos.selling
-            and not in_tp1_to_tp2_run          # TP1→TP2 상승 구간 중에는 발동 안 함
+            and not in_tp1_to_tp2_run
+            and not in_tp2_trailing_protect
             and len(pos.recent_volumes) == VOL_CHECK_TICKS
             and pos.peak_avg_vol > 0
-            and (now - pos.tp1_done_ts) >= VOL_DROP_PROTECT_SEC
         ):
             avg_vol = sum(pos.recent_volumes) / VOL_CHECK_TICKS
             vol_ratio = avg_vol / pos.peak_avg_vol
             pnl_rate = (cur - pos.entry_price) / pos.entry_price
 
-            if vol_ratio <= VOL_DROP_RATIO and pnl_rate >= TIME_STOP_MAX_LOSS:
+            # TP2 완료 후 트레일링 구간은 더 엄격한 임계값 (25%)
+            # TP1만 된 구간은 기존 임계값 (35%)
+            vol_threshold = 0.25 if pos.tp2_done else 0.35
+
+            if vol_ratio <= vol_threshold and pnl_rate >= TIME_STOP_MAX_LOSS:
                 if not self.can_try_sell(pos):
                     return
 
+                phase = "TRAILING" if pos.tp2_done else "TP1_WAIT"
                 self.log_trade.info(
-                    f"[VOL_TIME_STOP] code={code} "
+                    f"[VOL_TIME_STOP] code={code} phase={phase} "
                     f"avg_vol={avg_vol:.2f} peak={pos.peak_avg_vol:.2f} "
-                    f"ratio={vol_ratio:.2f} pnl={pnl_rate:.4f} "
-                    f"tp2_done={pos.tp2_done}"
+                    f"ratio={vol_ratio:.2f} threshold={vol_threshold:.2f} "
+                    f"pnl={pnl_rate:.4f} tp2_done={pos.tp2_done}"
                 )
                 ok = self.send_market_order(
                     side="SELL",

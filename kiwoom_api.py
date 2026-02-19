@@ -836,7 +836,7 @@ class KiwoomAPI(QAxWidget):
         #   TP1→TP2 구간: 30초 보호 + 임계값 35%
         #   TP2→트레일링 구간: 30초 보호 + 임계값 25% (신규)
         # =========================
-        TP1_PROTECT_SEC = 30   # TP1 후 보호시간
+        TP1_PROTECT_SEC = 45   # TP1 후 보호시간 (30→45초: 229000 사례로 TP2 도달 기회 확보)
         TP2_PROTECT_SEC = 30   # TP2 후 보호시간 (신규)
 
         # TP1→TP2 구간 보호: TP1은 됐지만 TP2는 아직인 경우

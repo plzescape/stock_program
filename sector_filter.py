@@ -93,12 +93,44 @@ class SectorFilter:
         로그인 완료 후 1회 호출.
         GetThemeGroupList() + GetThemeGroupCode() 로 섹터 구성 종목 로드.
         (동기 함수 — 이벤트 대기 없음)
+
+        ※ GetThemeGroupList 는 OCX 완전 초기화 전에 호출하면 빈 값을 반환함.
+          섹터가 0개면 초기화 실패로 간주하고 _initialized = False 로 남겨둠.
+          ensure_initialized() 가 run_condition_cycle / classify_code 직전에
+          자동으로 재시도함.
         """
+        self._initialized = False
         self._load_sector_codes()
-        self.log.info(
-            f"[SECTOR] 초기화 완료 | 섹터={len(self.sectors)}개 "
-            f"종목={len(self.code_to_sector)}개"
-        )
+        if len(self.sectors) == 0:
+            self.log.warning(
+                "[SECTOR] 초기화 실패 — GetThemeGroupList 빈 응답 "
+                "(OCX 준비 전 호출 가능성). run_condition_cycle 시 자동 재시도."
+            )
+        else:
+            self._initialized = True
+            self.log.info(
+                f"[SECTOR] 초기화 완료 | 섹터={len(self.sectors)}개 "
+                f"종목={len(self.code_to_sector)}개"
+            )
+
+    def ensure_initialized(self):
+        """
+        섹터 데이터가 아직 비어 있으면 재시도.
+        classify_code / run_condition_cycle 직전에 호출.
+        """
+        if not getattr(self, "_initialized", False):
+            self.log.info("[SECTOR] 섹터 데이터 없음 → 재초기화 시도")
+            self.sectors.clear()
+            self.code_to_sector.clear()
+            self._load_sector_codes()
+            if len(self.sectors) > 0:
+                self._initialized = True
+                self.log.info(
+                    f"[SECTOR] 재초기화 성공 | 섹터={len(self.sectors)}개 "
+                    f"종목={len(self.code_to_sector)}개"
+                )
+            else:
+                self.log.warning("[SECTOR] 재초기화 실패 — 섹터 데이터 여전히 비어있음")
 
     def _load_sector_codes(self):
         """
@@ -274,6 +306,7 @@ class SectorFilter:
         SECTOR_ONLY : 섹터 포함 (강세 아님)
         NORMAL      : 섹터 미포함
         """
+        self.ensure_initialized()
         si = self.get_sector_of(code)
         if si is None:
             return "NORMAL"

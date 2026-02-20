@@ -32,6 +32,9 @@ def enable_auto_trade(api: KiwoomAPI):
     if ok:
         api.auto_trade_enabled = True
 
+        # ── 섹터 데이터 재초기화 (장전 로드 실패한 경우 대비) ──
+        api.sector_filter.ensure_initialized()
+
         # ── 디스코드 장 시작 알림 ──
         try:
             from discord_notify import notify_market_open

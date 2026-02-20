@@ -33,8 +33,8 @@ MAX_TRADES_PER_DAY = 1000
 CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
-# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "AUTO_CANDI_KOSDAQ_SCALP", "DANTA_1", "DANTA_2"
-CONDITION_NAME = "AUTO_CANDI_BREAKOUT"
+# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "AUTO_CANDI_KOSDAQ_SCALP", "DANTA_1", "DANTA_2, CHUSAE_INDICATE"
+CONDITION_NAME = "CHUSAE_INDICATE"
 # CONDITION_INDEX = 0
 
 # ===== 스캔 설정 =====
@@ -63,3 +63,11 @@ REENTRY_DELAY_SEC = 1     # 재매수 딜레이
 FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
 
 # (TP 지정가 제거됨 - 모두 시장가 매도)
+# ===== 섹터 필터 설정 =====
+# HTS 조건검색식에 등록된 이름과 정확히 일치해야 합니다.
+SECTOR_COND_NAME   = "INFOSTICK_SECTOR"   # 0629 인포스틱 섹터 종목
+MOMENTUM_COND_NAME = "UPPER_VOL_FILTER"   # 0162 상한가/거래량 50만↑ 1000원↑
+
+# 시장 분위기 판단 (거래량증가비율 평균 기준)
+MARKET_GOOD_THRESHOLD = 1.3   # 이상이면 GOOD (진입 적극)
+MARKET_BAD_THRESHOLD  = 0.7   # 이하면 BAD (SECTOR_HOT만 진입)

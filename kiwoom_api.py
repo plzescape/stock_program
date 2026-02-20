@@ -298,13 +298,19 @@ class KiwoomAPI(QAxWidget):
 
         code = self.scan_queue.pop(0)
         
-    # 🟢 추가된 쿨타임 체크 로직
+    # 🟢 쿨타임 체크 로직 (무한루프 방지 개선)
         last_time = self.last_scan_times.get(code, 0)
         if pytime.time() - last_time < SCAN_CODE_COOLDOWN_SEC:
             self.scan_queue.append(code)   # 다시 큐의 맨 뒤로 보냄
-            # 0.2초 정도 쉬었다가 다음 종목 확인 (CPU 과부하 방지)
-            QTimer.singleShot(1000, self._scan_next) 
-            return        
+            
+            # ⭐ 버그 수정: 큐에 쿨타임 아닌 종목이 있으면 바로 다음 처리
+            # 모두 쿨타임이면 무한루프 방지를 위해 1초 대기 후 재시도
+            has_ready = any(
+                pytime.time() - self.last_scan_times.get(c, 0) >= SCAN_CODE_COOLDOWN_SEC
+                for c in self.scan_queue
+            )
+            QTimer.singleShot(0 if has_ready else 1000, self._scan_next)
+            return
         
         if code in self.positions or code in self.pending_orders:
             QTimer.singleShot(0, self._scan_next)
@@ -1298,48 +1304,67 @@ class KiwoomAPI(QAxWidget):
             # ✔ 최소 30개 확보 (여유 두고 60까지 가져와도 OK)
             fetch_cnt = min(rows, 60)
 
+            # ── 파싱 헬퍼: 루프 밖에 정의 (루프마다 재정의 비효율 제거) ──
+            def _safe_int(val):
+                """거래량 등 항상 양수인 값용"""
+                try:
+                    return abs(int(val.strip()))
+                except:
+                    return 0
+
+            def _safe_int_signed(val):
+                """시가/고가/저가/현재가용 - 부호 보존 후 호출측에서 abs() 처리"""
+                try:
+                    return int(val.strip())
+                except:
+                    return 0
+
             for i in range(fetch_cnt):
 
-                def _safe_int(val):
-                    try:
-                        return abs(int(val.strip()))
-                    except:
-                        return 0
-
-                open_ = _safe_int(
+                # ⚠️ 버그 수정: open/high/low/close 모두 abs() 처리하되,
+                # 키움 API 특성상 현재가(close)는 음수로 내려오는 하락봉도
+                # open과의 비교(close < open → 음봉)로 판별 가능.
+                # 시가/고가/저가/현재가는 abs()로 절댓값을 취해 가격으로 사용.
+                open_ = abs(_safe_int_signed(
                     self.dynamicCall(
                         "GetCommData(QString, QString, int, QString)",
                         trcode, rqname, i, "시가"
                     )
-                )
+                ))
 
-                high = _safe_int(
+                high = abs(_safe_int_signed(
                     self.dynamicCall(
                         "GetCommData(QString, QString, int, QString)",
                         trcode, rqname, i, "고가"
                     )
-                )
+                ))
 
-                low = _safe_int(
+                low = abs(_safe_int_signed(
                     self.dynamicCall(
                         "GetCommData(QString, QString, int, QString)",
                         trcode, rqname, i, "저가"
                     )
-                )
+                ))
 
-                close = _safe_int(
+                close_raw = _safe_int_signed(
                     self.dynamicCall(
                         "GetCommData(QString, QString, int, QString)",
                         trcode, rqname, i, "현재가"
                     )
                 )
+                close = abs(close_raw)
 
+                # 거래량은 항상 양수
                 volume = _safe_int(
                     self.dynamicCall(
                         "GetCommData(QString, QString, int, QString)",
                         trcode, rqname, i, "거래량"
                     )
                 )
+
+                # 시가 또는 종가가 0이면 데이터 오류 → 스킵
+                if open_ == 0 or close == 0:
+                    continue
 
                 candles.append({
                     "open": open_,
@@ -1509,7 +1534,9 @@ class KiwoomAPI(QAxWidget):
                 "added_at": datetime.now(),
             }
 
-            self.scan_queue.append(code)
+            # ⭐ 버그 수정: 중복 추가 방지
+            if code not in self.scan_queue:
+                self.scan_queue.append(code)
             self.log_signal.info(f"[COND_IN] {code}")
 
         # 🔥 스캔 트리거 조건
@@ -1556,7 +1583,7 @@ class KiwoomAPI(QAxWidget):
                 info["last_try"] = None
                 info.pop("cond_out_ts", None)
 
-                # scan_queue 없으면 다시 등록
+                # scan_queue 없으면 다시 등록 (중복 추가 방지)
                 if code not in self.scan_queue:
                     self.scan_queue.append(code)
 

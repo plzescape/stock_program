@@ -105,12 +105,13 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     ma20_now  = sum(c['close'] for c in candles[0:20]) / 20
     ma20_prev = sum(c['close'] for c in candles[5:25]) / 20   # 5봉 전 시점 MA20
 
-    # ── A. MA20 기울기 ≥ 0.5% ────────────────────────────────────────
-    # 0.3%는 사실상 횡보 → TIME_STOP 종목들이 모두 0.3%대였음
+    # ── A. MA20 기울기 ≥ 0.3% ────────────────────────────────────────
+    # 0.5%는 실전에서 통과율 6.7%로 너무 낮음 → 0.3%로 완화
+    # 0.3% 미만은 진짜 횡보로 판단
     ma20_slope_pct = (ma20_now - ma20_prev) / ma20_prev * 100
     trend_ok = (
         c1['close'] > ma20_now and      # 정배열 (종가 > MA20)
-        ma20_slope_pct >= 0.5           # 실질적 우상향
+        ma20_slope_pct >= 0.3           # 0.5% → 0.3%로 완화
     )
 
     # ── B. MA갭 0.5% ~ 1.5% ───────────────────────────────────────────
@@ -127,14 +128,14 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
         c1['close'] > c1['open']        # 양봉
     )
 
-    # ── D. 거래량 4 ~ 15배 ────────────────────────────────────────────
-    # 3배: 너무 낮아 약한 신호도 통과 → 4배로 상향
-    # 15배 초과: 천장봉(세력 털기) 의심 → 차단
+    # ── D. 거래량 3 ~ 15배 ────────────────────────────────────────────
+    # 4배: 실전 통과율 2.5%로 너무 낮음 → 3배로 완화
+    # 15배 초과: 천장봉(세력 털기) 의심 → 유지
     prev_5_candles = candles[1:6]
     avg_vol = sum(c['volume'] for c in prev_5_candles) / 5
     vol_ratio = c1['volume'] / avg_vol if avg_vol > 0 else 0
     vol_ok = (
-        4.0 <= vol_ratio <= 15.0 and
+        3.0 <= vol_ratio <= 15.0 and    # 4배 → 3배로 완화
         c1['volume'] >= 5000
     )
 
@@ -165,8 +166,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
                 f"trend={trend_ok}(slope={ma20_slope_pct:.2f}%) "
                 f"ma_gap={ma_gap_ok}({ma_gap_pct:.2f}%) "
                 f"price={price_ok}(5봉고점={prev_5_high}) "
-                f"vol={vol_ok}({vol_ratio:.1f}배) "
-                f"strength={strength_ok} "
+                f"vol={vol_ok}({vol_ratio:.1f}배) "  # 4배→3배 완화                f"strength={strength_ok} "
                 f"c2_bull={c2_bull}"
             )
 
@@ -273,11 +273,13 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     body_size    = c1['close'] - c1['open']
     strength_pct = (body_size / candle_range) if candle_range > 0 else 0
 
-    # STRONG 구간(≤2%): 55% 이상 / NORMAL 구간(2~3.5%): 65% 이상
+    # STRONG 구간(≤2%): 40% 이상 / NORMAL 구간(2~3.5%): 50% 이상
+    # ⬇️ 추가 완화: 실전 로그에서 최고 통과 케이스가 52%인 NORMAL, 42%인 STRONG
+    # STRONG 50%→40%, NORMAL 55%→50%
     if near_ma_strong:
-        final_strength_ok = strength_pct >= 0.55
+        final_strength_ok = strength_pct >= 0.40   # 55%→50%→40%
     else:
-        final_strength_ok = strength_pct >= 0.65
+        final_strength_ok = strength_pct >= 0.50   # 65%→55%→50%
 
     # 5. 반등 거래량
     # 최솟값 1000 → 3000 (016590: 1002주로 TIME_STOP, 거래량 너무 적었음)

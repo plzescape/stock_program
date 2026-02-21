@@ -56,18 +56,21 @@ def enable_auto_trade(api: KiwoomAPI):
 
 #===== 강제 청산 예약 =====        
 def schedule_force_liquidation(api):
+    from config import FORCE_LIQUIDATION_HOUR, FORCE_LIQUIDATION_MIN
 
     now = datetime.now()
-
     liquidation_time = datetime.combine(
         now.date(),
-        time(14, 50)
+        time(FORCE_LIQUIDATION_HOUR, FORCE_LIQUIDATION_MIN)
     )
 
     delay_ms = max(
         0,
         int((liquidation_time - now).total_seconds() * 1000)
     )
+
+    print(f"⏰ 강제청산 예약: {FORCE_LIQUIDATION_HOUR:02d}:{FORCE_LIQUIDATION_MIN:02d} "
+          f"(약 {delay_ms//60000}분 후)")
 
     QTimer.singleShot(
         delay_ms,

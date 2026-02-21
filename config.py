@@ -17,16 +17,16 @@ MAX_BUY_AMOUNT = 500000    # 종목당 최대 매수금액 (원)
 TOTAL_BUDGET = 5000000     # 총 투자 한도 (원)
 
 # ===== 손절 / 익절 / 트레일링 =====
-STOP_LOSS_RATE = 0.015   # -1.5%
+STOP_LOSS_RATE = 0.010   # -1.0% (기존 -1.5% → 보고서 손익비 1:2 달성)   # -1.5%
 
 TP1_RATE = 0.02         # +2%
 TP1_RATIO = 0.5         # 50% 매도
 
-TP2_RATE = 0.04         # +4%
+TP2_RATE = 0.03         # +3% (기존 +4% → 보수적 확정)         # +4%
 TP2_RATIO = 0.3         # 30% 매도
 
 TRAIL_START_RATE = 0.02 # +2%부터 트레일링 활성화
-TRAIL_GAP = 0.015        # 고점 대비 1.5% 하락 시 청산
+TRAIL_GAP = 0.010        # 1.0% (SL 축소에 맞춰 조정)        # 고점 대비 1.5% 하락 시 청산
 
 # ===== 제한 =====
 MAX_TRADES_PER_DAY = 1000
@@ -63,3 +63,6 @@ REENTRY_DELAY_SEC = 1     # 재매수 딜레이
 FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
 
 # (TP 지정가 제거됨 - 모두 시장가 매도)
+# ===== 강제청산 시각 =====
+FORCE_LIQUIDATION_HOUR = 15
+FORCE_LIQUIDATION_MIN  = 20

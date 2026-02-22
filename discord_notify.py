@@ -5,12 +5,29 @@ import requests
 from datetime import datetime
 import os
 
-# 보안을 위해 환경변수 또는 config 파일에서 관리 권장
-# 예: DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-DISCORD_WEBHOOK_URL = os.environ.get(
-    "DISCORD_WEBHOOK_URL",
-    "https://discord.com/api/webhooks/1465022221994037339/mOln_VqVzMAQRInrUic86Ysr482ZDIjMFB6EoUR9U3dUpMkqTw-Keyf0InVpUwE2IkTu"
-)
+# ──────────────────────────────────────────────────
+# 웹훅 URL 설정
+#
+# [운영]  환경변수 DISCORD_WEBHOOK_URL 설정
+#         예) set DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+#
+# [테스트] 아래 DISCORD_WEBHOOK_URL_TEST 에 하드코딩
+#          → 환경변수가 없을 때 자동으로 테스트 URL 사용
+#          → 운영 배포 전 반드시 빈 문자열("")로 되돌릴 것
+# ──────────────────────────────────────────────────
+_URL_TEST = "https://discord.com/api/webhooks/1465022221994037339/mOln_VqVzMAQRInrUic86Ysr482ZDIjMFB6EoUR9U3dUpMkqTw-Keyf0InVpUwE2IkTu"
+# 운영 배포 시 위 줄을 아래로 교체:
+# _URL_TEST = ""
+
+DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", _URL_TEST)
+
+# 시작 시 어느 URL을 사용하는지 출력 (실수 방지)
+if os.environ.get("DISCORD_WEBHOOK_URL"):
+    print("🔔 Discord: 환경변수 DISCORD_WEBHOOK_URL 사용")
+elif _URL_TEST:
+    print("⚠️  Discord: 테스트 하드코딩 URL 사용 (_URL_TEST) — 운영 전 제거 필요")
+else:
+    print("❌  Discord: 웹훅 URL 미설정 — 알림 비활성화")
 
 # ===== 색상 =====
 COLOR_GREEN  = 0x2ECC71   # 매수, 익절
@@ -23,6 +40,9 @@ COLOR_ORANGE = 0xE67E22   # 강제청산
 
 def _send(embed: dict):
     """디스코드 웹훅 전송 (실패해도 매매에 영향 없도록 예외 처리)"""
+    if not DISCORD_WEBHOOK_URL:
+        print("⚠️ Discord 알림 생략: 웹훅 URL 미설정")
+        return
     try:
         requests.post(
             DISCORD_WEBHOOK_URL,
@@ -95,9 +115,18 @@ def notify_buy_fill(
             indicator_lines.append(f"돌파: {signal_data['breakout']}")
         if "candle_strength" in signal_data:
             indicator_lines.append(f"캔들강도: **{signal_data['candle_strength']:.0f}%**")
+        if "rsi" in signal_data:
+            indicator_lines.append(f"RSI: **{signal_data['rsi']:.1f}**")
+        if "macd" in signal_data:
+            indicator_lines.append(f"MACD: {signal_data['macd']}")
+        # FLAG 전용 필드
+        if "flag_len" in signal_data:
+            indicator_lines.append(f"횡보: {signal_data['flag_len']}봉")
+        if "base_stop" in signal_data:
+            indicator_lines.append(f"손절기준(기준봉시가): **{signal_data['base_stop']:,}원**")
         if indicator_lines:
             fields.append({
-                "name": "📈 강세 지표",
+                "name": "📈 진입 지표",
                 "value": "\n".join(indicator_lines),
                 "inline": False
             })
@@ -298,7 +327,7 @@ def notify_time_stop(
 
 
 # ==================================================
-# 9) 강제 청산 알림
+# 9) 강제 청산 알림  (BUG3 수정: config에서 시각 동적 반영)
 # ==================================================
 def notify_force_liquidation(
     code: str,
@@ -306,8 +335,14 @@ def notify_force_liquidation(
     qty: int,
     entry_price: int
 ):
+    try:
+        from config import FORCE_LIQUIDATION_HOUR, FORCE_LIQUIDATION_MIN
+        time_str = f"{FORCE_LIQUIDATION_HOUR:02d}:{FORCE_LIQUIDATION_MIN:02d}"
+    except Exception:
+        time_str = "강제"
+
     embed = {
-        "title": "🚨 14:50 강제 청산",
+        "title": f"🚨 {time_str} 강제 청산",
         "color": COLOR_ORANGE,
         "fields": [
             {"name": "종목", "value": f"{name} ({code})", "inline": False},

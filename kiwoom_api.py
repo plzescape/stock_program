@@ -55,6 +55,8 @@ class PositionState:
     peak_avg_vol: float = 0.0     # 진입~TP1 구간 최고 평균거래량
     tp1_done_ts: float = 0.0      # TP1 체결 시각 (보호시간용)
     tp2_done_ts: float = 0.0      # TP2 체결 시각 (트레일링 구간 보호용)
+    entry_type: str = ""          # 진입 전략 타입 (BREAKOUT/PULLBACK/FLAG)
+    flag_stop_price: int = 0      # FLAG 전용 손절가 (기준봉 시가, 0이면 미사용)
 
 class KiwoomAPI(QAxWidget):
     def __init__(self):
@@ -448,6 +450,11 @@ class KiwoomAPI(QAxWidget):
                 # 예산 추적용
                 if code in self.pending_orders:
                     self.pending_orders[code]["est_amount"] = est_amount
+                    self.pending_orders[code]["entry_type"] = entry_type
+                    # FLAG 전용 손절가: signal_data의 base_stop 값
+                    if entry_type == "FLAG" and code in self._entry_signals:
+                        self.pending_orders[code]["flag_stop_price"] = \
+                            int(self._entry_signals[code].get("base_stop", 0))
 
                 info["state"] = "DONE"
                 self._finish_tr(delay=True)
@@ -550,6 +557,9 @@ class KiwoomAPI(QAxWidget):
                 self.positions[code] = pos
                 self.register_real(code)
                 self.log_trade.info(f"[BUY_FILL_NEW] code={code} entry={price} total_qty={total_qty}")
+                # 진입 전략 타입 기록 (pending_orders에 저장된 값 활용)
+                pos.entry_type = pend.get("entry_type", "")
+                pos.flag_stop_price = pend.get("flag_stop_price", 0)
 
             # --------------------------------------------------
             # ✅ 체결수량 처리(중요):
@@ -751,7 +761,13 @@ class KiwoomAPI(QAxWidget):
             pos.last_pnl_log_ts = now
 
         # STOP LOSS
-        if pnl_rate <= -STOP_LOSS_RATE:
+        # FLAG 전략: 기준봉 시가를 손절가로 사용 (보고서 원칙)
+        # 일반 전략: config STOP_LOSS_RATE(-1.0%) 적용
+        is_stop_loss = (
+            (pos.flag_stop_price > 0 and cur <= pos.flag_stop_price) or
+            (pos.flag_stop_price == 0 and pnl_rate <= -STOP_LOSS_RATE)
+        )
+        if is_stop_loss:
             if not self.can_try_sell(pos):
                 return
             self.log_trade.info(f"[STOP_LOSS] {code} 손절 매도 트리거 (현재가:{cur} pnl={pnl_rate:.4f})")

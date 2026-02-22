@@ -24,7 +24,7 @@ from config import (
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
 )
 from logger_util import setup_logger
-from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data
+from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data
 
 
 @dataclass
@@ -375,13 +375,15 @@ class KiwoomAPI(QAxWidget):
         # 최신봉 제외한 완성봉들
         completed_candles = candles[1:] if len(candles) > 1 else []
 
-        # === ENTRY 판정: 돌파 전략 OR 눌림목 전략 ===
+        # === ENTRY 판정: 돌파 / 눌림목 / 깃발 패턴 ===
         entry_type = None
-        if len(completed_candles) >= 25:
+        if len(completed_candles) >= 35:
             if is_entry_candidate_VER2(completed_candles, self.log_signal, code):
                 entry_type = "BREAKOUT"
             elif is_pullback_entry(completed_candles, self.log_signal, code):
                 entry_type = "PULLBACK"
+            elif is_flag_entry(completed_candles, self.log_signal, code):
+                entry_type = "FLAG"
 
         if entry_type and len(self.positions) < MAX_POSITIONS:
                 # ── 매수수량 계산: BUY_MODE에 따라 분기 ──
@@ -436,6 +438,8 @@ class KiwoomAPI(QAxWidget):
                 # 전략 지표 저장 (디스코드 알림용)
                 if entry_type == "PULLBACK":
                     sig = get_pullback_signal_data(completed_candles)
+                elif entry_type == "FLAG":
+                    sig = get_flag_signal_data(completed_candles)
                 else:
                     sig = get_entry_signal_data(completed_candles)
                 if sig:

@@ -1,21 +1,28 @@
 """
-strategy.py — 보고서 기반 전면 재구성 (2026-02-20)
+strategy.py — 보고서 기반 전면 재구성 + 패턴 확장 (2026-02-22)
 
 [보고서 적용 항목]
 1. EMA 2단계 정배열 필터 (EMA20 > EMA60)
    - "20, 50, 100 EMA 정배열 상태에서만 매수"
    - "100 EMA 이탈 시 매수 절대 금지"
 2. RSI(14) 모멘텀 확인
-   - BREAKOUT: RSI ≥ 55 (상승 모멘텀 진입)
-   - PULLBACK: RSI 45~70 (눌림목 반등 구간)
+   - BREAKOUT: RSI ≥ 55 / PULLBACK: RSI 45~70
 3. MACD 방향 확인
-   - BREAKOUT: MACD > 시그널 (골든크로스 상태)
-   - PULLBACK: MACD ≥ 0 (전반적 상향 방향)
+   - BREAKOUT: MACD > 시그널 / PULLBACK: MACD ≥ 0
 4. 돌파 후 리테스트 전략 (토니 몬타나)
    - 저항선 돌파 후 지지 확인 구간에서 PULLBACK 진입
-5. 손익비 config 권고
-   - SL -1.0%, TP1 +2% → 손익비 1:2 (보고서 핵심 원칙)
-   - (실제 config.py 값 변경 필요)
+
+[2차 추가 항목 - GPT/보고서 권고]
+5. 지지/저항 박스 구간 자동 탐지 (_find_sr_boxes)
+   - "구간을 박스 형태로 표시, 두 가지가 겹치는 자리를 노림"
+   - 피벗 고/저점 클러스터링으로 수평 구간 자동 생성
+   - PULLBACK: EMA 근접 + SR 박스 근접 시 확신도 상승 (추가 확인 근거)
+   - BREAKOUT: SR 저항 박스 돌파 확인으로 신호 품질 강화
+6. 깃발 패턴 (FLAG) 진입 전략 — 신규 entry_type
+   - "기준봉 세우고 짧게 횡보, 재돌파 시 다음 파동 기대"
+   - 기준봉(강한 양봉+거래량) + 횡보 5~15봉(범위 축소+거래량 감소)
+     + 박스 상단 재돌파 + 거래량 재증가 시 진입
+   - BREAKOUT/PULLBACK과 병렬로 동작 (entry_type = "FLAG")
 """
 
 from datetime import datetime, time
@@ -149,6 +156,75 @@ def _calc_indicators(candles: list):
 
 
 # ==================================================
+# ── 지지/저항 박스 구간 유틸 (보고서 2차 추가) ──
+# ==================================================
+
+def _find_sr_boxes(candles: list,
+                   window: int = 2,
+                   tolerance: float = 0.020,
+                   min_touches: int = 2) -> dict:
+    """
+    최근 N봉에서 피벗 고/저점 클러스터링으로 지지/저항 박스 자동 탐지.
+    보고서: "수평 구간을 박스 형태로 표시, 두 가지 근거가 겹치는 자리 노림"
+
+    candles: [최신→과거]
+    window: 피벗 판정을 위한 좌우 봉 수 (2 = 좌2봉·우2봉보다 극단적)
+    tolerance: 같은 구간으로 묶는 가격 폭 (기본 ±2%)
+    min_touches: 구간으로 인정할 최소 피벗 수 (기본 2회 터치)
+    반환: {'resistance': [(lo,hi),...], 'support': [(lo,hi),...]}
+    """
+    highs, lows = [], []
+    n = len(candles)
+    for i in range(window, n - window):
+        h = candles[i]['high']
+        l = candles[i]['low']
+        # 피벗 고점
+        if (all(h >= candles[i - j]['high'] for j in range(1, window + 1)) and
+                all(h >= candles[i + j]['high'] for j in range(1, window + 1))):
+            highs.append(h)
+        # 피벗 저점
+        if (all(l <= candles[i - j]['low'] for j in range(1, window + 1)) and
+                all(l <= candles[i + j]['low'] for j in range(1, window + 1))):
+            lows.append(l)
+
+    def _cluster(levels: list) -> list:
+        if not levels:
+            return []
+        levels = sorted(levels)
+        boxes, group = [], [levels[0]]
+        for lv in levels[1:]:
+            if (lv - group[0]) / group[0] <= tolerance:
+                group.append(lv)
+            else:
+                if len(group) >= min_touches:
+                    boxes.append((min(group), max(group)))
+                group = [lv]
+        if len(group) >= min_touches:
+            boxes.append((min(group), max(group)))
+        return boxes
+
+    return {
+        'resistance': _cluster(highs),
+        'support':    _cluster(lows),
+    }
+
+
+def _near_sr_box(cur_price: float, boxes: dict,
+                 side: str = 'support',
+                 proximity: float = 0.015) -> tuple:
+    """
+    현재가가 지지/저항 박스 근처인지 확인.
+    proximity: 박스 중심 대비 ±N% 이내면 근접으로 판정 (기본 ±1.5%)
+    반환: (근접여부, 박스하단, 박스상단)
+    """
+    for lo, hi in boxes.get(side, []):
+        mid = (lo + hi) / 2.0
+        if abs(cur_price - mid) / mid <= proximity:
+            return True, lo, hi
+    return False, 0, 0
+
+
+# ==================================================
 # 전략 1: BREAKOUT (돌파 진입)
 # ==================================================
 def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
@@ -214,8 +290,16 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     body      = c1['close'] - c1['open']
     str_ok    = (body / rng) >= 0.60 if rng > 0 else False
 
+    # H. SR 박스: 저항 구간 돌파 확인 (보조 근거, 없으면 패스)
+    #    보고서: "저항이 지지로 바뀌는 구간을 돌파한 자리"
+    sr_boxes = _find_sr_boxes(candles)
+    near_resist, r_lo, r_hi = _near_sr_box(c1['close'], sr_boxes, 'resistance', proximity=0.025)
+    sr_breakout_ok = (not near_resist) or (c1['close'] > r_hi)
+    # → 저항박스가 없거나, 있어도 상단을 돌파한 경우만 통과
+    #   저항박스 한복판에 걸려있으면 차단 (아직 안 뚫린 저항)
+
     is_valid = (ema_aligned and rsi_ok and macd_ok and
-                trend_ok and price_ok and vol_ok and str_ok)
+                trend_ok and price_ok and vol_ok and str_ok and sr_breakout_ok)
 
     if logger:
         if is_valid:
@@ -225,7 +309,8 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
                 f"RSI:{rsi14:.1f} MACD:{macd_l:.2f}>{macd_s:.2f} | "
                 f"기울기:{slope:.2f}% | "
                 f"5봉고점돌파:{prev_5_high} | "
-                f"거래량:{c1['volume']}(평균의 {vol_ratio:.1f}배)"
+                f"거래량:{c1['volume']}(평균의 {vol_ratio:.1f}배) | "
+                f"SR저항돌파:{sr_breakout_ok}(저항박스:{r_lo}~{r_hi})"
             )
         else:
             logger.info(
@@ -236,7 +321,8 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
                 f"trend={trend_ok}(slope={slope:.2f}%) "
                 f"price={price_ok}(5봉고점={prev_5_high}) "
                 f"vol={vol_ok}({vol_ratio:.1f}배) "
-                f"strength={str_ok}"
+                f"strength={str_ok} "
+                f"sr_break={sr_breakout_ok}"
             )
 
     return is_valid
@@ -357,13 +443,23 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     f3 = (min(c['low'] for c in candles[0:5]) < ema20 * 0.95)
     filters_ok = not f1 and not f2 and not f3
 
+    # K. SR 박스 지지 근접 확인 (보조 근거 — 보고서 "구간 겹침" 전략)
+    #    EMA 근접에 더해 수평 지지박스도 근처면 확신도 상승
+    #    없으면 페널티 없음 (박스가 없을 수도 있으므로)
+    sr_boxes  = _find_sr_boxes(candles)
+    near_supp, s_lo, s_hi = _near_sr_box(c1['close'], sr_boxes, 'support', proximity=0.020)
+    near_resist_block, _, _ = _near_sr_box(c1['close'], sr_boxes, 'resistance', proximity=0.010)
+    # 저항박스 한복판이면 리테스트가 아니라 저항에 부딪힌 것 → 차단
+    sr_ok = not near_resist_block
+
     # 최종
     base_ok  = (ema_aligned and rsi_ok and macd_ok and
                 high_above_ma and pullback_ok and near_ma_ok and
                 bounce_ok and vol_ok)
-    is_valid = base_ok and final_str_ok and filters_ok
+    is_valid = base_ok and final_str_ok and filters_ok and sr_ok
 
     if logger:
+        sr_note = f"SR지지근접:{near_supp}({s_lo}~{s_hi})" if near_supp else "SR지지:없음"
         if is_valid:
             logger.info(
                 f"[PULLBACK_CONFIRMED] {code} | "
@@ -372,7 +468,8 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
                 f"눌림:{pullback_pct*100:.1f}% | "
                 f"MA거리:{ma_distance*100:.2f}%({'STRONG' if near_ma_strong else 'NORMAL'}) | "
                 f"반등거래량:{c1['volume']} | "
-                f"캔들강도:{str_pct*100:.0f}%"
+                f"캔들강도:{str_pct*100:.0f}% | "
+                f"{sr_note}"
             )
         else:
             logger.info(
@@ -386,7 +483,8 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
                 f"bounce={bounce_ok} "
                 f"strength={final_str_ok}({str_pct*100:.0f}%) "
                 f"vol={vol_ok}({c1['volume']}주) "
-                f"f1_fake_trend={f1} f2_fake_wick={f2} f3_support_broken={f3}"
+                f"f1_fake_trend={f1} f2_fake_wick={f2} f3_support_broken={f3} "
+                f"sr_ok={sr_ok}"
             )
 
     return is_valid
@@ -423,6 +521,189 @@ def get_pullback_signal_data(candles) -> dict | None:
         "macd":            f"{ind['macd_line']:.2f}",
         "ma_strength":     ma_strength,
     }
+
+
+# ==================================================
+# 전략 3: FLAG (깃발 패턴) — 신규 entry_type
+# ==================================================
+def is_flag_entry(candles, logger=None, code=None) -> bool:
+    """
+    깃발 패턴 진입 전략 (보고서 2차 추가)
+
+    보고서: "세력들이 기준봉을 세우고 기간 조정을 거쳐 짧게 횡보,
+            박스 상단 재돌파 시 다음 파동 기대"
+
+    [조건 요약]
+    1. 기준봉 (candles[1+flag_len]):
+       - 양봉 + 상승폭 ≥ 1.0%
+       - 캔들강도 ≥ 60%
+       - 거래량 직전5봉 평균 대비 ≥ 3배
+    2. 횡보 구간 (candles[1 : 1+flag_len], flag_len=3~15봉):
+       - 고저 범위 ≤ 기준봉 몸통의 60% (좁은 박스)
+       - 평균 거래량 ≤ 기준봉의 60% (거래량 수렴)
+    3. 재돌파봉 (candles[0], 최신 완성봉):
+       - 횡보 박스 상단 돌파 + 양봉
+       - 거래량 ≥ 횡보 평균의 2배 (재폭발)
+    4. EMA 정배열: EMA20 > EMA60 (전체 추세 확인)
+
+    손절: 기준봉 시가 (보고서: "세력이 기준봉 시가 아래를 절대 허용 안 함")
+    """
+    MIN_FLAG = 3
+    MAX_FLAG = 15
+    need = MAX_FLAG + 25   # 기준봉 + 배경봉 충분히 확보
+
+    if len(candles) < need:
+        if logger:
+            logger.info(f"[FLAG_SKIP] {code} 데이터 부족(필요:{need} 현재:{len(candles)})")
+        return False
+
+    # EMA 정배열 사전 체크
+    closes = [c['close'] for c in candles]
+    ema20  = _calc_ema(closes, 20)
+    ema60  = _calc_ema(closes, min(60, len(closes)))
+    if ema20 is None or ema60 is None or ema20 <= ema60:
+        if logger:
+            logger.info(
+                f"[FLAG_CHECK] {code} "
+                f"ema_align=False(ema20={ema20 or 0:.0f},ema60={ema60 or 0:.0f})"
+            )
+        return False
+
+    c0 = candles[0]  # 재돌파봉 (최신 완성봉)
+
+    for flag_len in range(MIN_FLAG, MAX_FLAG + 1):
+        if 1 + flag_len + 5 >= len(candles):
+            break
+
+        flag_candles = candles[1 : 1 + flag_len]      # 횡보 구간
+        base         = candles[1 + flag_len]           # 기준봉 후보
+        prev_base    = candles[1 + flag_len + 1 : 1 + flag_len + 6]  # 기준봉 이전 5봉
+
+        # ── 기준봉 조건 ─────────────────────────────────────
+        base_body  = base['close'] - base['open']
+        base_range = base['high'] - base['low']
+        base_rise  = base_body / base['open'] if base['open'] > 0 else 0
+        base_str   = base_body / base_range if base_range > 0 else 0
+
+        avg_vol_before  = (sum(c['volume'] for c in prev_base) / len(prev_base)
+                           if prev_base else 1)
+        base_vol_ratio  = base['volume'] / avg_vol_before if avg_vol_before > 0 else 0
+
+        is_base = (
+            base_body   > 0     and   # 양봉
+            base_rise   >= 0.010 and  # 1% 이상 상승
+            base_str    >= 0.60  and  # 캔들강도 60%
+            base_vol_ratio >= 3.0     # 거래량 3배 이상
+        )
+        if not is_base:
+            continue
+
+        # ── 횡보 구간 조건 ───────────────────────────────────
+        flag_highs = [c['high']   for c in flag_candles]
+        flag_lows  = [c['low']    for c in flag_candles]
+        flag_vols  = [c['volume'] for c in flag_candles]
+
+        box_range        = max(flag_highs) - min(flag_lows)
+        flag_range_ratio = box_range / base_body if base_body > 0 else 999
+        avg_flag_vol     = sum(flag_vols) / len(flag_vols) if flag_vols else 1
+        vol_shrink       = avg_flag_vol / base['volume']
+
+        is_flag = (
+            flag_range_ratio <= 0.60 and   # 횡보폭 ≤ 기준봉 몸통의 60%
+            vol_shrink       <= 0.60        # 거래량 수렴 (60% 이하)
+        )
+        if not is_flag:
+            continue
+
+        # ── 재돌파 조건 ─────────────────────────────────────
+        box_top     = max(flag_highs)
+        rebreak_ok  = (
+            c0['close'] > box_top and          # 박스 상단 돌파
+            c0['close'] > c0['open'] and       # 양봉
+            c0['volume'] >= avg_flag_vol * 2.0  # 거래량 2배 이상 재폭발
+        )
+        if not rebreak_ok:
+            continue
+
+        # ── SR 박스: 재돌파가 저항 한복판에 걸리면 차단 ────
+        sr_boxes = _find_sr_boxes(candles)
+        _, _, r_hi = _near_sr_box(c0['close'], sr_boxes, 'resistance', proximity=0.010)
+        if r_hi and c0['close'] < r_hi:
+            # 저항 박스 안에 있으면 아직 돌파 미완성
+            if logger:
+                logger.info(
+                    f"[FLAG_CHECK] {code} "
+                    f"flag_len={flag_len} 재돌파 감지됐으나 저항박스({r_hi}) 미돌파 → 스킵"
+                )
+            continue
+
+        # ── 전부 통과 ────────────────────────────────────────
+        if logger:
+            logger.info(
+                f"[FLAG_CONFIRMED] {code} | "
+                f"기준봉:{base['open']}→{base['close']}(+{base_rise*100:.1f}%, "
+                f"거래량{base_vol_ratio:.1f}배) | "
+                f"횡보:{flag_len}봉(범위비율{flag_range_ratio:.2f}, "
+                f"거래량수렴{vol_shrink:.2f}) | "
+                f"재돌파:{c0['close']}(박스상단{box_top}, "
+                f"거래량{c0['volume']/avg_flag_vol:.1f}배) | "
+                f"EMA20:{ema20:.0f}>EMA60:{ema60:.0f} | "
+                f"손절기준봉시가:{base['open']}"
+            )
+        return True
+
+    if logger:
+        logger.info(
+            f"[FLAG_CHECK] {code} "
+            f"flag_len=3~{MAX_FLAG} 탐색 완료 → 패턴 미감지"
+        )
+    return False
+
+
+def get_flag_signal_data(candles) -> dict | None:
+    """FLAG 진입 시 디스코드 알림용 지표"""
+    MIN_FLAG, MAX_FLAG = 3, 15
+    need = MAX_FLAG + 25
+    if len(candles) < need:
+        return None
+
+    closes = [c['close'] for c in candles]
+    ema20  = _calc_ema(closes, 20)
+    c0     = candles[0]
+
+    for flag_len in range(MIN_FLAG, MAX_FLAG + 1):
+        if 1 + flag_len + 5 >= len(candles):
+            break
+        flag_candles = candles[1 : 1 + flag_len]
+        base         = candles[1 + flag_len]
+        prev_base    = candles[1 + flag_len + 1 : 1 + flag_len + 6]
+
+        base_body = base['close'] - base['open']
+        if base_body <= 0:
+            continue
+        base_rise = base_body / base['open'] if base['open'] > 0 else 0
+        avg_vol_before = (sum(c['volume'] for c in prev_base) / len(prev_base)
+                          if prev_base else 1)
+        base_vol_ratio = base['volume'] / avg_vol_before if avg_vol_before > 0 else 0
+        if base_vol_ratio < 3.0 or base_rise < 0.01:
+            continue
+
+        flag_highs = [c['high']   for c in flag_candles]
+        flag_vols  = [c['volume'] for c in flag_candles]
+        avg_flag_vol = sum(flag_vols) / len(flag_vols) if flag_vols else 1
+        box_top    = max(flag_highs)
+
+        if c0['close'] > box_top and c0['volume'] >= avg_flag_vol * 2.0:
+            return {
+                "vol_ratio":       c0['volume'] / avg_flag_vol,
+                "trend":           f"깃발 재돌파(기준봉+{base_rise*100:.1f}%)",
+                "breakout":        f"박스상단({box_top}) 돌파",
+                "candle_strength": base_body / (base['high'] - base['low']) * 100
+                                   if (base['high'] - base['low']) > 0 else 0,
+                "flag_len":        flag_len,
+                "base_stop":       base['open'],   # 손절 기준봉 시가
+            }
+    return None
 
 
 # ==================================================

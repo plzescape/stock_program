@@ -283,7 +283,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     # F. 거래량 3~15배
     avg_vol   = sum(c['volume'] for c in candles[1:6]) / 5
     vol_ratio = c1['volume'] / avg_vol if avg_vol > 0 else 0
-    vol_ok    = (3.0 <= vol_ratio <= 15.0 and c1['volume'] >= 5000)
+    vol_ok    = (2.0 <= vol_ratio <= 15.0 and c1['volume'] >= 5000)
 
     # G. 캔들강도 ≥ 60%
     rng       = c1['high'] - c1['low']

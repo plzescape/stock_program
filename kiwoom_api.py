@@ -16,6 +16,7 @@ import time as pytime
 from config import (
     IS_REAL, ACCOUNT_NO, MAX_REENTRY_RETRIES, QTY, MAX_BUY_AMOUNT, BUY_MODE, REENTRY_DELAY_SEC,
     STOP_LOSS_RATE, TP1_RATE, TP1_RATIO, TP2_RATE, TP2_RATIO,
+    CANDLE_SL_ENABLED, EMERGENCY_SL_RATE,
     TRAIL_GAP,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
     CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
@@ -57,6 +58,13 @@ class PositionState:
     tp2_done_ts: float = 0.0      # TP2 체결 시각 (트레일링 구간 보호용)
     entry_type: str = ""          # 진입 전략 타입 (BREAKOUT/PULLBACK/FLAG)
     flag_stop_price: int = 0      # FLAG 전용 손절가 (기준봉 시가, 0이면 미사용)
+
+    # ⭐ 완성봉 기준 손절용 — 틱에서 1분봉을 직접 합산
+    sl_candle_minute: int = -1     # 현재 쌓고 있는 분봉의 minute(-1=미초기화)
+    sl_candle_open:   int = 0      # 현재 분봉 시가
+    sl_candle_high:   int = 0      # 현재 분봉 고가
+    sl_candle_low:    int = 0      # 현재 분봉 저가
+    sl_candle_last:   int = 0      # 현재 분봉 마지막 체결가(완성 시 종가)
 
 class KiwoomAPI(QAxWidget):
     def __init__(self):
@@ -760,17 +768,104 @@ class KiwoomAPI(QAxWidget):
             )
             pos.last_pnl_log_ts = now
 
-        # STOP LOSS
-        # FLAG 전략: 기준봉 시가를 손절가로 사용 (보고서 원칙)
-        # 일반 전략: config STOP_LOSS_RATE(-1.0%) 적용
-        is_stop_loss = (
-            (pos.flag_stop_price > 0 and cur <= pos.flag_stop_price) or
-            (pos.flag_stop_price == 0 and pnl_rate <= -STOP_LOSS_RATE)
-        )
-        if is_stop_loss:
+        # ==================================================
+        # ── 완성봉 기준 손절 (메인) ──────────────────────
+        # 틱마다 현재 분봉 OHLC를 직접 합산하고,
+        # 분이 바뀌는 순간 직전 완성봉 종가로 손절 판단
+        # ==================================================
+        from datetime import datetime as _dt
+        cur_minute = _dt.now().minute
+
+        if pos.sl_candle_minute == -1:
+            # 첫 틱: 분봉 초기화
+            pos.sl_candle_minute = cur_minute
+            pos.sl_candle_open   = cur
+            pos.sl_candle_high   = cur
+            pos.sl_candle_low    = cur
+            pos.sl_candle_last   = cur
+
+        elif cur_minute != pos.sl_candle_minute:
+            # ── 분이 바뀜 → 직전 분봉 완성 ─────────────────
+            completed_close = pos.sl_candle_last   # 완성봉 종가
+            completed_open  = pos.sl_candle_open
+            completed_high  = pos.sl_candle_high
+            completed_low   = pos.sl_candle_low
+
+            sl_rate = (completed_close - entry) / entry
+
+            self.log_trade.info(
+                f"[CANDLE_CLOSED] {code} "
+                f"O:{completed_open} H:{completed_high} "
+                f"L:{completed_low} C:{completed_close} "
+                f"pnl={sl_rate:.4f}"
+            )
+
+            # 완성봉 손절 판단
+            if CANDLE_SL_ENABLED and sl_rate <= -STOP_LOSS_RATE:
+                if self.can_try_sell(pos):
+                    self.log_trade.info(
+                        f"[STOP_LOSS_CANDLE] {code} 완성봉 손절 "
+                        f"종가:{completed_close} pnl={sl_rate:.4f}"
+                    )
+                    ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+                    if ok:
+                        pos.last_sell_attempt_ts = now
+                        pos.selling = True
+                    else:
+                        pos.selling = False
+                    # 새 분봉 초기화 후 return
+                    pos.sl_candle_minute = cur_minute
+                    pos.sl_candle_open   = cur
+                    pos.sl_candle_high   = cur
+                    pos.sl_candle_low    = cur
+                    pos.sl_candle_last   = cur
+                    return
+
+            # 새 분봉 시작
+            pos.sl_candle_minute = cur_minute
+            pos.sl_candle_open   = cur
+            pos.sl_candle_high   = cur
+            pos.sl_candle_low    = cur
+            pos.sl_candle_last   = cur
+
+        else:
+            # ── 같은 분 내 틱 — 분봉 갱신 ──────────────────
+            if cur > pos.sl_candle_high:
+                pos.sl_candle_high = cur
+            if cur < pos.sl_candle_low:
+                pos.sl_candle_low = cur
+            pos.sl_candle_last = cur
+
+        # ==================================================
+        # ── 실시간 비상 안전망 (EMERGENCY_SL_RATE) ────────
+        # 완성봉과 무관하게 순간 낙폭이 너무 크면 즉시 손절
+        # CANDLE_SL_ENABLED=True여도 안전망은 항상 동작
+        # EMERGENCY_SL_RATE = 0.0 이면 비활성화
+        # ==================================================
+        if EMERGENCY_SL_RATE > 0 and pnl_rate <= -EMERGENCY_SL_RATE:
             if not self.can_try_sell(pos):
                 return
-            self.log_trade.info(f"[STOP_LOSS] {code} 손절 매도 트리거 (현재가:{cur} pnl={pnl_rate:.4f})")
+            self.log_trade.info(
+                f"[STOP_LOSS_EMERGENCY] {code} 비상 손절 "
+                f"현재가:{cur} pnl={pnl_rate:.4f} "
+                f"(안전망 -{EMERGENCY_SL_RATE*100:.1f}%)"
+            )
+            ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+            if ok:
+                pos.last_sell_attempt_ts = now
+                pos.selling = True
+            else:
+                pos.selling = False
+            return
+
+        # 완성봉 손절 비활성 시 기존 실시간 손절로 폴백
+        if not CANDLE_SL_ENABLED and pnl_rate <= -STOP_LOSS_RATE:
+            if not self.can_try_sell(pos):
+                return
+            self.log_trade.info(
+                f"[STOP_LOSS] {code} 실시간 손절 "
+                f"현재가:{cur} pnl={pnl_rate:.4f}"
+            )
             ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             if ok:
                 pos.last_sell_attempt_ts = now

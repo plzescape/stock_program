@@ -4,7 +4,7 @@ IS_REAL = False
 ACCOUNT_NO = ""  # IS_REAL=True일 때만 사용 (예: "12345678")
 
 # ✅ 모의투자에서 사용할 계좌 (국내주식)
-MOCK_ACCOUNT_NO = "8118694111"
+MOCK_ACCOUNT_NO = "8120446011"
 
 # ===== 매매 수량 =====
 # BUY_MODE 옵션:
@@ -12,39 +12,51 @@ MOCK_ACCOUNT_NO = "8118694111"
 #   "QTY"      → 무조건 QTY 만큼 매수 (금액 무시)
 #   "BOTH"     → MAX_BUY_AMOUNT 이내 + 최대 QTY개 (둘 중 적은 쪽)
 BUY_MODE = "BOTH"
-QTY = 100                   # 고정 수량 / 최대 수량
-MAX_BUY_AMOUNT = 500000    # 종목당 최대 매수금액 (원)
-TOTAL_BUDGET = 5000000     # 총 투자 한도 (원)
+QTY = 10000                 # 고정 수량 / 최대 수량
+MAX_BUY_AMOUNT = 2000000    # 종목당 최대 매수금액 (원)
+TOTAL_BUDGET = 20000000     # 총 투자 한도 (원)
 
 # ===== 완성봉 손절 설정 =====
-# CANDLE_SL_ENABLED: True면 "완성봉 종가 기준" 손절 (메인)
-#   → 1분봉이 닫히는 순간의 종가가 -STOP_LOSS_RATE 이하면 손절
+# CANDLE_SL_ENABLED: True면 "완성봉 종가 기준" ATR 손절 (메인)
+#   → 1분봉이 닫히는 순간의 종가가 atr_sl_price 이하면 손절
 #   → 순간 낙폭(급등락 노이즈)에 흔들리지 않음
 # EMERGENCY_SL_RATE: 실시간 보조 안전망 (틱 단위)
 #   → 순간 -EMERGENCY_SL_RATE 이하면 완성봉 무관 즉시 손절
 #   → 0.0으로 설정하면 비활성화 (완성봉 손절만)
 CANDLE_SL_ENABLED    = True
-EMERGENCY_SL_RATE    = 0.018     # 실시간 안전망: -1.8% (완성봉 -1%와 별도)
+EMERGENCY_SL_RATE    = 0.025     # 실시간 안전망: -2.5% (ATR 손절과 별도 극단적 낙폭 방어)
 
-# ===== 손절 / 익절 / 트레일링 =====
-STOP_LOSS_RATE = 0.010   # -1.0% (기존 -1.5% → 보고서 손익비 1:2 달성)   # -1.5%
+# ===== ATR 기반 손절 / 익절 배수 =====
+# ATR 계산: 진입 직전 14분봉 캔들 기준
+#   손절가  = 매수가 - ATR × ATR_SL_MULT    (완성봉 종가가 이하면 손절)
+#   TP1     = 매수가 + ATR × ATR_TP_MULT    (도달 시 TP1_RATIO 매도)
+#   TP2     = TP1 체결 시점 고점 + ATR × ATR_TP_MULT  (TP1 후 고점 기준 재설정)
+#   본절보호 = 매수가 - ATR × ATR_SAFE_MULT  (TP1 후 여기 이하로 밀리면 즉시 탈출)
+#   트레일링: TP2 후 최고가 - ATR × ATR_TRAIL_MULT 이하 시 청산
+ATR_PERIOD    = 14      # ATR 계산에 사용할 분봉 수
+ATR_SL_MULT   = 1.5    # 손절 배수
+ATR_TP_MULT   = 3.0    # 익절 배수 (TP1, TP2 공통)
+ATR_SAFE_MULT = 0.5    # 본절보호 배수 (TP1 후 매수가 이하 보호선)
+ATR_TRAIL_MULT = 1.0   # 트레일링 스탑 배수 (고점 기준)
 
-TP1_RATE = 0.02         # +2%
-TP1_RATIO = 0.5         # 50% 매도
+# ===== 분할 매도 비율 =====
+TP1_RATIO = 0.5         # TP1 도달 시 50% 매도
+TP2_RATIO = 0.3         # TP2 도달 시 30% 매도 (나머지 트레일링)
 
-TP2_RATE = 0.03         # +3% (기존 +4% → 보수적 확정)         # +4%
-TP2_RATIO = 0.3         # 30% 매도
-
-TRAIL_START_RATE = 0.02 # +2%부터 트레일링 활성화
-TRAIL_GAP = 0.010        # 1.0% (SL 축소에 맞춰 조정)        # 고점 대비 1.5% 하락 시 청산
+# ===== 하위 호환 유지 (직접 참조하는 코드 없음, 참고용) =====
+STOP_LOSS_RATE = 0.010   # 미사용 (ATR 손절로 대체)
+TP1_RATE       = 0.02    # 미사용 (ATR TP로 대체)
+TP2_RATE       = 0.03    # 미사용 (ATR TP로 대체)
+TRAIL_START_RATE = 0.02  # 미사용 (ATR 트레일링으로 대체)
+TRAIL_GAP        = 0.010 # 미사용 (ATR 트레일링으로 대체)
 
 # ===== 제한 =====
 MAX_TRADES_PER_DAY = 1000
 CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
-# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "AUTO_CANDI_KOSDAQ_SCALP", "DANTA_1", "DANTA_2, CHUSAE_INDICATE"
-CONDITION_NAME = "CHUSAE_INDICATE"
+# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "분봉급등주", "DANTA_1", "DANTA_2, CHUSAE_INDICATE"
+CONDITION_NAME = "분봉급등주"
 # CONDITION_INDEX = 0
 
 # ===== 스캔 설정 =====

@@ -15,9 +15,9 @@ import time as pytime
 
 from config import (
     IS_REAL, ACCOUNT_NO, MAX_REENTRY_RETRIES, QTY, MAX_BUY_AMOUNT, BUY_MODE, REENTRY_DELAY_SEC,
-    STOP_LOSS_RATE, TP1_RATE, TP1_RATIO, TP2_RATE, TP2_RATIO,
+    STOP_LOSS_RATE, TP1_RATIO, TP2_RATIO,
     CANDLE_SL_ENABLED, EMERGENCY_SL_RATE,
-    TRAIL_GAP,
+    ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT, ATR_SAFE_MULT, ATR_TRAIL_MULT,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
     CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
@@ -65,6 +65,23 @@ class PositionState:
     sl_candle_high:   int = 0      # 현재 분봉 고가
     sl_candle_low:    int = 0      # 현재 분봉 저가
     sl_candle_last:   int = 0      # 현재 분봉 마지막 체결가(완성 시 종가)
+
+    # ⭐ ATR 기반 손익 목표
+    atr_value:        float = 0.0  # 진입 시 계산한 14분봉 ATR
+    atr_sl_price:     int = 0      # ATR 손절가 (매수가 - ATR × 1.5), 완성봉 종가 기준
+    atr_tp1_price:    int = 0      # ATR TP1 목표가 (매수가 + ATR × 3)
+    atr_tp2_price:    int = 0      # ATR TP2 목표가 (TP1 고점 + ATR × 3, TP1 체결 시 갱신)
+    atr_safe_price:   int = 0      # 본절보호선 (매수가 - ATR × 0.5): TP1 후 이하 진입 시 탈출
+
+    # ⭐ 거래량 급감 청산용 — 분봉 단위 추적
+    # 조건: 최근 5분봉 평균 거래량 대비 50% 이하
+    #      + 고점 갱신 실패 2회 이상
+    #      + 전봉 저가 이탈 발생 시 청산
+    vol_candle_volumes: list = field(default_factory=list)  # 완성 분봉별 거래량 (최대 10개)
+    vol_candle_highs:   list = field(default_factory=list)  # 완성 분봉별 고가
+    vol_candle_lows:    list = field(default_factory=list)  # 완성 분봉별 저가
+    vol_peak_high:      int = 0    # TP1 이후 관찰된 최고 고가
+    vol_no_new_high_cnt: int = 0   # 고점 갱신 실패 연속 횟수
 
 class KiwoomAPI(QAxWidget):
     def __init__(self):
@@ -454,11 +471,20 @@ class KiwoomAPI(QAxWidget):
                     sig = get_entry_signal_data(completed_candles)
                 if sig:
                     self._entry_signals[code] = sig
+
+                # ── ATR 계산 (14분봉 기준) ──
+                atr_val = self.calc_atr(completed_candles, ATR_PERIOD)
+                self.log_trade.info(
+                    f"[ATR_CALC] code={code} ATR={atr_val:.1f}원 "
+                    f"(14분봉 기준, SL배수={ATR_SL_MULT}, TP배수={ATR_TP_MULT})"
+                )
+
                 self.send_market_order("BUY", code, buy_qty, "ENTRY")
                 # 예산 추적용
                 if code in self.pending_orders:
                     self.pending_orders[code]["est_amount"] = est_amount
                     self.pending_orders[code]["entry_type"] = entry_type
+                    self.pending_orders[code]["atr_value"]  = atr_val   # ← ATR 저장
                     # FLAG 전용 손절가: signal_data의 base_stop 값
                     if entry_type == "FLAG" and code in self._entry_signals:
                         self.pending_orders[code]["flag_stop_price"] = \
@@ -569,6 +595,15 @@ class KiwoomAPI(QAxWidget):
                 pos.entry_type = pend.get("entry_type", "")
                 pos.flag_stop_price = pend.get("flag_stop_price", 0)
 
+                # ── ATR 기반 손익 목표 설정 ──
+                atr = float(pend.get("atr_value", 0.0))
+                pos.atr_value = atr
+                if atr > 0:
+                    pos.atr_sl_price   = self.adjust_tick_size(max(1, int(price - atr * ATR_SL_MULT)))
+                    pos.atr_tp1_price  = self.adjust_tick_size(int(price + atr * ATR_TP_MULT))
+                    pos.atr_tp2_price  = pos.atr_tp1_price   # TP1 체결 시 고점 기준으로 갱신됨
+                    pos.atr_safe_price = self.adjust_tick_size(max(1, int(price - atr * ATR_SAFE_MULT)))
+
             # --------------------------------------------------
             # ✅ 체결수량 처리(중요):
             #  - 키움 Chejan FID 911 값이 "이번 체결수량"이 아니라
@@ -598,19 +633,30 @@ class KiwoomAPI(QAxWidget):
                 self.log_trade.info(f"[BUY_DONE] code={code} 잔여={pos.remain_qty}/{pos.total_qty}주 체결완료")
                 
             # =========================
-            # TP 목표가 설정 (시장가 매도 - 실시간 데이터에서 트리거)
+            # TP 목표가 설정 (ATR 기반 - 실시간 데이터에서 트리거)
             # =========================
             if pos.remain_qty >= pos.total_qty and not pos.tp1_done:
 
                 entry = pos.entry_price
-                tp1_target = self.adjust_tick_size(int(entry * (1 + TP1_RATE)))
-                tp2_target = self.adjust_tick_size(int(entry * (1 + TP2_RATE)))
-
-                self.log_trade.info(
-                    f"[TP_TARGET_SET] code={code} "
-                    f"TP1목표={tp1_target}(+{TP1_RATE*100:.1f}%) "
-                    f"TP2목표={tp2_target}(+{TP2_RATE*100:.1f}%)"
-                )
+                # ATR 값이 있으면 ATR 기반, 없으면 fallback 고정값
+                if pos.atr_value > 0:
+                    tp1_target = pos.atr_tp1_price
+                    tp2_target = pos.atr_tp2_price
+                    sl_price   = pos.atr_sl_price
+                    self.log_trade.info(
+                        f"[TP_TARGET_SET] code={code} ATR={pos.atr_value:.1f}원 "
+                        f"손절={sl_price} TP1={tp1_target} TP2(초기)={tp2_target} "
+                        f"본절보호={pos.atr_safe_price}"
+                    )
+                else:
+                    # ATR 미계산 fallback (ATR_PERIOD 캔들 부족 등 예외상황)
+                    tp1_target = self.adjust_tick_size(int(entry * 1.02))
+                    tp2_target = self.adjust_tick_size(int(entry * 1.03))
+                    sl_price   = self.adjust_tick_size(int(entry * 0.99))
+                    self.log_trade.warning(
+                        f"[TP_TARGET_SET_FALLBACK] code={code} ATR=0 → 고정비율 사용 "
+                        f"손절={sl_price} TP1={tp1_target} TP2={tp2_target}"
+                    )
 
                 # ── 디스코드 매수 체결 알림 ──
                 try:
@@ -658,10 +704,25 @@ class KiwoomAPI(QAxWidget):
                 if "TP1" in reason and not pos.tp1_done:
                     pos.tp1_done = True
                     pos.tp1_done_ts = pytime.time()
-                    self.log_trade.info(f"[TP1_FILLED] code={code} 잔여={pos.remain_qty}주")
+                    # ── TP2 목표가를 TP1 체결 시점 고점 기준으로 갱신 ──
+                    if pos.atr_value > 0:
+                        pos.atr_tp2_price = self.adjust_tick_size(
+                            int(pos.highest_price + pos.atr_value * ATR_TP_MULT)
+                        )
+                        self.log_trade.info(
+                            f"[TP1_FILLED] code={code} 잔여={pos.remain_qty}주 "
+                            f"고점={pos.highest_price} TP2갱신={pos.atr_tp2_price}"
+                        )
+                    else:
+                        self.log_trade.info(f"[TP1_FILLED] code={code} 잔여={pos.remain_qty}주")
+                    # ── 거래량 급감 감지용 분봉 추적 초기화 ──
+                    pos.vol_peak_high      = pos.highest_price
+                    pos.vol_no_new_high_cnt = 0
+                    pos.vol_candle_volumes  = []
+                    pos.vol_candle_highs    = []
+                    pos.vol_candle_lows     = []
                     try:
                         from discord_notify import notify_tp1_fill
-                        # TP1 주문 수량은 pend["qty"]가 정확함 (delta는 분할체결 시 마지막 틱만 들어와 1주처럼 작을 수 있음)
                         tp1_filled_qty = pend.get("qty", delta)
                         notify_tp1_fill(code, self.get_stock_name(code), tp1_filled_qty, price, pos.entry_price, pos.remain_qty)
                     except Exception as e:
@@ -777,7 +838,7 @@ class KiwoomAPI(QAxWidget):
         # ==================================================
         # ── 완성봉 기준 손절 (메인) ──────────────────────
         # 틱마다 현재 분봉 OHLC를 직접 합산하고,
-        # 분이 바뀌는 순간 직전 완성봉 종가로 손절 판단
+        # 분이 바뀌는 순간 직전 완성봉 종가로 ATR 손절 판단
         # ==================================================
         from datetime import datetime as _dt
         cur_minute = _dt.now().minute
@@ -792,7 +853,7 @@ class KiwoomAPI(QAxWidget):
 
         elif cur_minute != pos.sl_candle_minute:
             # ── 분이 바뀜 → 직전 분봉 완성 ─────────────────
-            completed_close = pos.sl_candle_last   # 완성봉 종가
+            completed_close = pos.sl_candle_last
             completed_open  = pos.sl_candle_open
             completed_high  = pos.sl_candle_high
             completed_low   = pos.sl_candle_low
@@ -806,12 +867,34 @@ class KiwoomAPI(QAxWidget):
                 f"pnl={sl_rate:.4f}"
             )
 
-            # 완성봉 손절 판단
-            if CANDLE_SL_ENABLED and sl_rate <= -STOP_LOSS_RATE:
+            # ── TP1 이후: 거래량 급감 감지용 분봉 데이터 적재 ──
+            if pos.tp1_done:
+                pos.vol_candle_volumes.append(
+                    sum(pos.recent_volumes) if pos.recent_volumes else 0
+                )
+                pos.vol_candle_highs.append(completed_high)
+                pos.vol_candle_lows.append(completed_low)
+                # 최대 10분봉만 유지
+                if len(pos.vol_candle_volumes) > 10:
+                    pos.vol_candle_volumes = pos.vol_candle_volumes[-10:]
+                    pos.vol_candle_highs   = pos.vol_candle_highs[-10:]
+                    pos.vol_candle_lows    = pos.vol_candle_lows[-10:]
+
+                # 고점 갱신 여부 판단
+                if completed_high > pos.vol_peak_high:
+                    pos.vol_peak_high = completed_high
+                    pos.vol_no_new_high_cnt = 0
+                else:
+                    pos.vol_no_new_high_cnt += 1
+
+            # ── ATR 완성봉 손절 판단 ──
+            # atr_sl_price가 설정된 경우 우선 사용, 없으면 고정비율 fallback
+            sl_threshold = pos.atr_sl_price if pos.atr_sl_price > 0 else int(entry * (1 - STOP_LOSS_RATE))
+            if CANDLE_SL_ENABLED and completed_close <= sl_threshold:
                 if self.can_try_sell(pos):
                     self.log_trade.info(
-                        f"[STOP_LOSS_CANDLE] {code} 완성봉 손절 "
-                        f"종가:{completed_close} pnl={sl_rate:.4f}"
+                        f"[STOP_LOSS_CANDLE] {code} 완성봉 ATR손절 "
+                        f"종가:{completed_close} 손절기준:{sl_threshold} pnl={sl_rate:.4f}"
                     )
                     ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
                     if ok:
@@ -843,9 +926,9 @@ class KiwoomAPI(QAxWidget):
             pos.sl_candle_last = cur
 
         # ==================================================
-        # ── 실시간 비상 안전망 (EMERGENCY_SL_RATE) ────────
-        # 완성봉과 무관하게 순간 낙폭이 너무 크면 즉시 손절
-        # CANDLE_SL_ENABLED=True여도 안전망은 항상 동작
+        # ── 실시간 비상 안전망 ────────────────────────────
+        # 완성봉과 무관하게 순간 낙폭이 EMERGENCY_SL_RATE 이상이면 즉시 손절
+        # atr_sl_price 기준보다 더 큰 낙폭을 별도 보호 (극단적 급락 방어)
         # EMERGENCY_SL_RATE = 0.0 이면 비활성화
         # ==================================================
         if EMERGENCY_SL_RATE > 0 and pnl_rate <= -EMERGENCY_SL_RATE:
@@ -865,25 +948,27 @@ class KiwoomAPI(QAxWidget):
             return
 
         # 완성봉 손절 비활성 시 기존 실시간 손절로 폴백
-        if not CANDLE_SL_ENABLED and pnl_rate <= -STOP_LOSS_RATE:
-            if not self.can_try_sell(pos):
+        if not CANDLE_SL_ENABLED:
+            sl_threshold = pos.atr_sl_price if pos.atr_sl_price > 0 else int(entry * (1 - STOP_LOSS_RATE))
+            if cur <= sl_threshold:
+                if not self.can_try_sell(pos):
+                    return
+                self.log_trade.info(
+                    f"[STOP_LOSS] {code} 실시간 ATR손절 "
+                    f"현재가:{cur} 손절기준:{sl_threshold} pnl={pnl_rate:.4f}"
+                )
+                ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+                if ok:
+                    pos.last_sell_attempt_ts = now
+                    pos.selling = True
+                else:
+                    pos.selling = False
                 return
-            self.log_trade.info(
-                f"[STOP_LOSS] {code} 실시간 손절 "
-                f"현재가:{cur} pnl={pnl_rate:.4f}"
-            )
-            ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
-            if ok:
-                pos.last_sell_attempt_ts = now
-                pos.selling = True
-            else:
-                pos.selling = False
-            return
 
         # =========================
-        # TP1 시장가 익절 (가격 도달 시)
+        # TP1 시장가 익절 (ATR 기반 목표가 도달 시)
         # =========================
-        tp1_target = self.adjust_tick_size(int(pos.entry_price * (1 + TP1_RATE)))
+        tp1_target = pos.atr_tp1_price if pos.atr_tp1_price > 0 else self.adjust_tick_size(int(pos.entry_price * 1.02))
         if not pos.tp1_done and cur >= tp1_target:
             if not self.can_try_sell(pos):
                 return
@@ -895,7 +980,7 @@ class KiwoomAPI(QAxWidget):
                 tp1_qty = min(tp1_qty, pos.remain_qty)
 
             self.log_trade.info(
-                f"[TP1_TRIGGER] code={code} 현재가={cur} 목표={tp1_target} 매도수량={tp1_qty}주"
+                f"[TP1_TRIGGER] code={code} 현재가={cur} ATR목표={tp1_target} 매도수량={tp1_qty}주"
             )
             ok = self.send_market_order("SELL", code, tp1_qty, "TP1")
             if ok:
@@ -904,9 +989,9 @@ class KiwoomAPI(QAxWidget):
             return
 
         # =========================
-        # TP2 시장가 익절 (가격 도달 시)
+        # TP2 시장가 익절 (ATR 기반 - TP1 고점 기준 갱신된 목표가)
         # =========================
-        tp2_target = self.adjust_tick_size(int(pos.entry_price * (1 + TP2_RATE)))
+        tp2_target = pos.atr_tp2_price if pos.atr_tp2_price > 0 else self.adjust_tick_size(int(pos.entry_price * 1.03))
         if pos.tp1_done and not pos.tp2_done and cur >= tp2_target:
             if not self.can_try_sell(pos):
                 return
@@ -918,7 +1003,7 @@ class KiwoomAPI(QAxWidget):
                 tp2_qty = min(tp2_qty, pos.remain_qty)
 
             self.log_trade.info(
-                f"[TP2_TRIGGER] code={code} 현재가={cur} 목표={tp2_target} 매도수량={tp2_qty}주"
+                f"[TP2_TRIGGER] code={code} 현재가={cur} ATR목표={tp2_target} 매도수량={tp2_qty}주"
             )
             ok = self.send_market_order("SELL", code, tp2_qty, "TP2")
             if ok:
@@ -926,10 +1011,17 @@ class KiwoomAPI(QAxWidget):
                 pos.selling = True
             return
 
-        # 조건: TP1 달성 후 수익률이 0.5% 이하로 밀리면 본절 탈출
-        if pos.tp1_done and pnl_rate <= 0.005:
+        # =========================
+        # 본절 보호: TP1 후 atr_safe_price 이하로 밀리면 탈출
+        # (매수가 - ATR × ATR_SAFE_MULT)
+        # =========================
+        safe_price = pos.atr_safe_price if pos.atr_safe_price > 0 else int(pos.entry_price * 1.005)
+        if pos.tp1_done and cur <= safe_price:
             if self.can_try_sell(pos):
-                self.log_trade.info(f"[PROFIT_SAFEGUARD] {code} 본절 매도 (현재가:{cur})")
+                self.log_trade.info(
+                    f"[PROFIT_SAFEGUARD] {code} 본절보호 매도 "
+                    f"현재가:{cur} 보호선:{safe_price} (ATR×{ATR_SAFE_MULT})"
+                )
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "PROFIT_SAFE")
                 if ok:
                     pos.last_sell_attempt_ts = now
@@ -938,76 +1030,83 @@ class KiwoomAPI(QAxWidget):
                     pos.selling = False
             return
 
-        # TRAIL
+        # =========================
+        # 트레일링 스탑 (ATR 기반: 최고가 - ATR × ATR_TRAIL_MULT)
+        # =========================
         if pos.trailing_active:
-            stop = int(pos.highest_price * (1 - TRAIL_GAP))
-
-            if cur <= stop:
+            trail_stop = int(pos.highest_price - pos.atr_value * ATR_TRAIL_MULT) if pos.atr_value > 0 \
+                         else int(pos.highest_price * 0.990)
+            if cur <= trail_stop:
                 if not self.can_try_sell(pos):
                     return
+                self.log_trade.info(
+                    f"[TRAIL_STOP] code={code} 현재가={cur} 트레일기준={trail_stop} "
+                    f"고점={pos.highest_price} ATR×{ATR_TRAIL_MULT}"
+                )
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "TRAIL_STOP")
-
                 pos.last_sell_attempt_ts = now
-
                 if ok:
                     pos.trailing_active = False
                     pos.selling = True
                 else:
                     pos.selling = False
-
                 return
 
         # =========================
-        # ⚠️ 거래량 급감 TIME STOP (TP1 익절 후에만)
-        # 구간별 보호:
-        #   TP1→TP2 구간: 30초 보호 + 임계값 35%
-        #   TP2→트레일링 구간: 30초 보호 + 임계값 25% (신규)
+        # ⚠️ 거래량 급감 청산 (TP1 이후)
+        # 3가지 조건 동시 충족 시 청산:
+        #   ① 최근 5분봉 평균 거래량 < 기준봉 5분봉 평균의 50%
+        #   ② 고점 갱신 실패 2회 이상 연속
+        #   ③ 직전 완성봉 저가가 그 이전 봉의 저가를 이탈
         # =========================
-        TP1_PROTECT_SEC = 45   # TP1 후 보호시간 (30→45초: 229000 사례로 TP2 도달 기회 확보)
-        TP2_PROTECT_SEC = 30   # TP2 후 보호시간 (신규)
+        TP1_PROTECT_SEC = 45   # TP1 직후 보호시간 (안정화 대기)
+        TP2_PROTECT_SEC = 30   # TP2 직후 보호시간
 
-        # TP1→TP2 구간 보호: TP1은 됐지만 TP2는 아직인 경우
-        in_tp1_to_tp2_run = (
+        in_tp1_protect = (
             pos.tp1_done
             and not pos.tp2_done
             and (now - pos.tp1_done_ts) < TP1_PROTECT_SEC
         )
-
-        # TP2→트레일링 구간 보호: TP2 완료 후 초기 안정화 시간
-        in_tp2_trailing_protect = (
+        in_tp2_protect = (
             pos.tp2_done
             and pos.tp2_done_ts > 0
             and (now - pos.tp2_done_ts) < TP2_PROTECT_SEC
         )
 
-        # 어느 보호 구간에도 속하지 않을 때만 거래량 급감 체크
         if (
             pos.tp1_done
             and not pos.time_stop_done
             and not pos.selling
-            and not in_tp1_to_tp2_run
-            and not in_tp2_trailing_protect
-            and len(pos.recent_volumes) == VOL_CHECK_TICKS
-            and pos.peak_avg_vol > 0
+            and not in_tp1_protect
+            and not in_tp2_protect
+            and len(pos.vol_candle_volumes) >= 6  # 최소 6분봉 적재 필요
         ):
-            avg_vol = sum(pos.recent_volumes) / VOL_CHECK_TICKS
-            vol_ratio = avg_vol / pos.peak_avg_vol
-            pnl_rate = (cur - pos.entry_price) / pos.entry_price
+            vols = pos.vol_candle_volumes
+            # ① 최근 5분봉 평균 vs 기준 5분봉 평균 (그 이전 5개)
+            recent_5_avg = sum(vols[-5:]) / 5
+            base_5_avg   = sum(vols[-10:-5]) / 5 if len(vols) >= 10 else sum(vols[:-5]) / max(1, len(vols) - 5)
 
-            # TP2 완료 후 트레일링 구간은 더 엄격한 임계값 (25%)
-            # TP1만 된 구간은 기존 임계값 (35%)
-            vol_threshold = 0.25 if pos.tp2_done else 0.35
+            cond_vol   = base_5_avg > 0 and (recent_5_avg / base_5_avg) < 0.50
+            # ② 고점 갱신 실패 2회 이상
+            cond_high  = pos.vol_no_new_high_cnt >= 2
+            # ③ 직전 완성봉 저가 < 그 이전 봉 저가 (전봉 저가 이탈)
+            cond_low   = (
+                len(pos.vol_candle_lows) >= 2
+                and pos.vol_candle_lows[-1] < pos.vol_candle_lows[-2]
+            )
 
-            if vol_ratio <= vol_threshold and pnl_rate >= TIME_STOP_MAX_LOSS:
+            if cond_vol and cond_high and cond_low:
                 if not self.can_try_sell(pos):
                     return
 
                 phase = "TRAILING" if pos.tp2_done else "TP1_WAIT"
                 self.log_trade.info(
                     f"[VOL_TIME_STOP] code={code} 구간={phase} 매도수량={pos.remain_qty}주 "
-                    f"평균거래량={avg_vol:.2f} 피크={pos.peak_avg_vol:.2f} "
-                    f"비율={vol_ratio:.2f} 임계={vol_threshold:.2f} "
-                    f"pnl={pnl_rate:.4f} tp2완료={pos.tp2_done}"
+                    f"최근5봉평균={recent_5_avg:.1f} 기준5봉평균={base_5_avg:.1f} "
+                    f"거래량비율={recent_5_avg/base_5_avg:.2f} "
+                    f"고점갱신실패={pos.vol_no_new_high_cnt}회 "
+                    f"전봉저가이탈={pos.vol_candle_lows[-1]}<{pos.vol_candle_lows[-2]} "
+                    f"pnl={pnl_rate:.4f}"
                 )
                 ok = self.send_market_order(
                     side="SELL",
@@ -1015,15 +1114,12 @@ class KiwoomAPI(QAxWidget):
                     qty=pos.remain_qty,
                     reason="VOL_TIME_STOP"
                 )
-
                 pos.last_sell_attempt_ts = now
-
                 if ok:
                     pos.time_stop_done = True
                     pos.selling = True
                 else:
                     pos.selling = False
-
                 return
 
         # =========================
@@ -1031,39 +1127,39 @@ class KiwoomAPI(QAxWidget):
         # =========================
         now = pytime.time()
         hold_sec = now - pos.entry_ts
-        
+
         if (
             not pos.time_stop_done
             and hold_sec >= TIME_STOP_SEC
         ):
             pnl_rate = (cur - pos.entry_price) / pos.entry_price
-        
+
             # 손실이 -0.3% 이내일 때만
             if pnl_rate >= TIME_STOP_MAX_LOSS:
                 if not self.can_try_sell(pos):
                     return
-        
+
                 self.log_trade.info(
                     f"[TIME_STOP] code={code} "
                     f"보유={int(hold_sec)}초 매도수량={pos.remain_qty}주 "
                     f"pnl={pnl_rate:.4f}"
                 )
-                
+
                 ok = self.send_market_order(
                     side="SELL",
                     code=code,
                     qty=pos.remain_qty,
                     reason="TIME_STOP"
                 )
-        
+
                 pos.last_sell_attempt_ts = now
-        
+
                 if ok:
                     pos.time_stop_done = True
                     pos.selling = True
                 else:
                     pos.selling = False
-        
+
                 return
 
     # ==================================================
@@ -1528,7 +1624,33 @@ class KiwoomAPI(QAxWidget):
         except Exception:
             return code
 
-    # 4. 호가단위 보정 (한국 주식시장)
+    # ==================================================
+    # ATR 계산 유틸리티
+    # ==================================================
+    @staticmethod
+    def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
+        """
+        완성봉 캔들 리스트(최신봉 index=0)로 ATR 계산.
+        True Range = max(고가-저가, |고가-전봉종가|, |저가-전봉종가|)
+        period개 TR의 단순평균을 반환. 캔들 부족 시 0.0 반환.
+        """
+        if len(candles) < period + 1:
+            return 0.0
+        # candles[0]이 가장 최근이므로 period+1개 슬라이싱
+        window = candles[:period + 1]
+        trs = []
+        for i in range(period):
+            cur  = window[i]
+            prev = window[i + 1]
+            tr = max(
+                cur["high"] - cur["low"],
+                abs(cur["high"] - prev["close"]),
+                abs(cur["low"]  - prev["close"]),
+            )
+            trs.append(tr)
+        return sum(trs) / len(trs)
+
+    # 호가단위 보정 (한국 주식시장)
     @staticmethod
     def adjust_tick_size(price: int) -> int:
         """주어진 가격을 올바른 호가단위로 올림 보정 (TP 목표가용)"""

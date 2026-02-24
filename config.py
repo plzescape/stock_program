@@ -24,7 +24,7 @@ TOTAL_BUDGET = 20000000     # 총 투자 한도 (원)
 #   → 순간 -EMERGENCY_SL_RATE 이하면 완성봉 무관 즉시 손절
 #   → 0.0으로 설정하면 비활성화 (완성봉 손절만)
 CANDLE_SL_ENABLED    = True
-EMERGENCY_SL_RATE    = 0.025     # 실시간 안전망: -2.5% (ATR 손절과 별도 극단적 낙폭 방어)
+EMERGENCY_SL_RATE    = 0.0     # 실시간 안전망: -2.5% (ATR 손절과 별도 극단적 낙폭 방어) 비활성화 하려면 0.0으로 설정
 
 # ===== ATR 기반 손절 / 익절 배수 =====
 # ATR 계산: 진입 직전 14분봉 캔들 기준
@@ -36,8 +36,8 @@ EMERGENCY_SL_RATE    = 0.025     # 실시간 안전망: -2.5% (ATR 손절과 별
 ATR_PERIOD    = 14      # ATR 계산에 사용할 분봉 수
 ATR_SL_MULT   = 1.5    # 손절 배수
 ATR_TP_MULT   = 3.0    # 익절 배수 (TP1, TP2 공통)
-ATR_SAFE_MULT = 0.5    # 본절보호 배수 (TP1 후 매수가 이하 보호선)
-ATR_TRAIL_MULT = 1.0   # 트레일링 스탑 배수 (고점 기준)
+ATR_SAFE_MULT = 1.5    # 본절보호 배수 (TP1 후 매수가 이하 보호선)
+ATR_TRAIL_MULT = 1.5   # 트레일링 스탑 배수 (고점 기준)
 
 # ===== 분할 매도 비율 =====
 TP1_RATIO = 0.5         # TP1 도달 시 50% 매도

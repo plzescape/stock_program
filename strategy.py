@@ -27,6 +27,8 @@ strategy.py — 보고서 기반 전면 재구성 + 패턴 확장 (2026-02-22)
 
 from datetime import datetime, time
 
+MIN_VOL_RATIO = 2.0   # 최소 거래량 배수 (평균 대비) - 보고서 기준 3배 → 2배로 완화
+MAX_VOL_RATIO = 15.0  # 최대 거래량 배수 (평균 대비) - 보고서 기준 15배 유지
 
 # ==================================================
 # ── 시장 시간 ──
@@ -283,7 +285,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     # F. 거래량 3~15배
     avg_vol   = sum(c['volume'] for c in candles[1:6]) / 5
     vol_ratio = c1['volume'] / avg_vol if avg_vol > 0 else 0
-    vol_ok    = (2.0 <= vol_ratio <= 15.0 and c1['volume'] >= 5000)
+    vol_ok    = (MIN_VOL_RATIO <= vol_ratio <= MAX_VOL_RATIO and c1['volume'] >= 5000)
 
     # G. 캔들강도 ≥ 60%
     rng       = c1['high'] - c1['low']

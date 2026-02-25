@@ -442,17 +442,56 @@ COLORS_MAP = {
     "기타":           "808080",
 }
 
-def _make_pie(ws, data_ref, label_ref, title, colors_order, w=13, h=13):
+def _make_pie(ws, data_ref, label_ref, title, colors_order, w=12.5, h=12):
+    from openpyxl.chart.label import DataLabel, DataLabelList
+    from openpyxl.chart.layout import Layout
+
     pie = PieChart()
-    pie.title  = title
     pie.style  = 10
+
+    # 제목 텍스트 설정
+    from openpyxl.chart.title import Title
+    from openpyxl.chart.text import RichText
+    from openpyxl.drawing.text import (RichTextProperties, Paragraph,
+                                        ParagraphProperties, RegularTextRun,
+                                        CharacterProperties)
+    body = RichTextProperties()
+    cp   = CharacterProperties(b=True, sz=1100)  # 11pt bold
+    rtr  = RegularTextRun(t=title, rPr=cp)
+    para = Paragraph(r=[rtr], pPr=ParagraphProperties(algn="ctr"))
+    rt   = RichText(bodyPr=body, p=[para])
+    from openpyxl.chart.text import Text
+    pie.title = Title(tx=Text(rich=rt))
+
     pie.add_data(data_ref)
     pie.set_categories(label_ref)
     pie.series[0].title = None
+
+    # 범례 위쪽 배치
+    from openpyxl.chart.legend import Legend
+    leg = Legend()
+    leg.position = "t"   # top
+    pie.legend = leg
+
+    # 데이터 레이블: 파이 안에 % 표시
+    dll = DataLabelList()
+    dll.showPercent  = True
+    dll.showVal      = False
+    dll.showCatName  = False
+    dll.showSerName  = False
+    dll.showLegendKey = False
+    # 레이블 위치: bestFit (파이 조각 안)
+    dll.dLblPos = "bestFit"
+    from openpyxl.chart.data_source import NumFmt
+    dll.numFmt = NumFmt(formatCode="0%", sourceLinked=False)
+    pie.series[0].dLbls = dll
+
+    # 색상 적용
     for idx, clr in enumerate(colors_order):
         dp = DataPoint(idx=idx)
         dp.graphicalProperties.solidFill = clr
         pie.series[0].dPt.append(dp)
+
     pie.width  = w
     pie.height = h
     return pie
@@ -463,14 +502,14 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
     ws.sheet_view.showGridLines = False
 
     # 열 너비: A(여백) B~E(콘텐츠 4열) F(여백) G~H(보조데이터)
-    for col, w in zip("ABCDEFGH", [2, 22, 20, 20, 20, 2, 1, 1]):
+    for col, w in zip("ABCDEFGHIJK", [2, 22, 22, 22, 22, 22, 22, 22, 22, 1, 1]):
         ws.column_dimensions[col].width = w
 
     n        = len(trades)
     det_last = n + 1
 
     # ── 로고+타이틀 (행 2~3) ──────────────────────────
-    ws.merge_cells("B2:E2")
+    ws.merge_cells("B2:F2")
     tc = ws["B2"]
     tc.value     = "📊 자동매매 일일 성과 보고서"
     tc.font      = Font(name=FONT_NAME, bold=True, size=16, color="1F3864")
@@ -478,7 +517,7 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
     ws.row_dimensions[2].height = 36
 
     trade_date = trades[0]["entry_time"].strftime("%Y년 %m월 %d일") if trades else ""
-    ws.merge_cells("B3:E3")
+    ws.merge_cells("B3:F3")
     sc = ws["B3"]
     sc.value     = f"운용일자: {trade_date}  |  모의투자 (키움증권)"
     sc.font      = _font(size=10, color="595959")
@@ -623,7 +662,7 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
         Reference(ws, min_col=AUX,   min_row=pnl_s,  max_row=pnl_e),
         "청산유형 손익금액 비율", et_colors,
     )
-    ws.add_chart(pie2, f"C{chart_row}")
+    ws.add_chart(pie2, f"F{chart_row}")
 
     pie3 = _make_pie(
         ws,
@@ -632,7 +671,7 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
         f"이익 vs 손실  (이익 {total_profit:,}원 / 손실 {total_loss:,}원)",
         ["0070C0", "FF4444"],
     )
-    ws.add_chart(pie3, f"D{chart_row}")
+    ws.add_chart(pie3, f"J{chart_row}")
 
 # ──────────────────────────────────────────────
 # 5. 메인

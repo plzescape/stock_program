@@ -54,6 +54,18 @@ def enable_auto_trade(api: KiwoomAPI):
         
         return
 
+#===== ⭐ BUG-3: 전일 미청산 잔고 처리 =====
+def recover_and_liquidate_leftover(api: KiwoomAPI):
+    """
+    1) OPW00018 잔고조회 TR로 실제 보유 잔고를 positions에 복구
+    2) 조회 완료 콜백으로 liquidate_leftover_positions() 자동 호출
+       → 전일 잔고(entry_ts < 오늘 09:00)를 즉시 시장가 청산
+    """
+    print("🔍 전일 미청산 잔고 조회 중 (OPW00018)...")
+    api.load_holdings_from_api(
+        on_done=api.liquidate_leftover_positions
+    )
+
 #===== 강제 청산 예약 =====        
 def schedule_force_liquidation(api):
     from config import FORCE_LIQUIDATION_HOUR, FORCE_LIQUIDATION_MIN
@@ -97,13 +109,20 @@ def main():
         print("⚠️ 장전 self-check 실패 (재시도는 장 시작 후)")
     else:
         print("🟢 장전 self-check 통과")
-           
-    # 2-2) 장 시작 후 자동매매 활성화 예약
+
+    # ⭐ BUG-3: 전일 미청산 잔고 자동 청산
+    # - OPW00018 TR로 실제 보유 잔고 조회 → positions 복구 → 전일 잔고 즉시 청산
+    # - 장 시작 전(08:00~08:59) 실행하면 조회만 하고, 장 시작 후(09:00~) 청산 발동
+    # - 장 시작 직후 바로 청산되도록 09:00 + 5초 시점에 호출
     now = datetime.now()
     market_open = datetime.combine(now.date(), time(9, 0))
-    delay_ms = max(0, int((market_open - now).total_seconds() * 1000))
+    leftover_delay_ms = max(0, int((market_open - now).total_seconds() * 1000)) + 5000
 
-    QTimer.singleShot(delay_ms + 3000,  lambda: enable_auto_trade(api))    
+    QTimer.singleShot(leftover_delay_ms, lambda: recover_and_liquidate_leftover(api))
+    print(f"⏰ 전일잔고 청산 예약: 09:00:05 (약 {leftover_delay_ms//1000}초 후)")
+
+    # 2-2) 장 시작 후 자동매매 활성화 예약 (잔고청산 이후 10초 뒤)
+    QTimer.singleShot(leftover_delay_ms + 10000, lambda: enable_auto_trade(api))
     # enable_auto_trade(api)
     # 2-3) 조건검색 실행
     # api.run_condition_cycle()

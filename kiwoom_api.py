@@ -43,7 +43,10 @@ class PositionState:
     last_pnl_log_ts: float = 0.0
 
     # ⭐ Time Stop용
+    # entry_ts: BUY_DONE(전량체결 완료) 시점에 갱신됨
+    # 분할체결 중에는 TIME_STOP 타이머가 시작되지 않도록 BUY_FILL_NEW에서는 갱신 안 함
     entry_ts: float = field(default_factory=lambda: pytime.time())
+    buy_done: bool = False          # BUY_DONE(전량체결) 완료 여부
     time_stop_done: bool = False
 
     # ⭐ 최근 매도 시도 시간 기록
@@ -379,6 +382,11 @@ class KiwoomAPI(QAxWidget):
                          "RQ_1MIN", "OPT10080", 0, screen)
 
     def _on_receive_tr_data(self, screen_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
+        # ── OPW00018 잔고조회 분기 (스캔 TR과 무관하게 처리) ──
+        if rq_name == "RQ_HOLDINGS" and tr_code == "OPW00018":
+            self._on_receive_holdings_tr(rq_name, tr_code)
+            return
+
         if not self.tr_inflight:
             return
         # print(rq_name, tr_code)
@@ -630,6 +638,11 @@ class KiwoomAPI(QAxWidget):
                 self.last_order_ts = None
                 self.daily_trade_count += 1
                 self.pending_orders.pop(code, None)
+                # ⭐ BUG-1 수정: TIME_STOP 타이머를 전량체결 완료 시점으로 갱신
+                # BUY_FILL_NEW(첫 부분체결)에서 시작하면 분할체결 대기 시간이 포함되어
+                # 실제 보유시간보다 짧게 계산되는 문제 + 분할체결 중 TIME_STOP 오발동 방지
+                pos.entry_ts = pytime.time()
+                pos.buy_done = True
                 self.log_trade.info(f"[BUY_DONE] {self.cn(code)} 잔여={pos.remain_qty}/{pos.total_qty}주 체결완료")
                 
             # =========================
@@ -1130,6 +1143,7 @@ class KiwoomAPI(QAxWidget):
 
         if (
             not pos.time_stop_done
+            and pos.buy_done          # ⭐ BUG-1: BUY_DONE 완료 후에만 타이머 시작
             and hold_sec >= TIME_STOP_SEC
         ):
             pnl_rate = (cur - pos.entry_price) / pos.entry_price
@@ -1697,6 +1711,96 @@ class KiwoomAPI(QAxWidget):
             if o["side"] == "BUY"
         )    
 
+    # ==================================================
+    # ⭐ BUG-3: 키움 잔고조회 TR (OPW00018) 기반 전일 미청산 포지션 복구
+    # ==================================================
+    def load_holdings_from_api(self, on_done: callable = None):
+        """
+        OPW00018로 실제 보유 잔고를 조회해 positions에 복구.
+        프로그램 재시작 시 전일 미청산 잔고를 메모리에 재등록하기 위해 사용.
+
+        on_done: 조회 완료 후 콜백 (main.py에서 liquidate_leftover_positions 예약용)
+        """
+        self._holdings_callback = on_done
+        self._holdings_result   = []
+
+        self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.get_account())
+        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
+        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
+        self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")
+        self.dynamicCall("CommRqData(QString, QString, int, QString)",
+                         "RQ_HOLDINGS", "OPW00018", 0, "9500")
+        self.log_system.info("[HOLDINGS_TR] OPW00018 잔고조회 요청")
+
+    def _on_receive_holdings_tr(self, rq_name, tr_code):
+        """OPW00018 수신 처리 (TR 콜백 분기용)"""
+        if rq_name != "RQ_HOLDINGS" or tr_code != "OPW00018":
+            return
+
+        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name)
+        recovered = 0
+
+        for i in range(rows):
+            def _g(field, idx=i):
+                return self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, rq_name, idx, field
+                ).strip()
+
+            code     = _g("종목번호").replace("A", "").strip()
+            name     = _g("종목명")
+            qty_str  = _g("보유수량")
+            price_str = _g("매입가")
+
+            try:
+                qty   = int(qty_str.replace(",", ""))
+                price = int(price_str.replace(",", ""))
+            except ValueError:
+                continue
+
+            if qty <= 0 or not code:
+                continue
+
+            # 이미 positions에 있으면 건드리지 않음
+            if code in self.positions:
+                self.log_system.info(
+                    f"[HOLDINGS_SKIP] {name}({code}) 이미 포지션 존재"
+                )
+                continue
+
+            from kiwoom_api import PositionState
+            import time as pytime_
+            # entry_ts를 오늘 장 시작 이전으로 설정 → liquidate_leftover 조건 통과
+            yesterday_ts = pytime_.time() - 86400
+            pos = PositionState(
+                code        = code,
+                entry_price = price,
+                highest_price = price,
+                total_qty   = qty,
+                remain_qty  = qty,
+                ordering    = False,
+                selling     = False,
+            )
+            pos.entry_ts = yesterday_ts   # 전일 잔고임을 표시
+            pos.buy_done = True
+
+            self.positions[code] = pos
+            self.register_real(code)
+            recovered += 1
+
+            self.log_system.warning(
+                f"[HOLDINGS_RECOVERED] {name}({code}) "
+                f"qty={qty} entry={price} → positions 복구완료"
+            )
+
+        self.log_system.info(
+            f"[HOLDINGS_TR_DONE] 잔고조회 완료: {rows}종목 조회, {recovered}종목 복구"
+        )
+
+        # 콜백 실행 (liquidate_leftover_positions 호출 등)
+        if callable(self._holdings_callback):
+            self._holdings_callback()
+
     # 6. pending 주문 복구
     def recover_pending_orders(self):
         """
@@ -1980,8 +2084,135 @@ class KiwoomAPI(QAxWidget):
                         pos = self.positions.get(code)
                         if pos:
                             pos.selling = False
+                            # ⭐ BUG-2: [800033] 매도가능수량 부족 = 미체결 BUY 주문이
+                            # 아직 살아있어 매도 불가 상태. 이 경우 즉시 재매도를 시도하되
+                            # 1초 딜레이를 두어 BUY 미체결 취소 처리가 먼저 완료되도록 함.
+                            if "800033" in msg or "매도가능수량" in msg:
+                                sell_qty = pos.remain_qty
+                                sell_reason = pend.get("reason", "STOP_LOSS")
+                                self.log_system.warning(
+                                    f"[SELL_REJECT_RETRY] {self.cn(code)} "
+                                    f"[800033] 매도가능수량 부족 → 1초 후 재시도 "
+                                    f"qty={sell_qty} reason={sell_reason}"
+                                )
+                                QTimer.singleShot(
+                                    1000,
+                                    lambda c=code, q=sell_qty, r=sell_reason: self._retry_sell_after_reject(c, q, r)
+                                )
                         self.ordering = bool(self.pending_orders)
                     break  # 동시 BUY 차단 로직상 1개만 있을 수 있음
+
+    # ==================================================
+    # ⭐ BUG-2: SELL REJECT [800033] 후 재매도 시도
+    # ==================================================
+    def _retry_sell_after_reject(self, code: str, qty: int, reason: str):
+        """
+        [800033] 매도가능수량 부족 REJECT 후 1초 뒤 재호출.
+        - 포지션이 살아있으면 현재 remain_qty 기준으로 재매도
+        - 이미 매도 완료됐으면 스킵
+        """
+        pos = self.positions.get(code)
+        if not pos or pos.remain_qty <= 0:
+            self.log_system.info(f"[SELL_REJECT_RETRY_SKIP] {self.cn(code)} 이미 청산됨")
+            return
+        if pos.selling:
+            self.log_system.info(f"[SELL_REJECT_RETRY_SKIP] {self.cn(code)} 이미 매도중")
+            return
+
+        actual_qty = pos.remain_qty
+        self.log_trade.info(
+            f"[SELL_REJECT_RETRY] {self.cn(code)} "
+            f"재매도 qty={actual_qty} reason={reason}"
+        )
+        ok = self.send_market_order("SELL", code, actual_qty, reason)
+        if ok:
+            pos.selling = True
+            pos.last_sell_attempt_ts = pytime.time()
+        else:
+            pos.selling = False
+            # 재시도도 실패 시 3초 후 한 번 더
+            self.log_system.warning(
+                f"[SELL_REJECT_RETRY_FAIL] {self.cn(code)} 재매도 실패 → 3초 후 마지막 시도"
+            )
+            QTimer.singleShot(
+                3000,
+                lambda c=code, q=actual_qty, r=reason: self._final_sell_attempt(c, q, r)
+            )
+
+    def _final_sell_attempt(self, code: str, qty: int, reason: str):
+        """재매도 2차 실패 후 마지막 시도. 이후에도 실패하면 로그만 남김."""
+        pos = self.positions.get(code)
+        if not pos or pos.remain_qty <= 0 or pos.selling:
+            return
+        self.log_trade.warning(
+            f"[FINAL_SELL_ATTEMPT] {self.cn(code)} qty={pos.remain_qty} reason={reason}"
+        )
+        ok = self.send_market_order("SELL", code, pos.remain_qty, reason)
+        if ok:
+            pos.selling = True
+            pos.last_sell_attempt_ts = pytime.time()
+        else:
+            self.log_system.error(
+                f"[FINAL_SELL_FAIL] {self.cn(code)} 마지막 매도 시도 실패 — 수동 확인 필요"
+            )
+
+    # ==================================================
+    # ⭐ BUG-3: 장 시작 시 전일 미청산 잔고 자동 청산
+    # ==================================================
+    def liquidate_leftover_positions(self):
+        """
+        전일 미청산 잔고 장 시작 직후 자동 청산.
+        load_holdings_from_api() 완료 콜백으로 호출됨.
+        - entry_ts < 오늘 09:00인 포지션만 대상 (당일 신규진입 제외)
+        """
+        today_open_ts = datetime.now().replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ).timestamp()
+
+        leftover = [
+            (code, pos) for code, pos in self.positions.items()
+            if pos.remain_qty > 0
+            and not pos.selling
+            and pos.entry_ts < today_open_ts  # 오늘 장 시작 이전 잔고
+        ]
+
+        if not leftover:
+            self.log_system.info("[LEFTOVER_CHECK] 전일 미청산 잔고 없음")
+            return
+
+        self.log_system.warning(
+            f"[LEFTOVER_LIQUIDATION_START] 전일 미청산 포지션 {len(leftover)}개: "
+            f"{[c for c, _ in leftover]}"
+        )
+
+        for code, pos in leftover:
+            self.log_trade.warning(
+                f"[LEFTOVER_SELL] {self.cn(code)} "
+                f"전일잔고 qty={pos.remain_qty} entry={pos.entry_price} "
+                f"entry_ts={datetime.fromtimestamp(pos.entry_ts).strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            try:
+                from discord_notify import notify_force_liquidation
+                notify_force_liquidation(
+                    code=code,
+                    name=self.get_stock_name(code),
+                    qty=pos.remain_qty,
+                    entry_price=pos.entry_price
+                )
+            except Exception as e:
+                self.log_system.warning(f"[DISCORD_FAIL] 전일잔고청산알림: {e}")
+
+            ok = self.send_market_order(
+                "SELL", code, pos.remain_qty, "LEFTOVER_LIQUIDATION"
+            )
+            if ok:
+                pos.selling = True
+                self.log_system.info(f"[LEFTOVER_SELL_OK] {self.cn(code)} 청산주문 접수")
+            else:
+                self.log_system.error(
+                    f"[LEFTOVER_SELL_FAIL] {self.cn(code)} 청산주문 실패 → 수동 확인 필요"
+                )
 
     # ==================================================
     # 14:50 강제 전량 청산

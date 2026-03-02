@@ -124,6 +124,8 @@ def notify_buy_fill(
             indicator_lines.append(f"횡보: {signal_data['flag_len']}봉")
         if "base_stop" in signal_data:
             indicator_lines.append(f"손절기준(기준봉시가): **{signal_data['base_stop']:,}원**")
+        if "orderblock" in signal_data:
+            indicator_lines.append(f"오더블록: **{signal_data['orderblock']}**")
         if indicator_lines:
             fields.append({
                 "name": "📈 진입 지표",

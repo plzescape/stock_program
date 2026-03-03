@@ -1,19 +1,19 @@
 """
-자동매매 일일 보고서 생성기 v2
+자동매매 일일 보고서 생성기 v3
 ────────────────────────────────────────────────────
-로그 포맷 변경 반영:
-  - code={code} → 종목명(code) 형태로 파싱
-  - CODE_NAME 하드코딩 매핑 제거
+v3 변경사항:
+  - 진입전략(BREAKOUT / PULLBACK / FLAG) 파싱 추가
+  - 거래내역 시트: 종목코드 옆에 '진입전략' 컬럼 추가 (색상 구분)
+  - 요약 시트: 청산유형 테이블 아래 '진입전략별 집계' 테이블 추가
 ────────────────────────────────────────────────────
 Usage:
-  python generate_report.py                          # trade.log → 자동매매_보고서.xlsx
+  python generate_report.py                          # trade.log -> 자동매매_보고서.xlsx
   python generate_report.py logs/trade.log
   python generate_report.py trade.log report.xlsx
 ────────────────────────────────────────────────────
 시트 구성:
-  ① 요약 & 차트  — KPI / 청산유형 테이블 / 원형 차트 3개
-                   (청산유형 건수 / 청산유형 금액 / 이익 vs 손실 총액)
-  ② 거래내역     — 종목별 ATR·손절·TP1/2·트레일링 세부 타임라인
+  1. 요약 & 차트  -- KPI / 청산유형 테이블 / 진입전략별 집계 / 원형 차트 3개
+  2. 거래내역     -- 종목별 ATR/손절/TP1/2/트레일링 세부 타임라인 + 진입전략
 """
 
 import re
@@ -32,15 +32,9 @@ from openpyxl.chart.series import DataPoint
 # 1. 로그 파싱
 # ──────────────────────────────────────────────
 def _parse_cn(token: str):
-    """
-    '종목명(code)' 또는 'code=종목명(code)' 형태에서 (name, code) 추출.
-    구버전 호환: 'code=xxxxxx' (숫자 6자리) 도 처리.
-    """
-    # 새 포맷: 종목명(039860)
     m = re.match(r'^(.+?)\((\d{6})\)$', token.strip())
     if m:
         return m.group(1).strip(), m.group(2).strip()
-    # 구버전 code=039860
     m = re.match(r'^code=(\d{6})$', token.strip())
     if m:
         return m.group(1), m.group(1)
@@ -48,41 +42,38 @@ def _parse_cn(token: str):
 
 
 def parse_log(path: str) -> list[dict]:
-    """trade.log 파싱 → 거래 세션 리스트"""
+    """trade.log 파싱 -> 거래 세션 리스트"""
 
-    # ── 정규식 ──
-    re_ts    = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-
-    # ATR_CALC: [ATR_CALC] 종목명(code) ATR=147.9원 ...
-    re_atr   = re.compile(r"\[ATR_CALC\]\s+(.+?\(\d{6}\))\s+ATR=([\d.]+)원")
-    # 구버전 ATR: [ATR_CALC] code=xxxxxx ATR=...
-    re_atr_old = re.compile(r"\[ATR_CALC\]\s+code=(\d{6})\s+ATR=([\d.]+)원")
-
-    # BUY_FILL_NEW: 새/구 모두 지원
-    re_buy   = re.compile(r"\[BUY_FILL_NEW\]\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)$")
-    re_qty   = re.compile(r"\[BUY_DONE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)/(\d+)")
-    re_tp    = re.compile(
+    re_ts     = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+    re_atr    = re.compile(r"\[ATR_CALC\]\s+(.+?\(\d{6}\))\s+ATR=([\d.]+)원")
+    re_atr_old= re.compile(r"\[ATR_CALC\]\s+code=(\d{6})\s+ATR=([\d.]+)원")
+    re_buy    = re.compile(r"\[BUY_FILL_NEW\]\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)$")
+    re_qty    = re.compile(r"\[BUY_DONE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)/(\d+)")
+    re_tp     = re.compile(
         r"\[TP_TARGET_SET\]\s+(.+?\(\d{6}\)|code=\d{6})\s+ATR=([\d.]+)원\s+손절=(\d+)\s+TP1=(\d+)\s+TP2\(초기\)=(\d+)"
     )
-    re_tp1   = re.compile(r"\[TP1_FILLED\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)주")
-    re_tp2   = re.compile(r"\[TP2_FILLED\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)주")
-    re_trail = re.compile(r"\[TRAIL_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+")
-    re_sell  = re.compile(r"\[ORDER_TRY\]\s+방향=SELL\s+(.+?\(\d{6}\)|code=\d{6})\s+수량=(\d+)주\s+사유=(\S+)")
-    re_done  = re.compile(r"\[SELL_DONE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+전량매도완료")
-    re_psafe = re.compile(r"\[PROFIT_SAFEGUARD\]\s+(.+?\(\d{6}\)|code=\d{6})\s+본절보호")
-    re_emerg = re.compile(r"\[STOP_LOSS_EMERGENCY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+비상 손절 현재가:(\d+)\s+pnl=([-\d.]+)")
-    re_candle= re.compile(r"\[STOP_LOSS_CANDLE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+완성봉 ATR손절 종가:(\d+)\s+손절기준:\d+\s+pnl=([-\d.]+)")
-    re_time  = re.compile(r"\[TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+보유=\d+초\s+매도수량=\d+주\s+pnl=([-\d.]+)")
-    re_vol   = re.compile(r"\[VOL_TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+구간=\S+\s+매도수량=\d+주.*pnl=([-\d.]+)")
-    re_chejan= re.compile(r"\[CHEJAN\]\s+-매도\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)")
+    re_tp1    = re.compile(r"\[TP1_FILLED\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)주")
+    re_tp2    = re.compile(r"\[TP2_FILLED\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)주")
+    re_trail  = re.compile(r"\[TRAIL_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+")
+    re_sell   = re.compile(r"\[ORDER_TRY\]\s+방향=SELL\s+(.+?\(\d{6}\)|code=\d{6})\s+수량=(\d+)주\s+사유=(\S+)")
+    re_done   = re.compile(r"\[SELL_DONE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+전량매도완료")
+    re_psafe  = re.compile(r"\[PROFIT_SAFEGUARD\]\s+(.+?\(\d{6}\)|code=\d{6})\s+본절보호")
+    re_emerg  = re.compile(r"\[STOP_LOSS_EMERGENCY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+비상 손절 현재가:(\d+)\s+pnl=([-\d.]+)")
+    re_candle = re.compile(r"\[STOP_LOSS_CANDLE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+완성봉 ATR손절 종가:(\d+)\s+손절기준:\d+\s+pnl=([-\d.]+)")
+    re_time   = re.compile(r"\[TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+보유=\d+초\s+매도수량=\d+주\s+pnl=([-\d.]+)")
+    re_vol    = re.compile(r"\[VOL_TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+구간=\S+\s+매도수량=\d+주.*pnl=([-\d.]+)")
+    re_chejan = re.compile(r"\[CHEJAN\]\s+-매도\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)")
+    re_entry_qty = re.compile(r"\[ENTRY_QTY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+.*?전략=(BREAKOUT|PULLBACK|FLAG)")
+
+    # ── 진입전략 정규식 (v3 신규) ──
+    re_entry_breakout = re.compile(r"\[ENTRY_CONFIRMED\]\s+(.+?\(\d{6}\)|code=\d{6})")
+    re_entry_pullback = re.compile(r"\[PULLBACK_CONFIRMED\]\s+(.+?\(\d{6}\)|code=\d{6})")
+    re_entry_flag     = re.compile(r"\[FLAG_CONFIRMED\]\s+(.+?\(\d{6}\)|code=\d{6})")
 
     def extract_code(token: str):
-        """'종목명(code)' 또는 'code=xxxxxx' → (name, code)"""
-        # 새 포맷: "종목명(039860)"
         m = re.match(r'^(.+?)\((\d{6})\)$', token.strip())
         if m:
             return m.group(1).strip(), m.group(2)
-        # 구버전: "code=039860"
         m = re.match(r'^code=(\d{6})$', token.strip())
         if m:
             return m.group(1), m.group(1)
@@ -99,6 +90,33 @@ def parse_log(path: str) -> list[dict]:
         for line in f:
             line = line.rstrip()
             t = ts(line)
+            
+            # ★ 진입전략 (ENTRY_QTY에서 파싱)
+            m = re_entry_qty.search(line)
+            if m:
+                name, code = extract_code(m.group(1))
+                s = sessions.setdefault(code, {})
+                s["entry_strategy"] = m.group(2)
+                s.setdefault("name", name)
+                continue            
+            # ── 진입전략 감지 (v3 신규) ──
+            m = re_entry_breakout.search(line)
+            if m:
+                _, code = extract_code(m.group(1))
+                sessions.setdefault(code, {})["entry_strategy"] = "BREAKOUT"
+                continue
+
+            m = re_entry_pullback.search(line)
+            if m:
+                _, code = extract_code(m.group(1))
+                sessions.setdefault(code, {})["entry_strategy"] = "PULLBACK"
+                continue
+
+            m = re_entry_flag.search(line)
+            if m:
+                _, code = extract_code(m.group(1))
+                sessions.setdefault(code, {})["entry_strategy"] = "FLAG"
+                continue
 
             # ATR_CALC
             m = re_atr.search(line) or re_atr_old.search(line)
@@ -108,8 +126,8 @@ def parse_log(path: str) -> list[dict]:
                 else:
                     code = m.group(1); name = code
                 sessions.setdefault(code, {})
-                sessions[code]["atr"] = float(m.group(2))
-                sessions[code]["name"] = name
+                sessions[code]["atr"]      = float(m.group(2))
+                sessions[code]["name"]     = name
                 sessions[code]["atr_time"] = t
                 continue
 
@@ -180,8 +198,8 @@ def parse_log(path: str) -> list[dict]:
             if m:
                 _, code = extract_code(m.group(1))
                 if code in sessions:
-                    sessions[code]["exit_pnl_pct"] = float(m.group(3))
-                    sessions[code]["exit_reason_detail"] = "비상손절(-2.5%)"
+                    sessions[code]["exit_pnl_pct"]       = float(m.group(3))
+                    sessions[code]["exit_reason_detail"]  = "비상손절(-2.5%)"
                 continue
 
             # ATR 완성봉 손절
@@ -189,8 +207,8 @@ def parse_log(path: str) -> list[dict]:
             if m:
                 _, code = extract_code(m.group(1))
                 if code in sessions:
-                    sessions[code]["exit_pnl_pct"] = float(m.group(3))
-                    sessions[code]["exit_reason_detail"] = "ATR손절(완성봉)"
+                    sessions[code]["exit_pnl_pct"]       = float(m.group(3))
+                    sessions[code]["exit_reason_detail"]  = "ATR손절(완성봉)"
                 continue
 
             # 타임스탑 pnl
@@ -206,8 +224,8 @@ def parse_log(path: str) -> list[dict]:
             if m:
                 _, code = extract_code(m.group(1))
                 if code in sessions:
-                    sessions[code]["exit_pnl_pct"] = float(m.group(2))
-                    sessions[code]["exit_reason_detail"] = "거래량급감청산"
+                    sessions[code]["exit_pnl_pct"]       = float(m.group(2))
+                    sessions[code]["exit_reason_detail"]  = "거래량급감청산"
                 continue
 
             # 매도체결가 추적
@@ -228,7 +246,7 @@ def parse_log(path: str) -> list[dict]:
                     sessions[code]["sell_time"]   = t
                 continue
 
-            # SELL_DONE → 세션 종료
+            # SELL_DONE -> 세션 종료
             m = re_done.search(line)
             if m:
                 name, code = extract_code(m.group(1))
@@ -310,8 +328,18 @@ def _color_pnl(cell, val):
 # ──────────────────────────────────────────────
 # 3. 거래 상세 시트
 # ──────────────────────────────────────────────
+
+# 진입전략 색상
+STRATEGY_COLORS = {
+    "BREAKOUT": "C55A11",   # 주황
+    "PULLBACK": "0070C0",   # 파랑
+    "FLAG":     "00B050",   # 초록
+}
+
+# 헤더 (col 4에 '진입전략' 삽입 -> 기존 컬럼 1씩 밀림)
 DETAIL_HEADERS = [
     "No", "종목명", "종목코드",
+    "진입전략",                          # col 4 (신규)
     "매수시각", "매수가", "수량", "매수금액",
     "ATR", "손절기준", "TP1목표", "TP2목표",
     "TP1\n체결", "TP2\n체결", "트레일링\n발동",
@@ -320,11 +348,32 @@ DETAIL_HEADERS = [
     "보유시간"
 ]
 
+# 컬럼 인덱스 상수 (1-based)
+COL_STRATEGY  = 4
+COL_ENTRY_T   = 5
+COL_ENTRY_P   = 6
+COL_QTY       = 7
+COL_AMOUNT    = 8
+COL_ATR       = 9
+COL_SL        = 10
+COL_TP1       = 11
+COL_TP2       = 12
+COL_TP1_HIT   = 13
+COL_TP2_HIT   = 14
+COL_TRAIL_HIT = 15
+COL_EXIT_TYPE = 16
+COL_EXIT_T    = 17
+COL_EXIT_P    = 18
+COL_PNL_AMT   = 19
+COL_PNL_PCT   = 20
+COL_HOLD_TIME = 21
+
+
 def build_detail_sheet(ws, trades: list[dict]):
     ws.title = "거래내역"
     ws.sheet_view.showGridLines = True
 
-    col_widths = [5, 16, 10, 18, 9, 7, 13, 8, 9, 9, 9,
+    col_widths = [5, 16, 10, 11, 18, 9, 7, 13, 8, 9, 9, 9,
                   7, 7, 8, 14, 18, 9, 14, 10, 10]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -337,14 +386,17 @@ def build_detail_sheet(ws, trades: list[dict]):
         entry_p = t.get("entry_price", 0)
         qty     = t.get("qty", 0)
 
-        has_tp1   = any(e["type"] == "TP1"         for e in events)
-        has_tp2   = any(e["type"] == "TP2"         for e in events)
-        has_trail = any(e["type"] == "TRAIL"        for e in events)
+        has_tp1   = any(e["type"] == "TP1"   for e in events)
+        has_tp2   = any(e["type"] == "TP2"   for e in events)
+        has_trail = any(e["type"] == "TRAIL" for e in events)
+
+        strategy = t.get("entry_strategy", "-")
 
         row_data = [
             i - 1,
             t.get("name", t.get("code", "")),
             t.get("code", ""),
+            strategy,                                                            # col 4: 진입전략
             t["entry_time"].strftime("%H:%M:%S") if t.get("entry_time") else "",
             entry_p,
             qty,
@@ -353,9 +405,9 @@ def build_detail_sheet(ws, trades: list[dict]):
             t.get("stop_loss", ""),
             t.get("tp1", ""),
             t.get("tp2", ""),
-            "✔" if has_tp1   else "",
-            "✔" if has_tp2   else "",
-            "✔" if has_trail else "",
+            "V" if has_tp1   else "",
+            "V" if has_tp2   else "",
+            "V" if has_trail else "",
             t.get("exit_type", ""),
             t["exit_time"].strftime("%H:%M:%S") if t.get("exit_time") else "",
             t.get("exit_price", ""),
@@ -373,15 +425,22 @@ def build_detail_sheet(ws, trades: list[dict]):
         # 보유시간
         if t.get("entry_time") and t.get("exit_time"):
             secs = int((t["exit_time"] - t["entry_time"]).total_seconds())
-            ws.cell(row=i, column=20, value=f"{secs//60}분 {secs%60}초")
+            ws.cell(row=i, column=COL_HOLD_TIME, value=f"{secs//60}분 {secs%60}초")
 
         # 숫자 포맷
-        for col, fmt in [(5,"#,##0"),(7,"#,##0"),(8,"#,##0.0"),
-                          (9,"#,##0"),(10,"#,##0"),(11,"#,##0"),(17,"#,##0")]:
+        for col, fmt in [
+            (COL_ENTRY_P, "#,##0"),
+            (COL_AMOUNT,  "#,##0"),
+            (COL_ATR,     "#,##0.0"),
+            (COL_SL,      "#,##0"),
+            (COL_TP1,     "#,##0"),
+            (COL_TP2,     "#,##0"),
+            (COL_EXIT_P,  "#,##0"),
+        ]:
             ws.cell(row=i, column=col).number_format = fmt
 
-        pnl_c = ws.cell(row=i, column=18)
-        pct_c = ws.cell(row=i, column=19)
+        pnl_c = ws.cell(row=i, column=COL_PNL_AMT)
+        pct_c = ws.cell(row=i, column=COL_PNL_PCT)
         pnl_c.number_format = '#,##0;(#,##0);"-"'
         pct_c.number_format = '0.00%;(0.00%);"-"'
         _color_pnl(pnl_c, t.get("pnl_amt", 0))
@@ -391,14 +450,20 @@ def build_detail_sheet(ws, trades: list[dict]):
             for col in range(1, len(DETAIL_HEADERS)+1):
                 ws.cell(row=i, column=col).fill = _fill("F5F7FA")
 
-        # ✔ 색상
-        for col, etype in [(12,"TP1"),(13,"TP2"),(14,"TRAIL")]:
+        # 진입전략 색상 (신규)
+        sc = ws.cell(row=i, column=COL_STRATEGY)
+        clr = STRATEGY_COLORS.get(strategy)
+        if clr:
+            sc.font = _font(bold=True, color=clr)
+
+        # V 색상
+        for col in [COL_TP1_HIT, COL_TP2_HIT, COL_TRAIL_HIT]:
             c = ws.cell(row=i, column=col)
-            if c.value == "✔":
+            if c.value == "V":
                 c.font = _font(bold=True, color="00B050")
 
         # 청산유형 색상
-        ec = ws.cell(row=i, column=15)
+        ec = ws.cell(row=i, column=COL_EXIT_TYPE)
         ev = ec.value or ""
         if "손절" in ev:
             ec.font = _font(bold=True, color="FF0000")
@@ -414,7 +479,8 @@ def build_detail_sheet(ws, trades: list[dict]):
     ws.cell(sr, 2, "합   계").font = _font(bold=True, size=9)
     ws.cell(sr, 2).alignment = _align()
 
-    sc = ws.cell(sr, 18, value=f"=SUM(R2:R{last})")
+    pnl_letter = get_column_letter(COL_PNL_AMT)
+    sc = ws.cell(sr, COL_PNL_AMT, value=f"=SUM({pnl_letter}2:{pnl_letter}{last})")
     sc.font = _font(bold=True, size=10)
     sc.number_format = '#,##0;(#,##0);"-"'
     _color_pnl(sc, sum(t.get("pnl_amt", 0) for t in trades))
@@ -425,7 +491,6 @@ def build_detail_sheet(ws, trades: list[dict]):
         ws.cell(sr, col).alignment = _align()
 
     ws.freeze_panes = "A2"
-
 
 
 # ──────────────────────────────────────────────
@@ -442,21 +507,21 @@ COLORS_MAP = {
     "기타":           "808080",
 }
 
+
 def _make_pie(ws, data_ref, label_ref, title, colors_order, w=12.5, h=12):
     from openpyxl.chart.label import DataLabel, DataLabelList
     from openpyxl.chart.layout import Layout
 
     pie = PieChart()
-    pie.style  = 10
+    pie.style = 10
 
-    # 제목 텍스트 설정
     from openpyxl.chart.title import Title
     from openpyxl.chart.text import RichText
     from openpyxl.drawing.text import (RichTextProperties, Paragraph,
                                         ParagraphProperties, RegularTextRun,
                                         CharacterProperties)
     body = RichTextProperties()
-    cp   = CharacterProperties(b=True, sz=1100)  # 11pt bold
+    cp   = CharacterProperties(b=True, sz=1100)
     rtr  = RegularTextRun(t=title, rPr=cp)
     para = Paragraph(r=[rtr], pPr=ParagraphProperties(algn="ctr"))
     rt   = RichText(bodyPr=body, p=[para])
@@ -467,26 +532,22 @@ def _make_pie(ws, data_ref, label_ref, title, colors_order, w=12.5, h=12):
     pie.set_categories(label_ref)
     pie.series[0].title = None
 
-    # 범례 위쪽 배치
     from openpyxl.chart.legend import Legend
     leg = Legend()
-    leg.position = "t"   # top
+    leg.position = "t"
     pie.legend = leg
 
-    # 데이터 레이블: 파이 안에 % 표시
     dll = DataLabelList()
-    dll.showPercent  = True
-    dll.showVal      = False
-    dll.showCatName  = False
-    dll.showSerName  = False
+    dll.showPercent   = True
+    dll.showVal       = False
+    dll.showCatName   = False
+    dll.showSerName   = False
     dll.showLegendKey = False
-    # 레이블 위치: bestFit (파이 조각 안)
     dll.dLblPos = "bestFit"
     from openpyxl.chart.data_source import NumFmt
     dll.numFmt = NumFmt(formatCode="0%", sourceLinked=False)
     pie.series[0].dLbls = dll
 
-    # 색상 적용
     for idx, clr in enumerate(colors_order):
         dp = DataPoint(idx=idx)
         dp.graphicalProperties.solidFill = clr
@@ -501,17 +562,20 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
     ws.title = "요약 & 차트"
     ws.sheet_view.showGridLines = False
 
-    # 열 너비: A(여백) B~E(콘텐츠 4열) F(여백) G~H(보조데이터)
     for col, w in zip("ABCDEFGHIJK", [2, 22, 22, 22, 22, 22, 22, 22, 22, 1, 1]):
         ws.column_dimensions[col].width = w
 
     n        = len(trades)
     det_last = n + 1
 
-    # ── 로고+타이틀 (행 2~3) ──────────────────────────
+    # 진입전략 컬럼 삽입으로 손익금액=S열(19), 수익률=T열(20)
+    pnl_col = get_column_letter(COL_PNL_AMT)   # S
+    pct_col = get_column_letter(COL_PNL_PCT)    # T
+
+    # ── 타이틀 (행 2~3) ──
     ws.merge_cells("B2:F2")
     tc = ws["B2"]
-    tc.value     = "📊 자동매매 일일 성과 보고서"
+    tc.value     = "자동매매 일일 성과 보고서"
     tc.font      = Font(name=FONT_NAME, bold=True, size=16, color="1F3864")
     tc.alignment = _align(h="left")
     ws.row_dimensions[2].height = 36
@@ -523,10 +587,9 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
     sc.font      = _font(size=10, color="595959")
     sc.alignment = _align(h="left")
     ws.row_dimensions[3].height = 16
+    ws.row_dimensions[4].height = 8
 
-    ws.row_dimensions[4].height = 8  # 여백
-
-    # ── KPI 박스 (행 5~6) ─────────────────────────────
+    # ── KPI 박스 (행 5~6) ──
     def kpi(col, label, formula, fmt="#,##0"):
         ws.row_dimensions[5].height = 26
         ws.row_dimensions[6].height = 32
@@ -539,20 +602,23 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
         vl.number_format = fmt; vl.border = _border()
         return vl
 
-    kpi(2, "총 거래 수",   f"=COUNTA('거래내역'!A2:A{det_last})", "#,##0")
-    net_cell = kpi(3, "순 손익 (원)", f"=SUM('거래내역'!R2:R{det_last})", '#,##0;(#,##0);-')
+    kpi(2, "총 거래 수",
+        f"=COUNTA('거래내역'!A2:A{det_last})", "#,##0")
+    net_cell = kpi(3, "순 손익 (원)",
+        f"=SUM('거래내역'!{pnl_col}2:{pnl_col}{det_last})", '#,##0;(#,##0);-')
     kpi(4, "승률",
-        f"=COUNTIF('거래내역'!R2:R{det_last},\">0\")/COUNTA('거래내역'!A2:A{det_last})",
-        "0.0%")
+        f"=COUNTIF('거래내역'!{pnl_col}2:{pnl_col}{det_last},\">0\")"
+        f"/COUNTA('거래내역'!A2:A{det_last})", "0.0%")
     kpi(5, "평균 수익률",
-        f"=AVERAGE('거래내역'!S2:S{det_last})", "0.00%")
+        f"=AVERAGE('거래내역'!{pct_col}2:{pct_col}{det_last})", "0.00%")
+
     net_val = sum(t.get("pnl_amt", 0) for t in trades)
     net_cell.font = Font(name=FONT_NAME, bold=True, size=14,
                          color="0070C0" if net_val >= 0 else "FF0000")
 
-    ws.row_dimensions[7].height = 10  # 여백
+    ws.row_dimensions[7].height = 10
 
-    # ── 청산유형 집계 테이블 (행 8~) ──────────────────
+    # ── 청산유형 집계 테이블 (행 8~) ──
     _apply_header(ws, 8, [2, 3, 4, 5],
                   ["청산유형", "건수", "손익합계(원)", "평균수익률"],
                   bg="2E4057", height=22)
@@ -590,16 +656,49 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
 
     tbl_end   = tbl_start + len(exit_types) - 1
     et_colors = [COLORS_MAP.get(et, "808080") for et in exit_types]
+    ws.row_dimensions[tbl_end + 1].height = 10  # 여백
 
-    ws.row_dimensions[tbl_end + 1].height = 8  # 여백
+    # ── 진입전략별 집계 테이블 (v3 신규) ──────────────
+    strat_hdr = tbl_end + 2
+    _apply_header(ws, strat_hdr, [2, 3, 4, 5],
+                  ["진입전략", "건수", "손익합계(원)", "평균수익률"],
+                  bg="2E5E2E", height=22)
 
-    # ── 이익/손실 요약 바 (테이블 직후) ──────────────
+    strategy_types: dict[str, dict] = {}
+    for t in trades:
+        st = t.get("entry_strategy", "미확인")
+        if st not in strategy_types:
+            strategy_types[st] = {"count": 0, "pnl": 0.0, "pcts": []}
+        strategy_types[st]["count"] += 1
+        strategy_types[st]["pnl"]   += t.get("pnl_amt", 0)
+        strategy_types[st]["pcts"].append(t.get("pnl_pct", 0))
+
+    for ro, (stype, v) in enumerate(strategy_types.items()):
+        r       = strat_hdr + 1 + ro
+        avg_pct = sum(v["pcts"]) / len(v["pcts"]) if v["pcts"] else 0
+        ws.row_dimensions[r].height = 18
+        for col, val in [(2, stype), (3, v["count"]), (4, v["pnl"]), (5, avg_pct)]:
+            c = ws.cell(r, col, value=val)
+            c.font = _font(size=9); c.border = _border(); c.alignment = _align()
+            if ro % 2 == 1:
+                c.fill = _fill("F5F7FA")
+        ws.cell(r, 4).number_format = '#,##0;(#,##0);-'
+        ws.cell(r, 5).number_format = '0.00%;(0.00%);-'
+        _color_pnl(ws.cell(r, 4), v["pnl"])
+        _color_pnl(ws.cell(r, 5), v["pnl"])
+        clr = STRATEGY_COLORS.get(stype, "808080")
+        ws.cell(r, 2).font = _font(bold=True, color=clr)
+
+    strat_end = strat_hdr + len(strategy_types)
+    ws.row_dimensions[strat_end + 1].height = 10  # 여백
+
+    # ── 이익/손실 요약 바 ──
     total_profit = sum(t.get("pnl_amt", 0) for t in trades if t.get("pnl_amt", 0) > 0)
     total_loss   = abs(sum(t.get("pnl_amt", 0) for t in trades if t.get("pnl_amt", 0) < 0))
     net          = total_profit - total_loss
 
-    hdr_row = tbl_end + 2
-    val_row = tbl_end + 3
+    hdr_row = strat_end + 2
+    val_row = strat_end + 3
     ws.row_dimensions[hdr_row].height = 22
     ws.row_dimensions[val_row].height = 26
 
@@ -618,35 +717,32 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
         if col in (3, 4, 5):
             c.number_format = '#,##0;(#,##0);-'
 
-    # ── 보조 데이터 (G/H열, 차트 소스) ──────────────
-    AUX = 7   # G열
+    # ── 보조 데이터 (G/H열, 차트 소스) ──
+    AUX = 7
 
     def aux(row, col, val):
         c = ws.cell(row, col, value=val)
         c.font = _font(size=7, color="EEEEEE")
         c.fill = _fill("FFFFFF")
 
-    # 보조1: 건수
     for ro, (et, v) in enumerate(exit_types.items()):
         aux(2 + ro, AUX, et)
         aux(2 + ro, AUX+1, v["count"])
-    cnt_s = 2;  cnt_e = 2 + len(exit_types) - 1
+    cnt_s = 2; cnt_e = 2 + len(exit_types) - 1
 
-    # 보조2: 손익 절댓값
     base2 = cnt_e + 2
     for ro, (et, v) in enumerate(exit_types.items()):
         aux(base2 + ro, AUX, et)
         aux(base2 + ro, AUX+1, abs(v["pnl"]))
     pnl_s = base2; pnl_e = base2 + len(exit_types) - 1
 
-    # 보조3: 이익 vs 손실
     base3 = pnl_e + 2
     aux(base3,   AUX, "총 이익"); aux(base3,   AUX+1, total_profit)
     aux(base3+1, AUX, "총 손실"); aux(base3+1, AUX+1, total_loss)
 
-    # ── 차트 3개 — 가로로 나란히 (차트 행 = val_row + 2) ──
+    # ── 차트 3개 ──
     chart_row = str(val_row + 2)
-    ws.row_dimensions[val_row + 1].height = 8  # 여백
+    ws.row_dimensions[val_row + 1].height = 8
 
     pie1 = _make_pie(
         ws,
@@ -673,6 +769,7 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
     )
     ws.add_chart(pie3, f"J{chart_row}")
 
+
 # ──────────────────────────────────────────────
 # 5. 메인
 # ──────────────────────────────────────────────
@@ -683,11 +780,18 @@ def main():
     print(f"[파싱] {log_path}")
     trades = parse_log(log_path)
     trades = [t for t in trades if t.get("entry_price") and t.get("exit_time")]
-    print(f"  → 완성된 거래 {len(trades)}건")
+    print(f"  -> 완성된 거래 {len(trades)}건")
 
     if not trades:
         print("분석할 거래가 없습니다.")
         return
+
+    # 진입전략 통계 출력
+    strat_cnt: dict[str, int] = {}
+    for t in trades:
+        s = t.get("entry_strategy", "미확인")
+        strat_cnt[s] = strat_cnt.get(s, 0) + 1
+    print(f"  -> 진입전략: {strat_cnt}")
 
     wb        = Workbook()
     ws_sum    = wb.active

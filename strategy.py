@@ -482,13 +482,17 @@ def get_breakout_position_size(entry_price: float,
 
 def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     """
-    돌파 진입 전략 VER5 — 모멘텀 캔들 필터 추가 (보고서 기반)
+    돌파 진입 전략 VER6 — EMA 간격/이격 필터 추가 (과열·횡보 제거)
 
-    [VER5 변경사항]
+    [VER6 변경사항]
+      + 조건 J: EMA 간격 필터 (ema20-ema60)/ema60 >= 1%
+                → 횡보장 EMA 붙어있는 가짜 돌파 제거
+      + 조건 K: EMA 이격 필터 (close-ema20)/ema20 <= 4%
+                → 이미 많이 오른 과열 종목 고점 물림 제거
+
+    [VER5 유지]
       + 조건 I: 모멘텀 캔들 확인 (_check_momentum_candle)
-                TYPE-A 장대 양봉 또는 TYPE-B 3연속 양봉 중 하나 충족 필수
-                → 즉시 손절 케이스(0~1분) 원천 차단
-      ± 조건 G: 캔들강도 60% → 65% 강화
+      ± 조건 G: 캔들강도 65%
 
     [기존 조건 유지]
       A. EMA 정배열: 종가 > EMA20 > EMA60
@@ -497,9 +501,9 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
       D. MA20 기울기 ≥ 0.3%
       E. 5봉 고점 돌파 + 양봉
       F. 거래량 2~15배 (최소 5,000주)
-      G. 캔들강도 ≥ 65% (강화)
+      G. 캔들강도 ≥ 65%
       H. SR 박스 저항 돌파 확인
-      I. 모멘텀 캔들 확인 (신규)
+      I. 모멘텀 캔들 확인
     """
     if len(candles) < 35:
         if logger:
@@ -554,12 +558,25 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     )
     sr_breakout_ok = (not near_resist) or (c1['close'] > r_hi)
 
-    # I. 모멘텀 캔들 확인 (신규)
+    # I. 모멘텀 캔들 확인
     momentum_ok, momentum_type = _check_momentum_candle(candles)
+
+    # J. EMA 간격 필터 (횡보장 가짜 돌파 제거)
+    # EMA20과 EMA60 사이가 최소 1% 이상 벌어진 강한 추세만 허용
+    # EMA가 붙어있는 횡보 구간에서 나오는 돌파는 false breakout 가능성 높음
+    ema_gap_pct    = (ema20 - ema60) / ema60 * 100 if ema60 > 0 else 0
+    ema_gap_ok     = ema_gap_pct >= 1.0
+
+    # K. EMA 이격 필터 (과열 고점 물림 제거)
+    # 종가가 EMA20 대비 4% 이상 벌어진 과열 구간은 진입 금지
+    # 이미 많이 오른 종목에 뒤늦게 올라타는 케이스 차단
+    ema_dist_pct   = (c1['close'] - ema20) / ema20 * 100 if ema20 > 0 else 0
+    ema_dist_ok    = ema_dist_pct <= 4.0
 
     is_valid = (ema_aligned and rsi_ok and macd_ok and trend_ok and
                 price_ok and vol_ok and str_ok and
-                sr_breakout_ok and momentum_ok)
+                sr_breakout_ok and momentum_ok and
+                ema_gap_ok and ema_dist_ok)
 
     if logger:
         str_pct = body / rng * 100 if rng > 0 else 0
@@ -569,6 +586,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
                 f"종가:{c1['close']} EMA20:{ema20:.0f} EMA60:{ema60:.0f} | "
                 f"RSI:{rsi14:.1f} MACD:{macd_l:.2f}>{macd_s:.2f} | "
                 f"기울기:{slope:.2f}% | "
+                f"EMA간격:{ema_gap_pct:.2f}%(≥1%) EMA이격:{ema_dist_pct:.2f}%(≤4%) | "
                 f"5봉고점돌파:{prev_5_high} | "
                 f"거래량:{c1['volume']}(평균의 {vol_ratio:.1f}배) | "
                 f"SR저항돌파:{sr_breakout_ok}(저항박스:{r_lo}~{r_hi}) | "
@@ -585,7 +603,9 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
                 f"vol={vol_ok}({vol_ratio:.1f}배) "
                 f"strength={str_ok}({str_pct:.0f}%≥65%) "
                 f"sr_break={sr_breakout_ok} "
-                f"momentum={momentum_ok}({momentum_type})"
+                f"momentum={momentum_ok}({momentum_type}) "
+                f"ema_gap={ema_gap_ok}({ema_gap_pct:.2f}%≥1%) "
+                f"ema_dist={ema_dist_ok}({ema_dist_pct:.2f}%≤4%)"
             )
 
     return is_valid

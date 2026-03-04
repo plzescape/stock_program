@@ -410,8 +410,11 @@ class KiwoomAPI(QAxWidget):
         # 최신봉 제외한 완성봉들
         completed_candles = candles[1:] if len(candles) > 1 else []
 
-        # === ENTRY 판정: 돌파 / 눌림목 / 깃발 패턴 ===
-        # 우선순위 : 1. 눌림목 2. 깃발 3. 돌파
+        # === ENTRY 판정: 눌림목 → 깃발 → 돌파 순으로 확인 ===
+        # 우선순위 변경 이유:
+        #   PULLBACK: 추세 조정 후 재진입 → 승률 높고 슬리피지 적음
+        #   FLAG    : 횡보 수렴 후 재돌파 → 패턴 명확, 손절선 뚜렷
+        #   BREAKOUT: 신고점 돌파 → 체결 많지만 고점 물림 위험 → 마지막 확인
         entry_type = None
         if len(completed_candles) >= 35:
             if is_pullback_entry(completed_candles, self.log_signal, code):

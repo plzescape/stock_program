@@ -56,8 +56,24 @@ CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
 # 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "분봉급등주", "DANTA_1", "DANTA_2, CHUSAE_INDICATE"
+# CONDITION_NAME: 단일 fallback (CONDITION_NAMES가 비어 있을 때 사용)
 CONDITION_NAME = "분봉급등주"
-# CONDITION_INDEX = 0
+
+# CONDITION_NAMES: 라운드로빈으로 순환할 조건검색식 목록
+# - 매 주기(CONDITION_INTERVAL_MIN)마다 목록에서 하나씩 순서대로 호출
+# - 각 조건식은 담당 전략에 특화된 종목을 유입시키는 역할
+#   "분봉급등주"          → BREAKOUT (급등 돌파)
+#   "급등주_주도주"        → BREAKOUT (주도주 돌파)
+#   "급등주_눌림목_검색식"  → PULLBACK (눌림 반등)
+#   "상승_깃발_패턴"       → FLAG     (횡보 수렴 재돌파)
+# - 키움 API 제약: 스크린 하나에 조건식 하나만 실시간 등록 가능
+#   → 조건식 4개를 스크린 9001~9004에 각각 고정 매핑
+CONDITION_NAMES = [
+    "분봉급등주",
+    "급등주_주도주",
+    "급등주_눌림목_검색식",
+    "상승_깃발_패턴",
+]
 
 # ===== 스캔 설정 =====
 SCAN_MAX_CODES = 30        # 조건검색 결과 중 최대 몇 종목만 스캔할지

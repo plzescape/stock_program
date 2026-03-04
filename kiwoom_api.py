@@ -19,7 +19,7 @@ from config import (
     CANDLE_SL_ENABLED, EMERGENCY_SL_RATE,
     ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT, ATR_SAFE_MULT, ATR_TRAIL_MULT,
     MAX_TRADES_PER_DAY, CONDITION_INTERVAL_MIN,
-    CONDITION_NAME, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
+    CONDITION_NAME, CONDITION_NAMES, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
     MAX_POSITIONS, TOTAL_BUDGET,
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
@@ -150,6 +150,13 @@ class KiwoomAPI(QAxWidget):
         self._scan_running = False
         self.tr_inflight = False
         self.current_scan_code = None
+
+        # ---- 다중 조건검색식 라운드로빈 ----
+        # CONDITION_NAMES 목록을 한 칸씩 순환하며 조건검색 호출
+        # 키움 API: 스크린 하나에 조건식 하나만 실시간 등록 가능
+        # → 조건식 4개를 스크린 9001~9004에 각각 매핑
+        self._cond_rr_idx        = 0      # 다음 호출할 조건식 인덱스
+        self._cond_screen_base   = 9001   # 스크린 시작 번호
         self._screen_seq = 0
         self._order_screen_seq = 0   # 주문 전용 화면번호 시퀀스
         self.TR_TIMEOUT_MS = 2000
@@ -208,20 +215,48 @@ class KiwoomAPI(QAxWidget):
                 return
         self._last_condition_run = now
 
-        idx = self.condition_map.get(CONDITION_NAME)
-        if idx is None:
-            self.log_system.error(f"[CONDITION] 조건식 없음: {CONDITION_NAME}")
+        # ── 다중 조건검색식 라운드로빈 ──────────────────────────────
+        # CONDITION_NAMES 목록을 순환하며 매 호출마다 다음 조건식 하나 실행
+        # 비어 있으면 CONDITION_NAME(단일) fallback
+        names = CONDITION_NAMES if CONDITION_NAMES else [CONDITION_NAME]
+        n = len(names)
+
+        # 로드된 조건식 중 다음 순번 선택 (미로드 조건식 건너뜀)
+        cond_to_run = None
+        for _ in range(n):
+            candidate = names[self._cond_rr_idx % n]
+            self._cond_rr_idx = (self._cond_rr_idx + 1) % n
+            if self.condition_map.get(candidate) is not None:
+                cond_to_run = candidate
+                break
+
+        if cond_to_run is None:
+            self.log_system.error(
+                f"[CONDITION] 유효한 조건식 없음 (목록={names}, "
+                f"로드된 조건식={list(self.condition_map.keys())})"
+            )
             return
+
+        cond_idx  = self.condition_map[cond_to_run]
+        # 조건식별 고정 스크린 번호 (9001, 9002, 9003, 9004)
+        screen_no = str(self._cond_screen_base + (names.index(cond_to_run) % n))
 
         ret = self.dynamicCall(
             "SendCondition(QString, QString, int, int)",
-            "9000", CONDITION_NAME, idx, 1
+            screen_no, cond_to_run, cond_idx, 1
         )
 
+        next_idx = self._cond_rr_idx % n
         if ret == 1:
-            self.log_system.info("[CONDITION] 조건검색 요청 성공")
+            self.log_system.info(
+                f"[CONDITION] 조건검색 요청 성공: '{cond_to_run}' "
+                f"(screen={screen_no}, "
+                f"다음순번={names[next_idx] if n>1 else '-'})"
+            )
         else:
-            self.log_system.error("[CONDITION] 조건검색 요청 실패")
+            self.log_system.error(
+                f"[CONDITION] 조건검색 요청 실패: '{cond_to_run}'"
+            )
 
 
     def self_check(self, phase: str) -> bool:
@@ -470,7 +505,8 @@ class KiwoomAPI(QAxWidget):
 
                 self.log_trade.info(
                     f"[ENTRY_QTY] {self.cn(code)} 현재가={cur_price} "
-                    f"전략={entry_type} 모드={BUY_MODE} 수량={buy_qty}주 금액={est_amount:,}원 "
+                    f"전략={entry_type} 조건식='{info.get("cond_name","?")}' "
+                    f"모드={BUY_MODE} 수량={buy_qty}주 금액={est_amount:,}원 "
                     f"잔여예산={remaining:,}원"
                 )
 
@@ -1896,12 +1932,13 @@ class KiwoomAPI(QAxWidget):
                 "state": "NEW",
                 "retry": 0,
                 "added_at": datetime.now(),
+                "cond_name": cond_name,   # 어느 조건식에서 잡혔는지 추적
             }
 
             # ⭐ 버그 수정: 중복 추가 방지
             if code not in self.scan_queue:
                 self.scan_queue.append(code)
-            self.log_signal.info(f"[COND_IN] {self.cn(code)}")
+            self.log_signal.info(f"[COND_IN] {self.cn(code)} cond='{cond_name}'")
 
         # 🔥 스캔 트리거 조건
         if (
@@ -1964,13 +2001,14 @@ class KiwoomAPI(QAxWidget):
                     "retry": 0,
                     "last_try": None,
                     "added_at": datetime.now(),
+                    "cond_name": cond_name,   # 어느 조건식에서 잡혔는지 추적
                 }
 
                 self.scan_queue.append(code)
-                self.log_signal.info(f"[COND_IN] {self.cn(code)}")
+                self.log_signal.info(f"[COND_IN] {self.cn(code)} cond='{cond_name}'")
                 self.log_trade.info(
-                    f"[CANDIDATE_ADD] {self.cn(code)} 큐크기={len(self.scan_queue)} "
-                    f"스캔중={self._scan_running}"
+                    f"[CANDIDATE_ADD] {self.cn(code)} cond='{cond_name}' "
+                    f"큐크기={len(self.scan_queue)} 스캔중={self._scan_running}"
                 )
 
             # ⭐ 공통 스캔 트리거 (신규 + 재편입 모두)

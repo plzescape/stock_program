@@ -411,14 +411,15 @@ class KiwoomAPI(QAxWidget):
         completed_candles = candles[1:] if len(candles) > 1 else []
 
         # === ENTRY 판정: 돌파 / 눌림목 / 깃발 패턴 ===
+        # 우선순위 : 1. 눌림목 2. 깃발 3. 돌파
         entry_type = None
         if len(completed_candles) >= 35:
-            if is_entry_candidate_VER2(completed_candles, self.log_signal, code):
-                entry_type = "BREAKOUT"
-            elif is_pullback_entry(completed_candles, self.log_signal, code):
+            if is_pullback_entry(completed_candles, self.log_signal, code):
                 entry_type = "PULLBACK"
             elif is_flag_entry(completed_candles, self.log_signal, code):
                 entry_type = "FLAG"
+            elif is_entry_candidate_VER2(completed_candles, self.log_signal, code):
+                entry_type = "BREAKOUT"
 
         if entry_type and len(self.positions) < MAX_POSITIONS:
                 # ── 매수수량 계산: BUY_MODE에 따라 분기 ──

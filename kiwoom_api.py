@@ -25,12 +25,7 @@ from config import (
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
 )
 from logger_util import setup_logger
-from strategy import (
-    is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data,
-    is_pullback_entry, get_pullback_signal_data,
-    is_flag_entry, get_flag_signal_data,
-    calc_breakout_stops, get_breakout_position_size,   # BREAKOUT 개선 함수 (v4)
-)
+from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data
 
 
 @dataclass
@@ -492,47 +487,12 @@ class KiwoomAPI(QAxWidget):
                     f"(14분봉 기준, SL배수={ATR_SL_MULT}, TP배수={ATR_TP_MULT})"
                 )
 
-                # ── BREAKOUT 전용: 개선된 손절/TP 계산 ──────────────────────
-                # calc_breakout_stops(): ATR×1.5 vs 저항선 직하단 중 더 타이트한 값
-                # TP1=ATR×2(빠른 절반 익절), TP2=ATR×5(트레일링 위임)
-                breakout_stops = None
-                if entry_type == "BREAKOUT" and atr_val > 0:
-                    breakout_stops = calc_breakout_stops(
-                        entry_price = cur_price,
-                        atr         = atr_val,
-                        candles     = completed_candles,
-                        logger      = self.log_trade,
-                        code        = code,
-                    )
-                    # 손절폭 기준 수량 재산출 (계좌 1% 손실 한도)
-                    risk_qty = get_breakout_position_size(
-                        entry_price     = cur_price,
-                        stop_loss       = breakout_stops["stop_loss"],
-                        account_balance = TOTAL_BUDGET,
-                        risk_pct        = 0.01,
-                    )
-                    # 기존 buy_qty(금액 기준)와 위험관리 수량 중 작은 값 사용
-                    if risk_qty > 0 and risk_qty < buy_qty:
-                        self.log_trade.info(
-                            f"[BREAKOUT_QTY_ADJ] {self.cn(code)} "
-                            f"금액기준={buy_qty}주 → 위험관리={risk_qty}주 "
-                            f"(손절={breakout_stops['stop_loss']:,} "
-                            f"SL폭={breakout_stops['sl_pct']:.2f}%)"
-                        )
-                        buy_qty    = risk_qty
-                        est_amount = cur_price * buy_qty
-
                 self.send_market_order("BUY", code, buy_qty, "ENTRY")
                 # 예산 추적용
                 if code in self.pending_orders:
                     self.pending_orders[code]["est_amount"] = est_amount
                     self.pending_orders[code]["entry_type"] = entry_type
                     self.pending_orders[code]["atr_value"]  = atr_val   # ← ATR 저장
-                    # BREAKOUT: 개선된 stops 저장 (BUY_FILL_NEW에서 꺼내 씀)
-                    if breakout_stops:
-                        self.pending_orders[code]["breakout_sl"]  = breakout_stops["stop_loss"]
-                        self.pending_orders[code]["breakout_tp1"] = breakout_stops["tp1"]
-                        self.pending_orders[code]["breakout_tp2"] = breakout_stops["tp2"]
                     # FLAG 전용 손절가: signal_data의 base_stop 값
                     if entry_type == "FLAG" and code in self._entry_signals:
                         self.pending_orders[code]["flag_stop_price"] = \
@@ -647,21 +607,15 @@ class KiwoomAPI(QAxWidget):
                 atr = float(pend.get("atr_value", 0.0))
                 pos.atr_value = atr
                 if atr > 0:
-                    # BREAKOUT: 진입 전 calc_breakout_stops()로 미리 계산한 값 사용
-                    #   - 손절: ATR×1.5 vs 저항선 직하단 중 더 타이트한 값
-                    #   - TP1 : ATR×2 (빠른 절반 익절 → TP 도달률 향상)
-                    #   - TP2 : ATR×5 (트레일링 스탑 위임 → 추세 끝까지 보유)
-                    if pos.entry_type == "BREAKOUT" and pend.get("breakout_sl"):
-                        pos.atr_sl_price   = self.adjust_tick_size(max(1, pend["breakout_sl"]))
-                        pos.atr_tp1_price  = self.adjust_tick_size(pend["breakout_tp1"])
-                        pos.atr_tp2_price  = self.adjust_tick_size(pend["breakout_tp2"])
-                        pos.atr_safe_price = self.adjust_tick_size(max(1, int(price - atr * ATR_SAFE_MULT)))
-                    else:
-                        # PULLBACK / FLAG: 기존 ATR 배수 계산 유지
-                        pos.atr_sl_price   = self.adjust_tick_size(max(1, int(price - atr * ATR_SL_MULT)))
-                        pos.atr_tp1_price  = self.adjust_tick_size(int(price + atr * ATR_TP_MULT))
-                        pos.atr_tp2_price  = pos.atr_tp1_price   # TP1 체결 시 고점 기준으로 갱신됨
-                        pos.atr_safe_price = self.adjust_tick_size(max(1, int(price - atr * ATR_SAFE_MULT)))
+                    pos.atr_sl_price   = self.adjust_tick_size(max(1, int(price - atr * ATR_SL_MULT)))
+                    pos.atr_tp1_price  = self.adjust_tick_size(int(price + atr * ATR_TP_MULT))
+                    pos.atr_tp2_price  = pos.atr_tp1_price   # TP1 체결 시 고점 기준으로 갱신됨
+                    # BUG-FIX: safe_price는 반드시 매수가(entry_price) 이상이어야 함
+                    # 기존: price - ATR×SAFE_MULT → ATR이 크면 매수가 아래로 내려가 손절 유발
+                    # 수정: max(entry_price, price - ATR×SAFE_MULT)
+                    pos.atr_safe_price = self.adjust_tick_size(
+                        max(pos.entry_price, int(price - atr * ATR_SAFE_MULT))
+                    )
 
             # --------------------------------------------------
             # ✅ 체결수량 처리(중요):
@@ -1033,7 +987,10 @@ class KiwoomAPI(QAxWidget):
         # TP1 시장가 익절 (ATR 기반 목표가 도달 시)
         # =========================
         tp1_target = pos.atr_tp1_price if pos.atr_tp1_price > 0 else self.adjust_tick_size(int(pos.entry_price * 1.02))
-        if not pos.tp1_done and cur >= tp1_target:
+        # BUG-FIX: 분할체결 완료 전 TP1 발동 금지
+        # 전량체결(BUY_DONE) 전에 TP1이 발동되면 TP_TARGET_SET이 건너뛰어져
+        # atr_safe_price=0 상태에서 fallback safe_price로 즉시 본절보호가 발동됨
+        if not pos.tp1_done and pos.buy_done and cur >= tp1_target:
             if not self.can_try_sell(pos):
                 return
             # TP1 수량 계산 (총 수량이 3주 이하면 분할 없이 전량 매도)
@@ -1079,7 +1036,10 @@ class KiwoomAPI(QAxWidget):
         # 본절 보호: TP1 후 atr_safe_price 이하로 밀리면 탈출
         # (매수가 - ATR × ATR_SAFE_MULT)
         # =========================
-        safe_price = pos.atr_safe_price if pos.atr_safe_price > 0 else int(pos.entry_price * 1.005)
+        # BUG-FIX: fallback safe_price도 entry_price 이상 보장
+        # 기존 fallback entry×1.005가 entry보다 높아 TP1 직후 즉시 본절보호 발동하는 버그 수정
+        _raw_safe = pos.atr_safe_price if pos.atr_safe_price > 0 else pos.entry_price
+        safe_price = max(pos.entry_price, _raw_safe)
         if pos.tp1_done and cur <= safe_price:
             if self.can_try_sell(pos):
                 self.log_trade.info(

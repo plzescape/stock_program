@@ -480,7 +480,7 @@ def get_breakout_position_size(entry_price: float,
 # 전략 1: BREAKOUT (돌파 진입) VER5 — 모멘텀 필터 추가
 # ==================================================
 
-def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
+def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bool:
     """
     돌파 진입 전략 VER6 — EMA 간격/이격 필터 추가 (과열·횡보 제거)
 
@@ -561,6 +561,13 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
     # I. 모멘텀 캔들 확인
     momentum_ok, momentum_type = _check_momentum_candle(candles)
 
+    # L. 신호봉 진행률 필터 (고점 물림 방지)
+    # 현재봉이 이미 상승 후반부(70%+)면 다음봉 눌림 손절 가능성 높음
+    # body_progress = (close - open) / (high - open) : 봉 고가 대비 현재 도달률
+    h_o = c1['high'] - c1['open']
+    candle_progress = (c1['close'] - c1['open']) / h_o if h_o > 0 else 1.0
+    progress_ok = candle_progress <= 0.70   # 70% 이하만 허용
+
     # J. EMA 간격 필터 (횡보장 가짜 돌파 제거)
     # EMA20과 EMA60 사이가 최소 1% 이상 벌어진 강한 추세만 허용
     # EMA가 붙어있는 횡보 구간에서 나오는 돌파는 false breakout 가능성 높음
@@ -569,14 +576,16 @@ def is_entry_candidate_VER2(candles, logger=None, code=None) -> bool:
 
     # K. EMA 이격 필터 (과열 고점 물림 제거)
     # 종가가 EMA20 대비 4% 이상 벌어진 과열 구간은 진입 금지
-    # 이미 많이 오른 종목에 뒤늦게 올라타는 케이스 차단
+    # strict=True(CHUSAE_INDICATE 등 품질 낮은 조건식): 2.5%로 강화
     ema_dist_pct   = (c1['close'] - ema20) / ema20 * 100 if ema20 > 0 else 0
-    ema_dist_ok    = ema_dist_pct <= 4.0
+    _dist_limit    = 2.5 if strict else 4.0
+    ema_dist_ok    = ema_dist_pct <= _dist_limit
 
     is_valid = (ema_aligned and rsi_ok and macd_ok and trend_ok and
                 price_ok and vol_ok and str_ok and
                 sr_breakout_ok and momentum_ok and
-                ema_gap_ok and ema_dist_ok)
+                ema_gap_ok and ema_dist_ok and
+                progress_ok)
 
     if logger:
         str_pct = body / rng * 100 if rng > 0 else 0

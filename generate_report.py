@@ -62,13 +62,16 @@ def parse_log(path: str) -> list[dict]:
     re_candle = re.compile(r"\[STOP_LOSS_CANDLE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+완성봉 ATR손절 종가:(\d+)\s+손절기준:\d+\s+pnl=([-\d.]+)")
     re_time   = re.compile(r"\[TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+보유=\d+초\s+매도수량=\d+주\s+pnl=([-\d.]+)")
     re_vol    = re.compile(r"\[VOL_TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+구간=\S+\s+매도수량=\d+주.*pnl=([-\d.]+)")
-    re_chejan = re.compile(r"\[CHEJAN\]\s+-매도\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)")
-    re_entry_qty = re.compile(r"\[ENTRY_QTY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+.*?전략=(BREAKOUT|PULLBACK|FLAG)")
+    # 매도 CHEJAN: price + qty (가중평균 체결가 계산용)
+    re_chejan     = re.compile(r"\[CHEJAN\]\s+-매도\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)(?:\s+qty=(\d+))?")
+    # 매수 CHEJAN: price + qty (가중평균 매수가 재계산용)
+    re_chejan_buy = re.compile(r"\[CHEJAN\]\s+\+매수\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)(?:\s+qty=(\d+))?")
 
-    # ── 진입전략 정규식 (v3 신규) ──
-    re_entry_breakout = re.compile(r"\[ENTRY_CONFIRMED\]\s+(.+?\(\d{6}\)|code=\d{6})")
-    re_entry_pullback = re.compile(r"\[PULLBACK_CONFIRMED\]\s+(.+?\(\d{6}\)|code=\d{6})")
-    re_entry_flag     = re.compile(r"\[FLAG_CONFIRMED\]\s+(.+?\(\d{6}\)|code=\d{6})")
+    # ── 진입전략 정규식: ENTRY_QTY 로그에서 전략명 파싱 ──
+    # 형식: [ENTRY_QTY] 종목명(코드) 현재가=N 전략=BREAKOUT|PULLBACK|FLAG ...
+    re_entry_qty = re.compile(
+        r"\[ENTRY_QTY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+현재가=\d+\s+전략=(BREAKOUT|PULLBACK|FLAG)"
+    )
 
     def extract_code(token: str):
         m = re.match(r'^(.+?)\((\d{6})\)$', token.strip())
@@ -90,32 +93,12 @@ def parse_log(path: str) -> list[dict]:
         for line in f:
             line = line.rstrip()
             t = ts(line)
-            
-            # ★ 진입전략 (ENTRY_QTY에서 파싱)
+
+            # ── 진입전략 감지: ENTRY_QTY 로그 파싱 ──
             m = re_entry_qty.search(line)
             if m:
-                name, code = extract_code(m.group(1))
-                s = sessions.setdefault(code, {})
-                s["entry_strategy"] = m.group(2)
-                s.setdefault("name", name)
-                continue            
-            # ── 진입전략 감지 (v3 신규) ──
-            m = re_entry_breakout.search(line)
-            if m:
                 _, code = extract_code(m.group(1))
-                sessions.setdefault(code, {})["entry_strategy"] = "BREAKOUT"
-                continue
-
-            m = re_entry_pullback.search(line)
-            if m:
-                _, code = extract_code(m.group(1))
-                sessions.setdefault(code, {})["entry_strategy"] = "PULLBACK"
-                continue
-
-            m = re_entry_flag.search(line)
-            if m:
-                _, code = extract_code(m.group(1))
-                sessions.setdefault(code, {})["entry_strategy"] = "FLAG"
+                sessions.setdefault(code, {})["entry_strategy"] = m.group(2)
                 continue
 
             # ATR_CALC
@@ -139,6 +122,19 @@ def parse_log(path: str) -> list[dict]:
                 s["entry_price"] = int(m.group(2))
                 s["entry_time"]  = t
                 s.setdefault("name", name)
+                continue
+
+            # 매수 CHEJAN → 가중평균 매수가 추적
+            m = re_chejan_buy.search(line)
+            if m:
+                _, code = extract_code(m.group(1))
+                if code in sessions:
+                    bp  = int(m.group(2))
+                    bq  = int(m.group(3)) if m.group(3) else 1
+                    s2  = sessions[code]
+                    s2["_buy_price_sum"] = s2.get("_buy_price_sum", 0) + bp * bq
+                    s2["_buy_qty_sum"]   = s2.get("_buy_qty_sum",   0) + bq
+                    s2["entry_price"]    = s2["_buy_price_sum"] // s2["_buy_qty_sum"]
                 continue
 
             # BUY_DONE qty
@@ -228,12 +224,17 @@ def parse_log(path: str) -> list[dict]:
                     sessions[code]["exit_reason_detail"]  = "거래량급감청산"
                 continue
 
-            # 매도체결가 추적
+            # 매도체결가 추적 → 가중평균 체결가 계산
             m = re_chejan.search(line)
             if m:
                 _, code = extract_code(m.group(1))
                 if code in sessions:
-                    sessions[code]["exit_price"] = int(m.group(2))
+                    sp  = int(m.group(2))
+                    sq  = int(m.group(3)) if m.group(3) else 1
+                    s2  = sessions[code]
+                    s2["_sell_price_sum"] = s2.get("_sell_price_sum", 0) + sp * sq
+                    s2["_sell_qty_sum"]   = s2.get("_sell_qty_sum",   0) + sq
+                    s2["exit_price"]      = s2["_sell_price_sum"] // s2["_sell_qty_sum"]
                 continue
 
             # ORDER_TRY SELL
@@ -277,16 +278,28 @@ def parse_log(path: str) -> list[dict]:
                     else:
                         s["exit_type"] = reason or "기타"
 
-                # 손익
+                # ── 손익 계산 (수수료/세금 반영) ─────────────────────
+                # 실제 손익 = (매도금액 - 매수금액) - 거래비용
+                # 거래비용 = 수수료(매수 0.015% + 매도 0.015%)
+                #           + 거래세 0.18% + 농특세 0.036%
+                #           = 총 0.246% (키움증권 기준)
+                # exit_pnl_pct(TIME_STOP 등)도 실제 체결가 기반으로 재계산
                 ep  = s.get("entry_price", 0)
                 xp  = s.get("exit_price", ep)
                 qty = s.get("qty", 0)
-                if "exit_pnl_pct" in s:
-                    s["pnl_pct"] = s["exit_pnl_pct"]
-                    s["pnl_amt"] = int(s["pnl_pct"] * ep * qty)
-                else:
-                    s["pnl_pct"] = (xp - ep) / ep if ep else 0
-                    s["pnl_amt"] = (xp - ep) * qty
+
+                gross_pnl = (xp - ep) * qty          # 세전 손익
+                buy_fee   = round(ep * qty * 0.00015) # 매수 수수료 0.015%
+                sell_fee  = round(xp * qty * 0.00015) # 매도 수수료 0.015%
+                tx_tax    = round(xp * qty * 0.0018)  # 거래세 0.18%
+                agri_tax  = round(xp * qty * 0.00036) # 농특세 0.036%
+                total_fee = buy_fee + sell_fee + tx_tax + agri_tax
+
+                net_pnl       = gross_pnl - total_fee
+                s["pnl_amt"]   = net_pnl
+                s["pnl_pct"]   = net_pnl / (ep * qty) if (ep and qty) else 0
+                s["gross_pnl"] = gross_pnl
+                s["total_fee"] = total_fee
 
                 closed.append(s)
 
@@ -344,7 +357,7 @@ DETAIL_HEADERS = [
     "ATR", "손절기준", "TP1목표", "TP2목표",
     "TP1\n체결", "TP2\n체결", "트레일링\n발동",
     "청산유형", "청산시각", "청산가",
-    "손익금액(원)", "수익률(%)",
+    "손익금액\n(수수료후)", "거래비용\n(원)", "수익률(%)",
     "보유시간"
 ]
 
@@ -365,8 +378,9 @@ COL_EXIT_TYPE = 16
 COL_EXIT_T    = 17
 COL_EXIT_P    = 18
 COL_PNL_AMT   = 19
-COL_PNL_PCT   = 20
-COL_HOLD_TIME = 21
+COL_FEE       = 20   # 거래비용(수수료+세금)
+COL_PNL_PCT   = 21
+COL_HOLD_TIME = 22
 
 
 def build_detail_sheet(ws, trades: list[dict]):
@@ -374,7 +388,7 @@ def build_detail_sheet(ws, trades: list[dict]):
     ws.sheet_view.showGridLines = True
 
     col_widths = [5, 16, 10, 11, 18, 9, 7, 13, 8, 9, 9, 9,
-                  7, 7, 8, 14, 18, 9, 14, 10, 10]
+                  7, 7, 8, 14, 18, 9, 14, 12, 10, 10]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -412,6 +426,7 @@ def build_detail_sheet(ws, trades: list[dict]):
             t["exit_time"].strftime("%H:%M:%S") if t.get("exit_time") else "",
             t.get("exit_price", ""),
             t.get("pnl_amt", 0),
+            t.get("total_fee", 0),          # 거래비용(수수료+세금)
             t.get("pnl_pct", 0),
             "",
         ]
@@ -440,10 +455,14 @@ def build_detail_sheet(ws, trades: list[dict]):
             ws.cell(row=i, column=col).number_format = fmt
 
         pnl_c = ws.cell(row=i, column=COL_PNL_AMT)
+        fee_c = ws.cell(row=i, column=COL_FEE)
         pct_c = ws.cell(row=i, column=COL_PNL_PCT)
         pnl_c.number_format = '#,##0;(#,##0);"-"'
+        fee_c.number_format = '#,##0'
         pct_c.number_format = '0.00%;(0.00%);"-"'
         _color_pnl(pnl_c, t.get("pnl_amt", 0))
+        # 거래비용은 항상 회색 (비용이므로)
+        fee_c.font = _font(size=9, color="808080")
         _color_pnl(pct_c, t.get("pnl_amt", 0))
 
         if i % 2 == 0:
@@ -508,7 +527,7 @@ COLORS_MAP = {
 }
 
 
-def _make_pie(ws, data_ref, label_ref, title, colors_order, w=12.5, h=12):
+def _make_pie(ws, data_ref, label_ref, title, colors_order, w=13, h=14):
     from openpyxl.chart.label import DataLabel, DataLabelList
     from openpyxl.chart.layout import Layout
 
@@ -534,7 +553,7 @@ def _make_pie(ws, data_ref, label_ref, title, colors_order, w=12.5, h=12):
 
     from openpyxl.chart.legend import Legend
     leg = Legend()
-    leg.position = "t"
+    leg.position = "b"   # 하단 배치 → 제목과 겹침 방지
     pie.legend = leg
 
     dll = DataLabelList()
@@ -543,7 +562,7 @@ def _make_pie(ws, data_ref, label_ref, title, colors_order, w=12.5, h=12):
     dll.showCatName   = False
     dll.showSerName   = False
     dll.showLegendKey = False
-    dll.dLblPos = "bestFit"
+    dll.dLblPos = "outEnd"   # 파이 바깥쪽 배치 → 겹침 방지
     from openpyxl.chart.data_source import NumFmt
     dll.numFmt = NumFmt(formatCode="0%", sourceLinked=False)
     pie.series[0].dLbls = dll
@@ -717,6 +736,21 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
         if col in (3, 4, 5):
             c.number_format = '#,##0;(#,##0);-'
 
+    # ── 거래비용 요약 행 ──
+    total_fee_all = sum(t.get("total_fee", 0) for t in trades)
+    total_gross   = sum(t.get("gross_pnl", 0) for t in trades)
+    fee_row = val_row + 1
+    ws.row_dimensions[fee_row].height = 18
+    fee_labels = ["거래비용 내역", f"세전손익: {total_gross:+,}원",
+                  f"총비용: -{total_fee_all:,}원",
+                  f"순손익: {net:+,}원"]
+    for col, val in enumerate(fee_labels, 2):
+        c = ws.cell(fee_row, col, value=val)
+        c.font      = _font(size=8, color="595959")
+        c.fill      = _fill("F5F7FA")
+        c.alignment = _align(h="center")
+        c.border    = _border()
+
     # ── 보조 데이터 (G/H열, 차트 소스) ──
     AUX = 7
 
@@ -741,8 +775,9 @@ def build_summary_sheet(ws, ws_detail, trades: list[dict]):
     aux(base3+1, AUX, "총 손실"); aux(base3+1, AUX+1, total_loss)
 
     # ── 차트 3개 ──
-    chart_row = str(val_row + 2)
-    ws.row_dimensions[val_row + 1].height = 8
+    # fee_row(거래비용 요약) 다음 행부터 차트 배치
+    ws.row_dimensions[fee_row + 1].height = 8   # 여백
+    chart_row = str(fee_row + 2)
 
     pie1 = _make_pie(
         ws,

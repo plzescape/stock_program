@@ -452,11 +452,19 @@ class KiwoomAPI(QAxWidget):
         #   BREAKOUT: 신고점 돌파 → 체결 많지만 고점 물림 위험 → 마지막 확인
         entry_type = None
         if len(completed_candles) >= 35:
+            # CHUSAE_INDICATE 조건식은 품질 낮은 종목 다수 포함
+            # → BREAKOUT 판정 시 EMA이격 기준 2.5%로 강화 (strict 모드)
+            _cname_chk   = info.get("cond_name", "")
+            _strict_mode = (_cname_chk == "CHUSAE_INDICATE")
+
             if is_pullback_entry(completed_candles, self.log_signal, code):
                 entry_type = "PULLBACK"
             elif is_flag_entry(completed_candles, self.log_signal, code):
                 entry_type = "FLAG"
-            elif is_entry_candidate_VER2(completed_candles, self.log_signal, code):
+            elif is_entry_candidate_VER2(
+                completed_candles, self.log_signal, code,
+                strict=_strict_mode      # CHUSAE 시 이격 기준 강화
+            ):
                 entry_type = "BREAKOUT"
 
         if entry_type and len(self.positions) < MAX_POSITIONS:
@@ -503,9 +511,10 @@ class KiwoomAPI(QAxWidget):
                         return
                     est_amount = cur_price * buy_qty
 
+                _cname = info.get("cond_name", "?")
                 self.log_trade.info(
                     f"[ENTRY_QTY] {self.cn(code)} 현재가={cur_price} "
-                    f"전략={entry_type} 조건식='{info.get("cond_name","?")}' "
+                    f"전략={entry_type} 조건식='{_cname}' "
                     f"모드={BUY_MODE} 수량={buy_qty}주 금액={est_amount:,}원 "
                     f"잔여예산={remaining:,}원"
                 )
@@ -533,6 +542,7 @@ class KiwoomAPI(QAxWidget):
                     self.pending_orders[code]["est_amount"] = est_amount
                     self.pending_orders[code]["entry_type"] = entry_type
                     self.pending_orders[code]["atr_value"]  = atr_val   # ← ATR 저장
+                    self.pending_orders[code]["cur_price"]  = cur_price  # ← 슬리피지 제어용
                     # FLAG 전용 손절가: signal_data의 base_stop 값
                     if entry_type == "FLAG" and code in self._entry_signals:
                         self.pending_orders[code]["flag_stop_price"] = \
@@ -647,7 +657,12 @@ class KiwoomAPI(QAxWidget):
                 atr = float(pend.get("atr_value", 0.0))
                 pos.atr_value = atr
                 if atr > 0:
-                    pos.atr_sl_price   = self.adjust_tick_size(max(1, int(price - atr * ATR_SL_MULT)))
+                    # FIX: atr_sl_price는 반드시 체결가(price)보다 낮아야 함
+                    # 재진입 케이스나 ATR 이상값으로 역전되면 즉시 손절 발동됨
+                    _raw_sl = int(price - atr * ATR_SL_MULT)
+                    pos.atr_sl_price   = self.adjust_tick_size(
+                        min(max(1, _raw_sl), price - self.min_tick(price))
+                    )
                     pos.atr_tp1_price  = self.adjust_tick_size(int(price + atr * ATR_TP_MULT))
                     pos.atr_tp2_price  = pos.atr_tp1_price   # TP1 체결 시 고점 기준으로 갱신됨
                     # BUG-FIX: safe_price는 반드시 매수가(entry_price) 이상이어야 함
@@ -1499,9 +1514,29 @@ class KiwoomAPI(QAxWidget):
             self.ordering = True
             self.last_order_ts = pytime.time()            
             
+        # ─── 매수 주문가격 결정 ───────────────────────────────────────
+        # BUY: 저가주(현재가 < 2,000원)는 지정가+1호가로 슬리피지 제어
+        #      고가주는 시장가(03)로 체결 속도 우선
+        # SELL: 항상 시장가(빠른 청산 필요)
+        if side == "BUY":
+            _cur = self.pending_orders.get(code, {}).get("cur_price", 0)
+            if _cur > 0 and _cur < 2000:
+                _tick   = self.min_tick(_cur)
+                _lmt_p  = _cur + _tick        # 현재가 + 1호가
+                _ord_tp = "00"                # 지정가
+                self.log_trade.info(
+                    f"[ORDER_LIMIT] {self.cn(code)} 저가주 지정가={_lmt_p}원(현재가{_cur}+1틱)"
+                )
+            else:
+                _lmt_p  = 0
+                _ord_tp = "03"               # 시장가
+        else:
+            _lmt_p  = 0
+            _ord_tp = "03"                   # SELL 항상 시장가
+
         ret = self.dynamicCall(
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [side, screen, self.get_account(), order_type, code, qty, 0, "03", ""]
+            [side, screen, self.get_account(), order_type, code, qty, _lmt_p, _ord_tp, ""]
         )
         
         # 주문 접수 실패 처리
@@ -1721,6 +1756,16 @@ class KiwoomAPI(QAxWidget):
 
     # 호가단위 보정 (한국 주식시장)
     @staticmethod
+    def min_tick(self, price: int) -> int:
+        """호가 단위 1틱 반환 (지정가 주문 계산용)"""
+        if price < 2000:     return 1
+        elif price < 5000:   return 5
+        elif price < 20000:  return 10
+        elif price < 50000:  return 50
+        elif price < 200000: return 100
+        elif price < 500000: return 500
+        else:                return 1000
+
     def adjust_tick_size(price: int) -> int:
         """주어진 가격을 올바른 호가단위로 올림 보정 (TP 목표가용)"""
         if price < 2000:     tick = 1

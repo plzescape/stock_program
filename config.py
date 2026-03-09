@@ -13,8 +13,8 @@ MOCK_ACCOUNT_NO = "8120446011"
 #   "BOTH"     → MAX_BUY_AMOUNT 이내 + 최대 QTY개 (둘 중 적은 쪽)
 BUY_MODE = "BOTH"
 QTY = 10000                 # 고정 수량 / 최대 수량
-MAX_BUY_AMOUNT = 2000000    # 종목당 최대 매수금액 (원)
-TOTAL_BUDGET = 20000000     # 총 투자 한도 (원)
+MAX_BUY_AMOUNT = 5000000    # 종목당 최대 매수금액 (원)
+TOTAL_BUDGET = 50000000     # 총 투자 한도 (원)
 
 # ===== 완성봉 손절 설정 =====
 # CANDLE_SL_ENABLED: True면 "완성봉 종가 기준" ATR 손절 (메인)
@@ -55,7 +55,7 @@ MAX_TRADES_PER_DAY = 1000
 CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
-# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "분봉급등주", "DANTA_1", "DANTA_2, CHUSAE_INDICATE"
+# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "분봉급등주", "급등주_주도주", "급등주_눌림목_검색식", "상승_깃발_패턴", CHUSAE_INDICATE"
 # CONDITION_NAME: 단일 fallback (CONDITION_NAMES가 비어 있을 때 사용)
 CONDITION_NAME = "분봉급등주"
 

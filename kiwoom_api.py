@@ -337,10 +337,7 @@ class KiwoomAPI(QAxWidget):
     # Scan control
     # ==================================================
     def _scan_next(self):
-        self.purge_candidates()
-        
         active_slots = len(self.positions) + self._count_pending_buys()
-        # print("Active slots:", active_slots, "Positions:", len(self.positions), "Pending buys:", self._count_pending_buys())
         if active_slots >= MAX_POSITIONS:
             self._scan_running = False
             return
@@ -362,6 +359,10 @@ class KiwoomAPI(QAxWidget):
             return
 
         code = self.scan_queue.pop(0)
+        # ⭐ FIX: purge를 pop 이후로 이동
+        # pop(0)으로 꺼낸 code가 purge로 삭제되는 타이밍 버그 방지
+        # pop 이후 purge → 꺼낸 code는 purge 대상에서 이미 제외됨
+        self.purge_candidates()
         
     # 🟢 쿨타임 체크 로직 (무한루프 방지 개선)
         last_time = self.last_scan_times.get(code, 0)
@@ -468,6 +469,11 @@ class KiwoomAPI(QAxWidget):
                 entry_type = "BREAKOUT"
 
         if entry_type and len(self.positions) < MAX_POSITIONS:
+                # ── 진입 확정 로그 ──
+                self.log_signal.info(
+                    f"[ENTRY_CONFIRMED] {self.cn(code)} 전략={entry_type} "
+                    f"조건식='{info.get('cond_name','?')}'"
+                )
                 # ── 매수수량 계산: BUY_MODE에 따라 분기 ──
                 cur_price = completed_candles[0]["close"]
 

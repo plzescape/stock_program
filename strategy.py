@@ -37,7 +37,7 @@ PULLBACK / FLAG: 변경 없음
 
 from datetime import datetime, time
 
-MIN_VOL_RATIO = 2.0
+MIN_VOL_RATIO = 1.5   # VER7: 2.0→1.5 완화 (거래량 약한 장 대응)
 MAX_VOL_RATIO = 15.0
 
 
@@ -578,7 +578,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
     # 종가가 EMA20 대비 4% 이상 벌어진 과열 구간은 진입 금지
     # strict=True(CHUSAE_INDICATE 등 품질 낮은 조건식): 2.5%로 강화
     ema_dist_pct   = (c1['close'] - ema20) / ema20 * 100 if ema20 > 0 else 0
-    _dist_limit    = 2.5 if strict else 4.0
+    _dist_limit    = 2.5 if strict else 4.5   # VER7: 4.0→4.5 완화 (미세초과 탈락 방지)
     ema_dist_ok    = ema_dist_pct <= _dist_limit
 
     is_valid = (ema_aligned and rsi_ok and macd_ok and trend_ok and
@@ -595,7 +595,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"종가:{c1['close']} EMA20:{ema20:.0f} EMA60:{ema60:.0f} | "
                 f"RSI:{rsi14:.1f} MACD:{macd_l:.2f}>{macd_s:.2f} | "
                 f"기울기:{slope:.2f}% | "
-                f"EMA간격:{ema_gap_pct:.2f}%(≥1%) EMA이격:{ema_dist_pct:.2f}%(≤4%) | "
+                f"EMA간격:{ema_gap_pct:.2f}%(≥1%) EMA이격:{ema_dist_pct:.2f}%(≤4.5%) | "
                 f"5봉고점돌파:{prev_5_high} | "
                 f"거래량:{c1['volume']}(평균의 {vol_ratio:.1f}배) | "
                 f"SR저항돌파:{sr_breakout_ok}(저항박스:{r_lo}~{r_hi}) | "
@@ -614,7 +614,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"sr_break={sr_breakout_ok} "
                 f"momentum={momentum_ok}({momentum_type}) "
                 f"ema_gap={ema_gap_ok}({ema_gap_pct:.2f}%≥1%) "
-                f"ema_dist={ema_dist_ok}({ema_dist_pct:.2f}%≤4%)"
+                f"ema_dist={ema_dist_ok}({ema_dist_pct:.2f}%≤{_dist_limit}%)"
             )
 
     return is_valid
@@ -741,11 +741,16 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
             )
         return False
 
-    if not ob_near and not near_ma_strong:
+    # OB 없을 때 차단 조건 완화
+    # 기존: OB없음 + near_ma_strong 아니면 전부 차단
+    # 수정: OB없어도 SR지지 근처 OR near_ma_strong이면 허용
+    #       → 오늘처럼 OB 미형성 장세에서 PULLBACK 완전 봉쇄되는 문제 해결
+    _has_sr_support = near_supp   # SR 지지박스 근처
+    if not ob_near and not near_ma_strong and not _has_sr_support:
         if logger:
             logger.info(
                 f"[PULLBACK_OB_REQUIRED] {code} "
-                f"EMA거리:{ma_distance*100:.2f}%(NORMAL) + 오더블록 없음 → 진입 차단"
+                f"EMA거리:{ma_distance*100:.2f}%(NORMAL) + 오더블록 없음 + SR지지 없음 → 진입 차단"
             )
         return False
 

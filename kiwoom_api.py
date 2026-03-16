@@ -843,7 +843,14 @@ class KiwoomAPI(QAxWidget):
                 # sell_pend["qty"]가 이번 매도 주문의 실제 수량 (remain_qty 기준으로 주문됨)
                 sold_qty = sell_pend.get("qty", pos.total_qty) if sell_pend else pos.total_qty
 
-                if "STOP_LOSS" in sell_reason:
+                if "TP1" in sell_reason and not pos.tp1_done:
+                    # TP1 주문이 전량 소진되며 SELL_DONE 도달한 경우
+                    from discord_notify import notify_tp1_fill
+                    notify_tp1_fill(code, stock_name, sold_qty, price, entry_p, 0)
+                elif "TP2" in sell_reason and not pos.tp2_done:
+                    from discord_notify import notify_tp2_fill
+                    notify_tp2_fill(code, stock_name, sold_qty, price, entry_p, 0)
+                elif "STOP_LOSS" in sell_reason:
                     from discord_notify import notify_stop_loss
                     notify_stop_loss(code, stock_name, sold_qty, price, entry_p)
                 elif "PROFIT_SAFE" in sell_reason:
@@ -855,7 +862,7 @@ class KiwoomAPI(QAxWidget):
                 elif "TIME_STOP" in sell_reason or "VOL_TIME_STOP" in sell_reason:
                     from discord_notify import notify_time_stop
                     notify_time_stop(code, stock_name, sold_qty, price, entry_p, sell_reason)
-                elif "FORCE_LIQUIDATION" in sell_reason:
+                elif "FORCE_LIQUIDATION" in sell_reason or "LEFTOVER_LIQUIDATION" in sell_reason:
                     from discord_notify import notify_force_liquidation
                     notify_force_liquidation(code, stock_name, sold_qty, entry_p)
             except Exception as e:
@@ -1762,7 +1769,7 @@ class KiwoomAPI(QAxWidget):
 
     # 호가단위 보정 (한국 주식시장)
     @staticmethod
-    def min_tick(self, price: int) -> int:
+    def min_tick(price: int) -> int:
         """호가 단위 1틱 반환 (지정가 주문 계산용)"""
         if price < 2000:     return 1
         elif price < 5000:   return 5
@@ -1772,6 +1779,7 @@ class KiwoomAPI(QAxWidget):
         elif price < 500000: return 500
         else:                return 1000
 
+    @staticmethod
     def adjust_tick_size(price: int) -> int:
         """주어진 가격을 올바른 호가단위로 올림 보정 (TP 목표가용)"""
         if price < 2000:     tick = 1

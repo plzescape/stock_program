@@ -229,47 +229,88 @@ def _near_sr_box(cur_price: float, boxes: dict,
 # ==================================================
 
 def _find_orderblock(candles: list,
-                     lookback: int = 20,
-                     min_body_ratio: float = 0.40) -> list:
+                     lookback: int = 30,
+                     min_impulse_pct: float = 0.015,
+                     min_ob_width_pct: float = 0.002) -> list:
     """
-    매수 오더블록 자동 탐지.
-    정의: 음봉 몸통이 직전 양봉 몸통 전체를 감싸는 구간 = 매수 오더블록(지지구간)
-    candles: [최신→과거]
-    반환: [{'ob_low', 'ob_high', 'age', 'engulf_candle_low'}, ...]
+    매수 오더블록(Bullish Order Block) 탐지 — ICT/SMC 정통 정의.
+
+    [정의]
+    강한 상승 임펄스(급등) 직전의 마지막 음봉 구간.
+    기관/세력이 물량을 모은 수요 구간으로, 가격이 되돌아오면 지지 역할.
+
+    [탐지 조건]
+    1. 임펄스: 음봉(OB) 이후 연속 2봉 이상 상승 or 단봉 1.5% 이상 급등
+    2. OB 구간: 그 임펄스 직전 마지막 음봉의 [몸통 저가 ~ 몸통 고가]
+    3. 유효성 필터:
+       - 임펄스 고점이 OB 고가 대비 min_impulse_pct 이상 상승
+       - OB 폭(ob_high - ob_low) / ob_low >= min_ob_width_pct (너무 좁은 OB 제외)
+
+    [손절선]
+    ob_sl = 음봉의 실제 저가(꼬리 포함) → 이 아래로 내려가면 OB 무효
+
+    candles: [최신→과거] 순서
+    반환: [{'ob_low', 'ob_high', 'ob_sl', 'age'}, ...]
     """
     orderblocks = []
-    n = min(len(candles) - 1, lookback)
+    n = min(len(candles) - 2, lookback)
 
     for i in range(1, n):
-        curr = candles[i]
-        prev = candles[i + 1]
+        # candles[i] = i봉 전 (OB 후보 음봉)
+        # candles[i-1] ... = 더 최근 봉들 (임펄스 구간)
+        ob_candle = candles[i]
 
-        prev_body_lo = min(prev['open'], prev['close'])
-        prev_body_hi = max(prev['open'], prev['close'])
-        if prev['close'] <= prev['open']:
+        # ── OB 후보: 반드시 음봉이어야 함 ──
+        if ob_candle['close'] >= ob_candle['open']:
             continue
 
-        curr_body_lo = min(curr['open'], curr['close'])
-        curr_body_hi = max(curr['open'], curr['close'])
-        if curr['close'] >= curr['open']:
+        ob_body_lo = ob_candle['close']   # 음봉: 종가 < 시가
+        ob_body_hi = ob_candle['open']
+        ob_sl      = ob_candle['low']     # 손절선 = 음봉 실제 저가
+
+        # OB 폭 필터 (너무 좁으면 의미 없음)
+        if ob_body_hi <= 0:
+            continue
+        if (ob_body_hi - ob_body_lo) / ob_body_hi < min_ob_width_pct:
             continue
 
-        if not (curr_body_lo <= prev_body_lo and curr_body_hi >= prev_body_hi):
+        # ── 임펄스 감지: OB 이후(더 최신 봉) 강한 상승이 있어야 함 ──
+        # candles[i-1], candles[i-2] 등이 OB 직후 봉들
+        impulse_found = False
+        impulse_high  = 0.0
+
+        # 방법1: 단봉 급등 (1봉만으로 min_impulse_pct 이상 상승)
+        if i >= 1:
+            next_c = candles[i - 1]
+            rise = (next_c['close'] - ob_body_hi) / ob_body_hi if ob_body_hi > 0 else 0
+            if rise >= min_impulse_pct:
+                impulse_found = True
+                impulse_high  = next_c['high']
+
+        # 방법2: 연속 2봉 이상 상승 (각각 양봉)
+        if not impulse_found and i >= 2:
+            c1 = candles[i - 1]
+            c2 = candles[i - 2]
+            if (c1['close'] > c1['open'] and        # 직후봉 양봉
+                c2['close'] > c2['open'] and        # 2번째봉 양봉
+                c2['close'] > ob_body_hi):          # 2봉 만에 OB 고점 초과
+                impulse_found = True
+                impulse_high  = max(c1['high'], c2['high'])
+
+        if not impulse_found:
             continue
 
-        curr_range = curr['high'] - curr['low']
-        curr_body  = curr_body_hi - curr_body_lo
-        if curr_range > 0 and (curr_body / curr_range) < min_body_ratio:
+        # 임펄스 고점이 OB 고가 대비 충분히 높은지 확인
+        if impulse_high <= 0:
             continue
-
-        if (prev_body_hi - prev_body_lo) <= 0:
+        if (impulse_high - ob_body_hi) / ob_body_hi < min_impulse_pct:
             continue
 
         orderblocks.append({
-            'ob_low':            prev_body_lo,
-            'ob_high':           prev_body_hi,
-            'age':               i,
-            'engulf_candle_low': curr['low'],
+            'ob_low':  ob_body_lo,   # 음봉 몸통 저가 (= 종가)
+            'ob_high': ob_body_hi,   # 음봉 몸통 고가 (= 시가)
+            'ob_sl':   ob_sl,        # 손절선 = 음봉 실제 저가
+            'age':     i,            # 몇 봉 전 OB인지
         })
 
     return orderblocks
@@ -277,22 +318,34 @@ def _find_orderblock(candles: list,
 
 def _near_orderblock(cur_price: float,
                      orderblocks: list,
-                     proximity: float = 0.015,
-                     max_age: int = 15) -> tuple:
+                     proximity: float = 0.005,
+                     max_age: int = 20) -> tuple:
     """
-    현재가가 오더블록 구간 내부 또는 ±proximity% 이내인지 확인.
-    반환: (근접여부, ob_low, ob_high, 손절기준가, age)
+    현재가가 오더블록 구간 내부 or 하단 proximity% 이내인지 확인.
+
+    [판정 기준]
+    - in_zone: ob_low <= cur_price <= ob_high (OB 구간 안에 있음)
+    - near_below: ob_low * (1 - proximity) <= cur_price < ob_low
+                  (OB 하단 아래 proximity% 이내 → 막 이탈했거나 접근 중)
+
+    기존 "중심점 ±1.5%" 방식은 OB를 이미 크게 벗어난 종목도 near로 처리하는 오류가 있었음.
+    → OB 위로 올라간 경우(종가 > ob_high) 는 제외: 이미 OB를 돌파해버린 상태
+
+    반환: (근접여부, ob_low, ob_high, ob_sl, age)
     """
-    for ob in orderblocks:
+    for ob in sorted(orderblocks, key=lambda x: x['age']):   # 최신 OB 우선
         if ob['age'] > max_age:
             continue
         ob_low  = ob['ob_low']
         ob_high = ob['ob_high']
-        mid     = (ob_low + ob_high) / 2.0
-        in_zone = (ob_low <= cur_price <= ob_high)
-        near    = (abs(cur_price - mid) / mid <= proximity)
-        if in_zone or near:
-            return True, ob_low, ob_high, ob['engulf_candle_low'], ob['age']
+        ob_sl   = ob['ob_sl']
+
+        in_zone    = (ob_low <= cur_price <= ob_high)
+        near_below = (ob_low * (1 - proximity) <= cur_price < ob_low)
+
+        if in_zone or near_below:
+            return True, ob_low, ob_high, ob_sl, ob['age']
+
     return False, 0, 0, 0, 0
 
 
@@ -537,9 +590,14 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
     # D. MA20 기울기
     trend_ok = slope >= 0.3
 
-    # E. 5봉 고점 돌파
-    prev_5_high = max(c['high'] for c in candles[1:6])
-    price_ok    = (c1['close'] > prev_5_high and c1['close'] > c1['open'])
+    # E. 5봉 고점 돌파 (VER7: 2단계 조건)
+    # STRONG: 종가가 5봉고점 완전 돌파 → 강한 진입 신호
+    # NEAR  : 종가가 5봉고점의 1% 이내 근접 + 현재봉 고가가 돌파
+    #         → 위꼬리로 신고점 찍은 경우, 다음 봉 돌파 확률 높음
+    prev_5_high  = max(c['high'] for c in candles[1:6])
+    _price_strong = (c1['close'] > prev_5_high)
+    _price_near   = (c1['close'] >= prev_5_high * 0.99 and c1['high'] > prev_5_high)
+    price_ok      = (_price_strong or _price_near) and c1['close'] > c1['open']
 
     # F. 거래량
     avg_vol   = sum(c['volume'] for c in candles[1:6]) / 5
@@ -596,7 +654,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"RSI:{rsi14:.1f} MACD:{macd_l:.2f}>{macd_s:.2f} | "
                 f"기울기:{slope:.2f}% | "
                 f"EMA간격:{ema_gap_pct:.2f}%(≥1%) EMA이격:{ema_dist_pct:.2f}%(≤4.5%) | "
-                f"5봉고점돌파:{prev_5_high} | "
+                f"5봉고점{'돌파' if _price_strong else '근접'}:{prev_5_high}(현재고가={c1['high']}) | "
                 f"거래량:{c1['volume']}(평균의 {vol_ratio:.1f}배) | "
                 f"SR저항돌파:{sr_breakout_ok}(저항박스:{r_lo}~{r_hi}) | "
                 f"모멘텀:{momentum_type}"
@@ -608,7 +666,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"rsi={rsi_ok}({rsi14:.1f}) "
                 f"macd={macd_ok}({macd_l:.2f}vs{macd_s:.2f}) "
                 f"trend={trend_ok}(slope={slope:.2f}%) "
-                f"price={price_ok}(5봉고점={prev_5_high}) "
+                f"price={price_ok}({'돌파' if _price_strong else '근접'},{prev_5_high}) "
                 f"vol={vol_ok}({vol_ratio:.1f}배) "
                 f"strength={str_ok}({str_pct:.0f}%≥65%) "
                 f"sr_break={sr_breakout_ok} "
@@ -638,7 +696,7 @@ def get_entry_signal_data(candles) -> dict | None:
     return {
         "vol_ratio":       vol_ratio,
         "trend":           f"EMA정배열 기울기{ind['ma20_slope_pct']:+.2f}%",
-        "breakout":        f"5봉고점({prev_5_high}) 돌파",
+        "breakout":        f"5봉고점({prev_5_high}) {'돌파' if _price_strong else '근접'}",
         "candle_strength": strength,
         "rsi":             ind["rsi14"],
         "macd":            f"{ind['macd_line']:.2f}>{ind['macd_signal']:.2f}",
@@ -724,33 +782,32 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     near_resist_block, _, _ = _near_sr_box(c1['close'], sr_boxes, 'resistance', proximity=0.010)
     sr_ok = not near_resist_block
 
-    orderblocks = _find_orderblock(candles, lookback=20)
+    orderblocks = _find_orderblock(candles, lookback=30)
     ob_near, ob_low, ob_high, ob_sl, ob_age = _near_orderblock(
         cur_price   = c1['close'],
         orderblocks = orderblocks,
-        proximity   = 0.015,
-        max_age     = 15
+        proximity   = 0.005,   # OB 하단 ±0.5% 이내만 허용 (기존 1.5%에서 엄격화)
+        max_age     = 20
     )
 
     if ob_near and ob_sl > 0 and c1['close'] < ob_sl:
         if logger:
             logger.info(
                 f"[PULLBACK_OB_BROKEN] {code} "
-                f"오더블록 하단({ob_sl}) 이탈 → 진입 차단 "
+                f"오더블록 손절선({ob_sl}) 이탈 → 진입 차단 "
                 f"현재가:{c1['close']} OB구간:{ob_low}~{ob_high}"
             )
         return False
 
-    # OB 없을 때 차단 조건 완화
-    # 기존: OB없음 + near_ma_strong 아니면 전부 차단
-    # 수정: OB없어도 SR지지 근처 OR near_ma_strong이면 허용
-    #       → 오늘처럼 OB 미형성 장세에서 PULLBACK 완전 봉쇄되는 문제 해결
-    _has_sr_support = near_supp   # SR 지지박스 근처
+    # OB 없을 때: SR지지 or EMA 밀착(near_ma_strong)이 있어야 허용
+    # 정통 Bullish OB가 없는 상황에서 SR/EMA 지지만으로 진입 → 품질 낮음
+    _has_sr_support = near_supp
     if not ob_near and not near_ma_strong and not _has_sr_support:
         if logger:
             logger.info(
                 f"[PULLBACK_OB_REQUIRED] {code} "
-                f"EMA거리:{ma_distance*100:.2f}%(NORMAL) + 오더블록 없음 + SR지지 없음 → 진입 차단"
+                f"EMA거리:{ma_distance*100:.2f}%({'STRONG' if near_ma_strong else 'NORMAL'}) "
+                f"+ 오더블록 없음 + SR지지 없음 → 진입 차단"
             )
         return False
 
@@ -829,9 +886,9 @@ def get_pullback_signal_data(candles) -> dict | None:
         "ma_strength":     ma_strength,
     }
 
-    orderblocks = _find_orderblock(candles, lookback=20)
+    orderblocks = _find_orderblock(candles, lookback=30)
     ob_near, ob_low, ob_high, ob_sl, ob_age = _near_orderblock(
-        c1['close'], orderblocks, proximity=0.015, max_age=15
+        c1['close'], orderblocks, proximity=0.005, max_age=20
     )
     if ob_near:
         result["orderblock"] = f"OB지지({ob_low:,}~{ob_high:,}, {ob_age}봉전)"

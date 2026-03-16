@@ -66,8 +66,11 @@ def parse_log(path: str) -> list[dict]:
     re_chejan     = re.compile(r"\[CHEJAN\]\s+-매도\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)(?:\s+qty=(\d+))?")
     # 매수 CHEJAN: price + qty (가중평균 매수가 재계산용)
     re_chejan_buy = re.compile(r"\[CHEJAN\]\s+\+매수\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)(?:\s+qty=(\d+))?")
-
-    # ── 진입전략 정규식: ENTRY_QTY 로그에서 전략명 파싱 ──
+    # [FIX4] 전일잔고 청산: LEFTOVER_SELL → 세션 생성용
+    # 형식: [LEFTOVER_SELL] 종목명(코드) 전일잔고 qty=N entry=N entry_ts=...
+    re_leftover = re.compile(
+        r"\[LEFTOVER_SELL\]\s+(.+?\(\d{6}\))\s+전일잔고\s+qty=(\d+)\s+entry=(\d+)"
+    )
     # 형식: [ENTRY_QTY] 종목명(코드) 현재가=N 전략=BREAKOUT|PULLBACK|FLAG ...
     re_entry_qty = re.compile(
         r"\[ENTRY_QTY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+현재가=\d+\s+전략=(BREAKOUT|PULLBACK|FLAG)"
@@ -101,6 +104,23 @@ def parse_log(path: str) -> list[dict]:
                 sessions.setdefault(code, {})["entry_strategy"] = m.group(2)
                 continue
 
+            # [FIX4] 전일잔고 청산 세션 생성
+            # LEFTOVER_SELL → 전일 매수 포지션을 당일 청산하는 케이스
+            # 형식: [LEFTOVER_SELL] 종목명(코드) 전일잔고 qty=N entry=N
+            m = re_leftover.search(line)
+            if m:
+                name, code = extract_code(m.group(1))
+                qty_val    = int(m.group(2))
+                entry_val  = int(m.group(3))
+                s = sessions.setdefault(code, {})
+                s["name"]            = name
+                s["entry_price"]     = entry_val
+                s["qty"]             = qty_val
+                s["entry_time"]      = t
+                s["entry_strategy"]  = "LEFTOVER"
+                s["exit_type"]       = "전일잔고청산"
+                continue
+
             # ATR_CALC
             m = re_atr.search(line) or re_atr_old.search(line)
             if m:
@@ -125,6 +145,7 @@ def parse_log(path: str) -> list[dict]:
                 continue
 
             # 매수 CHEJAN → 가중평균 매수가 추적
+            # [FIX] qty는 누적 체결수량 → 증분(delta)으로 계산
             m = re_chejan_buy.search(line)
             if m:
                 _, code = extract_code(m.group(1))
@@ -132,8 +153,15 @@ def parse_log(path: str) -> list[dict]:
                     bp  = int(m.group(2))
                     bq  = int(m.group(3)) if m.group(3) else 1
                     s2  = sessions[code]
-                    s2["_buy_price_sum"] = s2.get("_buy_price_sum", 0) + bp * bq
-                    s2["_buy_qty_sum"]   = s2.get("_buy_qty_sum",   0) + bq
+                    prev_order_qty = s2.get("_buy_order_qty", 0)
+                    if bq > prev_order_qty:
+                        delta = bq - prev_order_qty
+                        s2["_buy_price_sum"] = s2.get("_buy_price_sum", 0) + bp * delta
+                        s2["_buy_qty_sum"]   = s2.get("_buy_qty_sum",   0) + delta
+                    else:
+                        s2["_buy_price_sum"] = s2.get("_buy_price_sum", 0) + bp * bq
+                        s2["_buy_qty_sum"]   = s2.get("_buy_qty_sum",   0) + bq
+                    s2["_buy_order_qty"] = bq
                     s2["entry_price"]    = s2["_buy_price_sum"] // s2["_buy_qty_sum"]
                 continue
 
@@ -225,6 +253,9 @@ def parse_log(path: str) -> list[dict]:
                 continue
 
             # 매도체결가 추적 → 가중평균 체결가 계산
+            # [FIX] CHEJAN qty는 주문 내 누적 체결수량
+            # 같은 주문 내에서 qty가 증가하는 동안은 증분(delta)으로 계산
+            # 새 주문(TP2, TRAIL 등)이 시작되면 qty가 다시 작은 값으로 리셋됨
             m = re_chejan.search(line)
             if m:
                 _, code = extract_code(m.group(1))
@@ -232,9 +263,18 @@ def parse_log(path: str) -> list[dict]:
                     sp  = int(m.group(2))
                     sq  = int(m.group(3)) if m.group(3) else 1
                     s2  = sessions[code]
-                    s2["_sell_price_sum"] = s2.get("_sell_price_sum", 0) + sp * sq
-                    s2["_sell_qty_sum"]   = s2.get("_sell_qty_sum",   0) + sq
-                    s2["exit_price"]      = s2["_sell_price_sum"] // s2["_sell_qty_sum"]
+                    prev_order_qty = s2.get("_sell_order_qty", 0)
+                    if sq > prev_order_qty:
+                        # 같은 주문 내 연속 체결 → 증분만 합산
+                        delta = sq - prev_order_qty
+                        s2["_sell_price_sum"] = s2.get("_sell_price_sum", 0) + sp * delta
+                        s2["_sell_qty_sum"]   = s2.get("_sell_qty_sum",   0) + delta
+                    else:
+                        # qty 리셋 = 새 매도 주문 시작 (TP2, TRAIL 등)
+                        s2["_sell_price_sum"] = s2.get("_sell_price_sum", 0) + sp * sq
+                        s2["_sell_qty_sum"]   = s2.get("_sell_qty_sum",   0) + sq
+                    s2["_sell_order_qty"] = sq
+                    s2["exit_price"] = s2["_sell_price_sum"] // s2["_sell_qty_sum"]
                 continue
 
             # ORDER_TRY SELL
@@ -269,6 +309,8 @@ def parse_log(path: str) -> list[dict]:
                     s["exit_type"] = "트레일링"
                 elif "PROFIT_SAFE" in reason:
                     s["exit_type"] = "본절보호"
+                elif "LEFTOVER_LIQUIDATION" in reason:
+                    s["exit_type"] = "전일잔고청산"
                 else:
                     evts = [e["type"] for e in s.get("events", [])]
                     if "TP2" in evts:
@@ -280,20 +322,29 @@ def parse_log(path: str) -> list[dict]:
 
                 # ── 손익 계산 (수수료/세금 반영) ─────────────────────
                 # 실제 손익 = (매도금액 - 매수금액) - 거래비용
-                # 거래비용 = 수수료(매수 0.015% + 매도 0.015%)
-                #           + 거래세 0.18% + 농특세 0.036%
-                #           = 총 0.246% (키움증권 기준)
-                # exit_pnl_pct(TIME_STOP 등)도 실제 체결가 기반으로 재계산
+                #
+                # [FIX] 키움 모의투자 실제 수수료율 역산 결과 (2026-03-16 검증)
+                # HTS 수수료+세세금 컬럼값 vs 실제 손익 차감액 비교 → 0.4505%
+                # 구성: 수수료(매수 0.015% + 매도 0.015%) + 증권거래세 + 농특세
+                # 모의투자 특성상 세율이 단순 합산되어 (매수+매도) × 0.4505%로 근사
+                # 기존 0.246%는 실제의 절반 수준으로 손익이 과대계상되는 오류
+                #
+                # 전일잔고청산(LEFTOVER): 매수 수수료는 전일에 이미 차감됨
+                # → 오늘 매도분 수수료만 적용: sell_amt × 0.4505%
                 ep  = s.get("entry_price", 0)
                 xp  = s.get("exit_price", ep)
                 qty = s.get("qty", 0)
 
-                gross_pnl = (xp - ep) * qty          # 세전 손익
-                buy_fee   = round(ep * qty * 0.00015) # 매수 수수료 0.015%
-                sell_fee  = round(xp * qty * 0.00015) # 매도 수수료 0.015%
-                tx_tax    = round(xp * qty * 0.0018)  # 거래세 0.18%
-                agri_tax  = round(xp * qty * 0.00036) # 농특세 0.036%
-                total_fee = buy_fee + sell_fee + tx_tax + agri_tax
+                buy_amt   = ep * qty
+                sell_amt  = xp * qty
+                gross_pnl = sell_amt - buy_amt        # 세전 손익
+
+                is_leftover = (s.get("entry_strategy") == "LEFTOVER")
+                if is_leftover:
+                    # 전일잔고청산: 매도 단방향 수수료만 (매수는 전일 차감됨)
+                    total_fee = round(sell_amt * 0.004505)
+                else:
+                    total_fee = round((buy_amt + sell_amt) * 0.004505)  # 키움 모의투자 실측값
 
                 net_pnl       = gross_pnl - total_fee
                 s["pnl_amt"]   = net_pnl
@@ -523,6 +574,7 @@ COLORS_MAP = {
     "트레일링":       "00B0F0",
     "본절보호":       "FFC000",
     "거래량급감청산": "00B050",
+    "전일잔고청산":   "A9A9A9",
     "기타":           "808080",
 }
 

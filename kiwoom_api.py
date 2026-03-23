@@ -750,7 +750,10 @@ class KiwoomAPI(QAxWidget):
                         signal_data=self._entry_signals.pop(code, None)
                     )
                 except Exception as e:
-                    self.log_system.warning(f"[DISCORD_FAIL] 매수알림: {e}")
+                    import traceback
+                    self.log_system.error(
+                        f"[DISCORD_FAIL] 매수알림: {e}\n{traceback.format_exc()}"
+                    )
 
             return
 
@@ -805,7 +808,10 @@ class KiwoomAPI(QAxWidget):
                         tp1_filled_qty = pend.get("qty", delta)
                         notify_tp1_fill(code, self.get_stock_name(code), tp1_filled_qty, price, pos.entry_price, pos.remain_qty)
                     except Exception as e:
-                        self.log_system.warning(f"[DISCORD_FAIL] TP1알림: {e}")
+                        import traceback
+                        self.log_system.error(
+                            f"[DISCORD_FAIL] TP1알림: {e}\n{traceback.format_exc()}"
+                        )
 
                 elif "TP2" in reason and not pos.tp2_done:
                     pos.tp2_done = True
@@ -818,7 +824,10 @@ class KiwoomAPI(QAxWidget):
                         tp2_filled_qty = pend.get("qty", delta)
                         notify_tp2_fill(code, self.get_stock_name(code), tp2_filled_qty, price, pos.entry_price, pos.remain_qty)
                     except Exception as e:
-                        self.log_system.warning(f"[DISCORD_FAIL] TP2알림: {e}")
+                        import traceback
+                        self.log_system.error(
+                            f"[DISCORD_FAIL] TP2알림: {e}\n{traceback.format_exc()}"
+                        )
 
             if pos.remain_qty > 0:
                 # ⭐ 부분체결: selling 유지 (중복 매도 방지)
@@ -866,7 +875,10 @@ class KiwoomAPI(QAxWidget):
                     from discord_notify import notify_force_liquidation
                     notify_force_liquidation(code, stock_name, sold_qty, entry_p)
             except Exception as e:
-                self.log_system.warning(f"[DISCORD_FAIL] 매도알림: {e}")
+                import traceback
+                self.log_system.error(
+                    f"[DISCORD_FAIL] 매도알림({sell_reason}): {e}\n{traceback.format_exc()}"
+                )
 
             self.positions.pop(code, None)
             self.pending_orders.pop(code, None)
@@ -2032,6 +2044,12 @@ class KiwoomAPI(QAxWidget):
                     f"[COND_IN_IGNORE] {self.cn(code)} 사유=이미보유중"
                 )
                 return
+            # ⭐ 당일 이미 거래한 종목(체결 완료 or 거절) 재진입 방지
+            if code in self.traded_today:
+                self.log_trade.info(
+                    f"[COND_IN_IGNORE] {self.cn(code)} 사유=당일거래완료"
+                )
+                return
             if code in self.candidates:
                 info = self.candidates[code]
 
@@ -2191,26 +2209,44 @@ class KiwoomAPI(QAxWidget):
                         self.ordering = False
                         self._pending_buy_code = None
                         self._pending_buy_qty = 0
+                        # ⭐ FIX: BUY 거절 시 candidates에서도 제거 + 당일 재진입 방지
+                        # 미체결 REJECT인데 candidates에 남아있으면 즉시 재스캔→재주문 반복
+                        if code in self.candidates:
+                            self.candidates.pop(code, None)
+                            self.scan_queue = [c for c in self.scan_queue if c != code]
+                            self.log_system.warning(
+                                f"[REJECT_CLEANUP] {self.cn(code)} candidates 제거 완료"
+                            )
+                        self.traded_today.add(code)  # 당일 동일 종목 재진입 방지
                         self._resume_scan_if_possible()
                     elif rqname == "SELL":
                         pos = self.positions.get(code)
                         if pos:
-                            pos.selling = False
-                            # ⭐ BUG-2: [800033] 매도가능수량 부족 = 미체결 BUY 주문이
-                            # 아직 살아있어 매도 불가 상태. 이 경우 즉시 재매도를 시도하되
-                            # 1초 딜레이를 두어 BUY 미체결 취소 처리가 먼저 완료되도록 함.
+                            # ⭐ [800033] = 이미 접수된 매도 주문이 있어서 부족
+                            # → selling=False로 풀면 안 됨 (무한 재시도 루프 발생)
+                            # → [800033] 이외의 SELL 거절만 selling 해제
+                            if "800033" not in msg and "매도가능수량" not in msg:
+                                pos.selling = False
                             if "800033" in msg or "매도가능수량" in msg:
-                                sell_qty = pos.remain_qty
-                                sell_reason = pend.get("reason", "STOP_LOSS")
-                                self.log_system.warning(
-                                    f"[SELL_REJECT_RETRY] {self.cn(code)} "
-                                    f"[800033] 매도가능수량 부족 → 1초 후 재시도 "
-                                    f"qty={sell_qty} reason={sell_reason}"
-                                )
-                                QTimer.singleShot(
-                                    1000,
-                                    lambda c=code, q=sell_qty, r=sell_reason: self._retry_sell_after_reject(c, q, r)
-                                )
+                                # 재시도 횟수 초과 시 포기 (SELL_STUCK이 대신 처리)
+                                retry_cnt = pos.sell_reject_retries = getattr(pos, 'sell_reject_retries', 0) + 1
+                                if retry_cnt > 5:
+                                    self.log_system.error(
+                                        f"[SELL_REJECT_ABORT] {self.cn(code)} "
+                                        f"[800033] 재시도 {retry_cnt}회 초과 → 포기 (SELL_STUCK 대기)"
+                                    )
+                                else:
+                                    sell_qty = pos.remain_qty
+                                    sell_reason = pend.get("reason", "STOP_LOSS") if pend else "STOP_LOSS"
+                                    self.log_system.warning(
+                                        f"[SELL_REJECT_RETRY] {self.cn(code)} "
+                                        f"[800033] 매도가능수량 부족 → 1초 후 재시도 "
+                                        f"qty={sell_qty} reason={sell_reason} ({retry_cnt}회차)"
+                                    )
+                                    QTimer.singleShot(
+                                        1000,
+                                        lambda c=code, q=sell_qty, r=sell_reason: self._retry_sell_after_reject(c, q, r)
+                                    )
                         self.ordering = bool(self.pending_orders)
                     break  # 동시 BUY 차단 로직상 1개만 있을 수 있음
 
@@ -2313,7 +2349,10 @@ class KiwoomAPI(QAxWidget):
                     entry_price=pos.entry_price
                 )
             except Exception as e:
-                self.log_system.warning(f"[DISCORD_FAIL] 전일잔고청산알림: {e}")
+                import traceback
+                self.log_system.error(
+                    f"[DISCORD_FAIL] 전일잔고청산알림: {e}\n{traceback.format_exc()}"
+                )
 
             ok = self.send_market_order(
                 "SELL", code, pos.remain_qty, "LEFTOVER_LIQUIDATION"
@@ -2357,7 +2396,10 @@ class KiwoomAPI(QAxWidget):
                     entry_price=pos.entry_price
                 )
             except Exception as e:
-                self.log_system.warning(f"[DISCORD_FAIL] 강제청산알림: {e}")
+                import traceback
+                self.log_system.error(
+                    f"[DISCORD_FAIL] 강제청산알림: {e}\n{traceback.format_exc()}"
+                )
 
 
             # 시장가 전량 매도

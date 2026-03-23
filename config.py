@@ -52,7 +52,7 @@ TRAIL_GAP        = 0.010 # 미사용 (ATR 트레일링으로 대체)
 
 # ===== 제한 =====
 MAX_TRADES_PER_DAY = 1000
-CONDITION_INTERVAL_MIN = 30  # 조건검색 갱신 주기(분)
+CONDITION_INTERVAL_MIN = 5  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
 # 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "분봉급등주", "급등주_주도주", "급등주_눌림목_검색식", "상승_깃발_패턴", CHUSAE_INDICATE"
@@ -69,8 +69,8 @@ CONDITION_NAME = "분봉급등주"
 # - 키움 API 제약: 스크린 하나에 조건식 하나만 실시간 등록 가능
 #   → 조건식 4개를 스크린 9001~9004에 각각 고정 매핑
 CONDITION_NAMES = [
-    "CHUSAE_INDICATE",
     "분봉급등주",
+    "CHUSAE_INDICATE",
     "급등주_주도주",
     "급등주_눌림목_검색식"
 ]

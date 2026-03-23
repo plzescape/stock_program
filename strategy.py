@@ -685,13 +685,15 @@ def get_entry_signal_data(candles) -> dict | None:
     ind = _calc_indicators(candles)
     if ind is None:
         return None
-    c1          = candles[0]
-    prev_5_high = max(c['high'] for c in candles[1:6])
-    avg_vol     = sum(c['volume'] for c in candles[1:6]) / 5
-    vol_ratio   = c1['volume'] / avg_vol if avg_vol > 0 else 0
-    rng         = c1['high'] - c1['low']
-    body        = c1['close'] - c1['open']
-    strength    = (body / rng * 100) if rng > 0 else 0
+    c1            = candles[0]
+    prev_5_high   = max(c['high'] for c in candles[1:6])
+    _price_strong = (c1['close'] > prev_5_high)
+    _price_near   = (c1['close'] >= prev_5_high * 0.99 and c1['high'] > prev_5_high)
+    avg_vol       = sum(c['volume'] for c in candles[1:6]) / 5
+    vol_ratio     = c1['volume'] / avg_vol if avg_vol > 0 else 0
+    rng           = c1['high'] - c1['low']
+    body          = c1['close'] - c1['open']
+    strength      = (body / rng * 100) if rng > 0 else 0
     _, momentum_type = _check_momentum_candle(candles)
     return {
         "vol_ratio":       vol_ratio,

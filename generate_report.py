@@ -305,6 +305,8 @@ def parse_log(path: str) -> list[dict]:
                     s["exit_type"] = "손절"
                 elif "TIME_STOP" in reason or "VOL_TIME_STOP" in reason:
                     s["exit_type"] = "타임스탑"
+                elif "MINI_TRAIL_STOP" in reason:
+                    s["exit_type"] = "미니트레일"
                 elif "TRAIL_STOP" in reason:
                     s["exit_type"] = "트레일링"
                 elif "PROFIT_SAFE" in reason:
@@ -575,6 +577,7 @@ COLORS_MAP = {
     "본절보호":       "FFC000",
     "거래량급감청산": "00B050",
     "전일잔고청산":   "A9A9A9",
+    "미니트레일":     "00CED1",
     "기타":           "808080",
 }
 

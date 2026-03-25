@@ -55,7 +55,6 @@ MAX_TRADES_PER_DAY = 1000
 CONDITION_INTERVAL_MIN = 5  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
-# 조건검색식 등록해놓은 것 : "AUTO_CANDI_MOMENTUM", "AUTO_CANDI_VOL_SPIKE", "AUTO_CANDI_BREAKOUT", "분봉급등주", "급등주_주도주", "급등주_눌림목_검색식", "상승_깃발_패턴", CHUSAE_INDICATE"
 # CONDITION_NAME: 단일 fallback (CONDITION_NAMES가 비어 있을 때 사용)
 CONDITION_NAME = "분봉급등주"
 
@@ -86,6 +85,12 @@ MAX_POSITIONS = 10
 # ===== 자가진단 =====
 TIME_STOP_SEC = 600        # 10분
 TIME_STOP_MAX_LOSS = -0.003  # -0.3%
+
+# ── 미니 트레일링 스탑 (TP1 미달 구간 수익 보호) ──
+# TP1에 못 미치더라도 수익이 TRIGGER 이상 올라가면 고점을 추적,
+# 고점 대비 GAP 이상 하락 시 즉시 익절
+MINI_TRAIL_TRIGGER = 0.015   # +1.5% 이상 수익 시 활성화
+MINI_TRAIL_GAP     = 0.010   # 고점 대비 -1.0% 하락 시 청산
 SELL_COOLDOWN_SEC = 3
 
 # 거래량 기반 Time Stop

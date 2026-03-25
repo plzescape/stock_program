@@ -275,6 +275,27 @@ def notify_trail_stop(code: str, name: str, qty: int,
     _send(embed, "트레일링", f"{name}({code})")
 
 
+def notify_mini_trail_stop(code: str, name: str, qty: int,
+                           price: int, entry_price: int, **kwargs):
+    pnl_rate   = (price - entry_price) / entry_price * 100
+    pnl_amount = (price - entry_price) * qty
+    embed = {
+        "title": "🎯 미니 트레일링 익절",
+        "color": 0x00CED1,   # 청록색 — 타임스탑/트레일링과 구분
+        "fields": [
+            {"name": "종목",     "value": f"{name} ({code})",             "inline": False},
+            {"name": "매도가",   "value": _fmt_price(price),              "inline": True},
+            {"name": "수량",     "value": f"{qty:,}주",                    "inline": True},
+            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",            "inline": True},
+            {"name": "손익금액", "value": f"{pnl_amount:+,}원",           "inline": True},
+            {"name": "",         "value": "수익 보호 트레일링 (TP1 전)", "inline": False},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "미니트레일", f"{name}({code})")
+
+
 # ══════════════════════════════════════════════════════
 # 8) 타임스탑 / 거래량급감
 # ══════════════════════════════════════════════════════

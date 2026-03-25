@@ -22,7 +22,8 @@ from config import (
     CONDITION_NAME, CONDITION_NAMES, MOCK_ACCOUNT_NO, SCAN_TR_DELAY_MS,
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
     MAX_POSITIONS, TOTAL_BUDGET,
-    BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC
+    BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC,
+    MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data
@@ -39,6 +40,10 @@ class PositionState:
     tp2_done: bool = False
     tp1_filled_processed: bool = False  # TP1 CHEJAN 전량체결 후처리 완료 여부 (TP2 목표가 갱신용)
     trailing_active: bool = False
+
+    # ── 미니 트레일링 스탑 (TP1 미달 구간 수익 보호) ──
+    mini_trail_active: bool  = False   # 트리거 도달 후 활성화
+    mini_trail_peak:   float = 0.0     # 활성화 이후 추적하는 최고 pnl_rate
     ordering: bool = False
     selling: bool = False
     last_pnl_log_ts: float = 0.0
@@ -874,6 +879,9 @@ class KiwoomAPI(QAxWidget):
                 elif "PROFIT_SAFE" in sell_reason:
                     from discord_notify import notify_profit_safe
                     notify_profit_safe(code, stock_name, sold_qty, price, entry_p)
+                elif "MINI_TRAIL_STOP" in sell_reason:
+                    from discord_notify import notify_mini_trail_stop
+                    notify_mini_trail_stop(code, stock_name, sold_qty, price, entry_p)
                 elif "TRAIL" in sell_reason:
                     from discord_notify import notify_trail_stop
                     notify_trail_stop(code, stock_name, sold_qty, price, entry_p)
@@ -1071,6 +1079,47 @@ class KiwoomAPI(QAxWidget):
                 else:
                     pos.selling = False
                 return
+
+        # =========================
+        # 미니 트레일링 스탑 (TP1 미달 구간 수익 보호)
+        # TP1에 못 미치더라도 수익이 MINI_TRAIL_TRIGGER 이상 오르면 고점 추적,
+        # 고점 대비 MINI_TRAIL_GAP 이상 하락 시 즉시 익절
+        # 조건: TP1 미체결 + 전량매수 완료 + 트레일링 미활성 상태
+        # =========================
+        if not pos.tp1_done and pos.buy_done and not pos.trailing_active:
+            pnl_rate = (cur - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+
+            # 트리거 도달 → 미니 트레일링 활성화
+            if not pos.mini_trail_active and pnl_rate >= MINI_TRAIL_TRIGGER:
+                pos.mini_trail_active = True
+                pos.mini_trail_peak   = pnl_rate
+                self.log_trade.info(
+                    f"[MINI_TRAIL_ON] {self.cn(code)} "
+                    f"pnl={pnl_rate*100:.2f}% 미니트레일 활성화 "
+                    f"(트리거={MINI_TRAIL_TRIGGER*100:.1f}%)"
+                )
+
+            # 미니 트레일링 활성 중 → 고점 갱신 + 하락 감지
+            if pos.mini_trail_active:
+                if pnl_rate > pos.mini_trail_peak:
+                    pos.mini_trail_peak = pnl_rate
+
+                drop = pos.mini_trail_peak - pnl_rate
+                if drop >= MINI_TRAIL_GAP:
+                    if not self.can_try_sell(pos):
+                        return
+                    self.log_trade.info(
+                        f"[MINI_TRAIL_STOP] {self.cn(code)} "
+                        f"고점={pos.mini_trail_peak*100:.2f}% "
+                        f"현재={pnl_rate*100:.2f}% "
+                        f"하락={drop*100:.2f}% → 익절 청산"
+                    )
+                    ok = self.send_market_order("SELL", code, pos.remain_qty, "MINI_TRAIL_STOP")
+                    if ok:
+                        pos.last_sell_attempt_ts = now
+                        pos.selling  = True
+                        pos.time_stop_done = True  # 타임스탑 중복 방지
+                    return
 
         # =========================
         # TP1 시장가 익절 (ATR 기반 목표가 도달 시)

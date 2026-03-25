@@ -37,6 +37,7 @@ class PositionState:
     remain_qty: int
     tp1_done: bool = False
     tp2_done: bool = False
+    tp1_filled_processed: bool = False  # TP1 CHEJAN 전량체결 후처리 완료 여부 (TP2 목표가 갱신용)
     trailing_active: bool = False
     ordering: bool = False
     selling: bool = False
@@ -783,35 +784,43 @@ class KiwoomAPI(QAxWidget):
             # ── TP 체결 상태 반영 (reason 기준) ──
             if pend:
                 reason = pend.get("reason", "")
-                if "TP1" in reason and not pos.tp1_done:
-                    pos.tp1_done = True
-                    pos.tp1_done_ts = pytime.time()
-                    # ── TP2 목표가를 TP1 체결 시점 고점 기준으로 갱신 ──
-                    if pos.atr_value > 0:
-                        pos.atr_tp2_price = self.adjust_tick_size(
-                            int(pos.highest_price + pos.atr_value * ATR_TP_MULT)
-                        )
-                        self.log_trade.info(
-                            f"[TP1_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주 "
-                            f"고점={pos.highest_price} TP2갱신={pos.atr_tp2_price}"
-                        )
+                if "TP1" in reason and not pos.tp1_filled_processed:
+                    # ⭐ FIX: TP1 주문 전량 체결 완료 시에만 TP1_FILLED 후처리
+                    # tp1_done은 TP1_TRIGGER에서 주문 전송 시 즉시 세팅(중복 발동 방지)
+                    # tp1_filled_processed는 CHEJAN 전량 체결 후 세팅(TP2 목표가 갱신용)
+                    tp1_order_qty = pend.get("qty", 0)
+                    tp1_filled_so_far = pend.get("filled_qty", 0)
+                    _tp1_fully_filled = (tp1_order_qty > 0 and tp1_filled_so_far >= tp1_order_qty)
+                    if not _tp1_fully_filled:
+                        pass  # 아직 부분 체결 중 → TP1_FILLED 후처리 보류
                     else:
-                        self.log_trade.info(f"[TP1_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주")
-                    # ── 거래량 급감 감지용 분봉 추적 초기화 ──
-                    pos.vol_peak_high      = pos.highest_price
-                    pos.vol_no_new_high_cnt = 0
-                    pos.vol_candle_volumes  = []
-                    pos.vol_candle_highs    = []
-                    pos.vol_candle_lows     = []
-                    try:
-                        from discord_notify import notify_tp1_fill
-                        tp1_filled_qty = pend.get("qty", delta)
-                        notify_tp1_fill(code, self.get_stock_name(code), tp1_filled_qty, price, pos.entry_price, pos.remain_qty)
-                    except Exception as e:
-                        import traceback
-                        self.log_system.error(
-                            f"[DISCORD_FAIL] TP1알림: {e}\n{traceback.format_exc()}"
-                        )
+                        pos.tp1_filled_processed = True
+                        pos.tp1_done_ts = pytime.time()
+                        # ── TP2 목표가를 TP1 체결 완료 시점 고점 기준으로 갱신 ──
+                        if pos.atr_value > 0:
+                            pos.atr_tp2_price = self.adjust_tick_size(
+                                int(pos.highest_price + pos.atr_value * ATR_TP_MULT)
+                            )
+                            self.log_trade.info(
+                                f"[TP1_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주 "
+                                f"고점={pos.highest_price} TP2갱신={pos.atr_tp2_price}"
+                            )
+                        else:
+                            self.log_trade.info(f"[TP1_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주")
+                        # ── 거래량 급감 감지용 분봉 추적 초기화 ──
+                        pos.vol_peak_high      = pos.highest_price
+                        pos.vol_no_new_high_cnt = 0
+                        pos.vol_candle_volumes  = []
+                        pos.vol_candle_highs    = []
+                        pos.vol_candle_lows     = []
+                        try:
+                            from discord_notify import notify_tp1_fill
+                            notify_tp1_fill(code, self.get_stock_name(code), tp1_order_qty, price, pos.entry_price, pos.remain_qty)
+                        except Exception as e:
+                            import traceback
+                            self.log_system.error(
+                                f"[DISCORD_FAIL] TP1알림: {e}\n{traceback.format_exc()}"
+                            )
 
                 elif "TP2" in reason and not pos.tp2_done:
                     pos.tp2_done = True
@@ -1086,7 +1095,9 @@ class KiwoomAPI(QAxWidget):
             ok = self.send_market_order("SELL", code, tp1_qty, "TP1")
             if ok:
                 pos.last_sell_attempt_ts = now
-                pos.selling = True
+                pos.selling  = True
+                pos.tp1_done = True   # ⭐ FIX: 주문 전송 즉시 플래그 세팅 → 중복 발동 방지
+                                      # 체결 확인은 CHEJAN에서 filled_qty로 추적
             return
 
         # =========================
@@ -1109,7 +1120,8 @@ class KiwoomAPI(QAxWidget):
             ok = self.send_market_order("SELL", code, tp2_qty, "TP2")
             if ok:
                 pos.last_sell_attempt_ts = now
-                pos.selling = True
+                pos.selling  = True
+                pos.tp2_done = True   # ⭐ FIX: 주문 전송 즉시 플래그 세팅 → 중복 발동 방지
             return
 
         # =========================
@@ -1892,8 +1904,23 @@ class KiwoomAPI(QAxWidget):
 
             from kiwoom_api import PositionState
             import time as pytime_
-            # entry_ts를 오늘 장 시작 이전으로 설정 → liquidate_leftover 조건 통과
-            yesterday_ts = pytime_.time() - 86400
+            from datetime import datetime as _dt
+
+            # ⭐ FIX: 장 중 재시작 여부에 따라 entry_ts 결정
+            # - 09:05 이전 재시작: 전일 잔고 → entry_ts = 어제 (liquidate_leftover 대상)
+            # - 09:05 이후 재시작: 당일 신규 매수일 가능성 → entry_ts = now()
+            #   (장 중 재시작으로 복구된 포지션은 강제청산 방지)
+            _now = _dt.now()
+            _market_open = _now.replace(hour=9, minute=5, second=0, microsecond=0)
+            if _now >= _market_open:
+                _entry_ts = pytime_.time()   # 당일 포지션으로 유지
+                self.log_system.warning(
+                    f"[HOLDINGS_RECOVERED_INTRADAY] {name}({code}) "
+                    f"장 중 재시작 복구 → 당일 포지션으로 처리 (강제청산 제외)"
+                )
+            else:
+                _entry_ts = pytime_.time() - 86400  # 전일 잔고
+
             pos = PositionState(
                 code        = code,
                 entry_price = price,
@@ -1903,7 +1930,7 @@ class KiwoomAPI(QAxWidget):
                 ordering    = False,
                 selling     = False,
             )
-            pos.entry_ts = yesterday_ts   # 전일 잔고임을 표시
+            pos.entry_ts = _entry_ts
             pos.buy_done = True
 
             self.positions[code] = pos

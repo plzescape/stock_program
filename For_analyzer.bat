@@ -38,10 +38,13 @@ move "%REPORT_NAME%" "%REPORT_FOLDER%\%REPORT_NAME%"
 if exist logs\trade.log move logs\trade.log "%REPORT_FOLDER%\trade.log"
 if exist logs\signal.log move logs\signal.log "%REPORT_FOLDER%\signal.log"
 if exist logs\system.log move logs\system.log "%REPORT_FOLDER%\system.log"
+if exist logs\discord.log move logs\discord.log "%REPORT_FOLDER%\discord.log"
 
 type nul > logs\trade.log
 type nul > logs\signal.log
 type nul > logs\system.log
+type nul > logs\discord.log
+
 
 echo ==========================
 echo 리포트 생성 및 로그 정리 완료

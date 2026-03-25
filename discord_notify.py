@@ -1,31 +1,31 @@
 """
-discord_notify.py — 디스코드 웹훅 알림
+discord_notify.py — 디스코드 웹훅 알림 (embed 스타일)
 
-[알림 종류]
-  notify_market_open       장 시작
-  notify_buy_fill          매수 체결
-  notify_tp1_fill          TP1 체결
-  notify_tp2_fill          TP2 체결
-  notify_stop_loss         손절 청산
-  notify_profit_safe       본절보호 청산
-  notify_trail_stop        트레일링 스탑 청산
-  notify_time_stop         타임스탑 청산
-  notify_force_liquidation 강제청산
-
-[누락 원인 로깅]
-  logs/discord.log 에 모든 전송 시도/성공/실패 기록
+원본 embed UI + 전송 로깅(logs/discord.log) + 자동 재시도 통합
 """
 
 import os
 import json
 import logging
 import traceback
+import requests
 from datetime import datetime
 
 # ══════════════════════════════════════════════════════
 # 웹훅 URL
 # ══════════════════════════════════════════════════════
-WEBHOOK_URL = "https://discord.com/api/webhooks/1486049515801673728/X8ZvvaZ2ip1DbQvnMeb56Eelk4cs4PhtkSM_d2JdxZka7Hb448vWG1nSfzE2PsKN0b4V"
+_URL_HARDCODED = "https://discord.com/api/webhooks/1486049515801673728/X8ZvvaZ2ip1DbQvnMeb56Eelk4cs4PhtkSM_d2JdxZka7Hb448vWG1nSfzE2PsKN0b4V"
+DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", _URL_HARDCODED)
+
+# ══════════════════════════════════════════════════════
+# 색상
+# ══════════════════════════════════════════════════════
+COLOR_GREEN  = 0x2ECC71
+COLOR_RED    = 0xE74C3C
+COLOR_YELLOW = 0xF1C40F
+COLOR_BLUE   = 0x3498DB
+COLOR_PURPLE = 0x9B59B6
+COLOR_ORANGE = 0xE67E22
 
 # ══════════════════════════════════════════════════════
 # 로거 — logs/discord.log
@@ -38,8 +38,7 @@ def _get_logger():
     try:
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
         os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "discord.log")
-        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh = logging.FileHandler(os.path.join(log_dir, "discord.log"), encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s | %(levelname)s | %(message)s",
@@ -52,167 +51,291 @@ def _get_logger():
 
 
 # ══════════════════════════════════════════════════════
-# 전송 함수
+# 전송 함수 — embed 방식 + 로깅 + 1회 재시도
 # ══════════════════════════════════════════════════════
-def _send(content, alert_type, label):
+def _send(embed: dict, alert_type: str = "", label: str = ""):
+    """embed dict 전송. 실패해도 매매에 영향 없도록 예외 처리."""
     log = _get_logger()
 
-    if not WEBHOOK_URL:
+    if not DISCORD_WEBHOOK_URL:
         log.warning(f"[DISCORD_SKIP] {alert_type} | {label} | WEBHOOK_URL 미설정")
         return False
 
-    payload = json.dumps({"content": content})
+    log.info(f"[DISCORD_SEND] {alert_type} | {label}")
 
-    try:
-        import requests
-        log.info(f"[DISCORD_SEND] {alert_type} | {label}")
-        resp = requests.post(
-            WEBHOOK_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=5
-        )
-        if resp.status_code in (200, 204):
-            log.info(f"[DISCORD_OK] {alert_type} | {label} | HTTP={resp.status_code}")
-            return True
-        else:
-            log.error(f"[DISCORD_FAIL] {alert_type} | {label} | HTTP={resp.status_code} body={resp.text[:200]}")
-            return False
-
-    except ImportError:
-        import urllib.request
-        import urllib.error
+    for attempt in range(1, 3):  # 최대 2회 시도
         try:
-            log.info(f"[DISCORD_SEND_URLLIB] {alert_type} | {label}")
-            data = payload.encode("utf-8")
-            req = urllib.request.Request(
-                WEBHOOK_URL,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST"
+            resp = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"embeds": [embed]},
+                timeout=5
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                status = resp.status
-                if status in (200, 204):
-                    log.info(f"[DISCORD_OK] {alert_type} | {label} | HTTP={status}")
-                    return True
-                else:
-                    log.error(f"[DISCORD_FAIL] {alert_type} | {label} | HTTP={status}")
-                    return False
+            if resp.status_code in (200, 204):
+                log.info(f"[DISCORD_OK] {alert_type} | {label} | HTTP={resp.status_code}")
+                return True
+            else:
+                log.error(f"[DISCORD_FAIL] {alert_type} | {label} | HTTP={resp.status_code} body={resp.text[:200]} 시도={attempt}")
         except Exception as e:
-            log.error(f"[DISCORD_FAIL] {alert_type} | {label} | {type(e).__name__}: {e}\n{traceback.format_exc()}")
-            return False
+            log.error(f"[DISCORD_FAIL] {alert_type} | {label} | {type(e).__name__}: {e} 시도={attempt}")
+            if attempt == 2:
+                log.error(traceback.format_exc())
 
-    except Exception as e:
-        log.error(f"[DISCORD_FAIL] {alert_type} | {label} | {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        return False
-
-
-def _label(code, name):
-    return f"{name}({code})"
+    return False
 
 
-def _pnl_str(entry, exit_price):
-    if not entry:
-        return "N/A"
-    pct = (exit_price - entry) / entry * 100
-    sign = "+" if pct >= 0 else ""
-    return f"{sign}{pct:.2f}%"
+def _fmt_price(price: int) -> str:
+    return f"{price:,}원"
+
+def _fmt_pnl(pnl_rate: float, pnl_amount: int) -> str:
+    sign = "+" if pnl_rate >= 0 else ""
+    return f"{sign}{pnl_rate:.2f}% ({sign}{pnl_amount:,}원)"
 
 
 # ══════════════════════════════════════════════════════
-# 알림 함수
+# 1) 장 시작
 # ══════════════════════════════════════════════════════
-
-def notify_market_open(account_no="", **kwargs):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [
-        f"🔔 **자동매매 시작** | {now}",
-        "장이 열렸습니다. 조건검색 스캔을 시작합니다.",
+def notify_market_open(account_no: str = "", is_real: bool = False,
+                       position_count: int = 0, **kwargs):
+    mode = "⚠️ **실전투자**" if is_real else "🟢 **모의투자**"
+    fields = [
+        {"name": "모드",       "value": mode,               "inline": True},
+        {"name": "계좌번호",   "value": f"`{account_no}`",  "inline": True},
+        {"name": "기존 포지션","value": f"{position_count}개","inline": True},
     ]
-    if account_no:
-        lines.append(f"계좌: {account_no}")
-    return _send("\n".join(lines), "장시작", "시스템")
+    embed = {
+        "title": "🔔 자동매매 시작",
+        "description": "자동매매가 활성화되었습니다.",
+        "color": COLOR_BLUE,
+        "fields": fields,
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "장시작", "시스템")
 
 
-def notify_buy_fill(code, name, qty, price, tp1_price=0, tp2_price=0, signal_data=None, **kwargs):
-    lines = [
-        f"📈 **매수 체결** | {name} `{code}`",
-        f"체결가: **{price:,}원** × {qty:,}주  |  매수금액: {price * qty:,}원",
+# ══════════════════════════════════════════════════════
+# 2) 매수 체결
+# ══════════════════════════════════════════════════════
+def notify_buy_fill(code: str, name: str, qty: int, price: int,
+                    tp1_price: int = 0, tp2_price: int = 0,
+                    signal_data=None, **kwargs):
+    fields = [
+        {"name": "종목",     "value": f"{name} ({code})",       "inline": False},
+        {"name": "수량",     "value": f"{qty:,}주",              "inline": True},
+        {"name": "체결가",   "value": _fmt_price(price),         "inline": True},
+        {"name": "매수금액", "value": _fmt_price(price * qty),   "inline": True},
     ]
     if tp1_price:
-        lines.append(f"TP1 목표: {tp1_price:,}원  |  TP2 목표: {tp2_price:,}원")
+        fields.append({"name": "TP1 목표", "value": _fmt_price(tp1_price), "inline": True})
+    if tp2_price:
+        fields.append({"name": "TP2 목표", "value": _fmt_price(tp2_price), "inline": True})
+
     if signal_data and isinstance(signal_data, dict):
-        for k, v in signal_data.items():
-            lines.append(f"{k}: {v}")
-    return _send("\n".join(lines), "매수", _label(code, name))
+        indicator_lines = []
+        if "vol_ratio"       in signal_data: indicator_lines.append(f"거래량: 평균 대비 **{signal_data['vol_ratio']:.1f}배**")
+        if "trend"           in signal_data: indicator_lines.append(f"추세: {signal_data['trend']}")
+        if "breakout"        in signal_data: indicator_lines.append(f"돌파: {signal_data['breakout']}")
+        if "candle_strength" in signal_data: indicator_lines.append(f"캔들강도: **{signal_data['candle_strength']:.0f}%**")
+        if "rsi"             in signal_data: indicator_lines.append(f"RSI: **{signal_data['rsi']:.1f}**")
+        if "macd"            in signal_data: indicator_lines.append(f"MACD: {signal_data['macd']}")
+        if "flag_len"        in signal_data: indicator_lines.append(f"횡보: {signal_data['flag_len']}봉")
+        if "base_stop"       in signal_data: indicator_lines.append(f"손절기준: **{signal_data['base_stop']:,}원**")
+        if "orderblock"      in signal_data: indicator_lines.append(f"오더블록: **{signal_data['orderblock']}**")
+        if indicator_lines:
+            fields.append({"name": "📈 진입 지표", "value": "\n".join(indicator_lines), "inline": False})
+
+    embed = {
+        "title": "🟢 매수 체결",
+        "color": COLOR_GREEN,
+        "fields": fields,
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "매수", f"{name}({code})")
 
 
-def notify_tp1_fill(code, name, qty, price, entry_price, remain_qty, **kwargs):
-    pnl = _pnl_str(entry_price, price)
-    lines = [
-        f"🎯 **TP1 체결** | {name} `{code}`",
-        f"체결가: **{price:,}원** | 수익률: {pnl}",
-        f"매도: {qty:,}주 | 잔여: {remain_qty:,}주 | 매수가: {entry_price:,}원",
-    ]
-    return _send("\n".join(lines), "TP1", _label(code, name))
+# ══════════════════════════════════════════════════════
+# 3) 손절
+# ══════════════════════════════════════════════════════
+def notify_stop_loss(code: str, name: str, qty: int,
+                     price: int, entry_price: int, **kwargs):
+    pnl_rate   = (price - entry_price) / entry_price * 100
+    pnl_amount = (price - entry_price) * qty
+    embed = {
+        "title": "❌ 손절",
+        "color": COLOR_RED,
+        "fields": [
+            {"name": "종목",     "value": f"{name} ({code})", "inline": False},
+            {"name": "매도가",   "value": _fmt_price(price),  "inline": True},
+            {"name": "수량",     "value": f"{qty:,}주",        "inline": True},
+            {"name": "손해율",   "value": f"{pnl_rate:.2f}%", "inline": True},
+            {"name": "손해금액", "value": f"{pnl_amount:,}원","inline": True},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "손절", f"{name}({code})")
 
 
-def notify_tp2_fill(code, name, qty, price, entry_price, remain_qty, **kwargs):
-    pnl = _pnl_str(entry_price, price)
-    lines = [
-        f"🎯 **TP2 체결** | {name} `{code}`",
-        f"체결가: **{price:,}원** | 수익률: {pnl}",
-        f"매도: {qty:,}주 | 잔여: {remain_qty:,}주 | 매수가: {entry_price:,}원",
-    ]
-    return _send("\n".join(lines), "TP2", _label(code, name))
+# ══════════════════════════════════════════════════════
+# 4) TP1 부분익절
+# ══════════════════════════════════════════════════════
+def notify_tp1_fill(code: str, name: str, qty: int,
+                    price: int, entry_price: int, remain_qty: int, **kwargs):
+    pnl_rate   = (price - entry_price) / entry_price * 100
+    pnl_amount = (price - entry_price) * qty
+    embed = {
+        "title": "💰 TP1 부분익절",
+        "color": COLOR_GREEN,
+        "fields": [
+            {"name": "종목",     "value": f"{name} ({code})",  "inline": False},
+            {"name": "매도가",   "value": _fmt_price(price),   "inline": True},
+            {"name": "수량",     "value": f"{qty:,}주",         "inline": True},
+            {"name": "수익률",   "value": f"+{pnl_rate:.2f}%", "inline": True},
+            {"name": "손익금액", "value": f"+{pnl_amount:,}원","inline": True},
+            {"name": "잔여수량", "value": f"{remain_qty:,}주", "inline": True},
+            {"name": "다음목표", "value": "TP2 / 트레일링 대기","inline": False},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "TP1", f"{name}({code})")
 
 
-def notify_stop_loss(code, name, qty, price, entry_price, **kwargs):
-    pnl = _pnl_str(entry_price, price)
-    lines = [
-        f"🛑 **손절 청산** | {name} `{code}`",
-        f"청산가: **{price:,}원** | 수익률: {pnl}",
-        f"수량: {qty:,}주 | 매수가: {entry_price:,}원",
-    ]
-    return _send("\n".join(lines), "손절", _label(code, name))
+# ══════════════════════════════════════════════════════
+# 5) TP2 익절
+# ══════════════════════════════════════════════════════
+def notify_tp2_fill(code: str, name: str, qty: int,
+                    price: int, entry_price: int, remain_qty: int, **kwargs):
+    pnl_rate   = (price - entry_price) / entry_price * 100
+    pnl_amount = (price - entry_price) * qty
+    embed = {
+        "title": "🚀 TP2 익절",
+        "color": COLOR_GREEN,
+        "fields": [
+            {"name": "종목",     "value": f"{name} ({code})",  "inline": False},
+            {"name": "매도가",   "value": _fmt_price(price),   "inline": True},
+            {"name": "수량",     "value": f"{qty:,}주",         "inline": True},
+            {"name": "수익률",   "value": f"+{pnl_rate:.2f}%", "inline": True},
+            {"name": "손익금액", "value": f"+{pnl_amount:,}원","inline": True},
+            {"name": "잔여수량", "value": f"{remain_qty:,}주", "inline": True},
+            {"name": "",         "value": "📈 트레일링 시작",  "inline": False},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "TP2", f"{name}({code})")
 
 
-def notify_profit_safe(code, name, qty, price, entry_price, **kwargs):
-    pnl = _pnl_str(entry_price, price)
-    lines = [
-        f"🔒 **본절보호 청산** | {name} `{code}`",
-        f"청산가: **{price:,}원** | 수익률: {pnl}",
-        f"수량: {qty:,}주 | 매수가: {entry_price:,}원",
-    ]
-    return _send("\n".join(lines), "본절보호", _label(code, name))
+# ══════════════════════════════════════════════════════
+# 6) 본절보호
+# ══════════════════════════════════════════════════════
+def notify_profit_safe(code: str, name: str, qty: int,
+                       price: int, entry_price: int, **kwargs):
+    pnl_rate   = (price - entry_price) / entry_price * 100
+    pnl_amount = (price - entry_price) * qty
+    embed = {
+        "title": "🛡 본절 보호 매도",
+        "color": COLOR_YELLOW,
+        "fields": [
+            {"name": "종목",     "value": f"{name} ({code})",    "inline": False},
+            {"name": "매도가",   "value": _fmt_price(price),     "inline": True},
+            {"name": "수량",     "value": f"{qty:,}주",           "inline": True},
+            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",   "inline": True},
+            {"name": "손익금액", "value": f"{pnl_amount:+,}원",  "inline": True},
+            {"name": "",         "value": "TP1 이후 하락 방어",  "inline": False},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "본절보호", f"{name}({code})")
 
 
-def notify_trail_stop(code, name, qty, price, entry_price, **kwargs):
-    pnl = _pnl_str(entry_price, price)
-    lines = [
-        f"🔔 **트레일링 청산** | {name} `{code}`",
-        f"청산가: **{price:,}원** | 수익률: {pnl}",
-        f"수량: {qty:,}주 | 매수가: {entry_price:,}원",
-    ]
-    return _send("\n".join(lines), "트레일링", _label(code, name))
+# ══════════════════════════════════════════════════════
+# 7) 트레일링 청산
+# ══════════════════════════════════════════════════════
+def notify_trail_stop(code: str, name: str, qty: int,
+                      price: int, entry_price: int, **kwargs):
+    pnl_rate   = (price - entry_price) / entry_price * 100
+    pnl_amount = (price - entry_price) * qty
+    embed = {
+        "title": "📉 트레일링 청산",
+        "color": COLOR_PURPLE,
+        "fields": [
+            {"name": "종목",     "value": f"{name} ({code})",   "inline": False},
+            {"name": "매도가",   "value": _fmt_price(price),    "inline": True},
+            {"name": "수량",     "value": f"{qty:,}주",          "inline": True},
+            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",  "inline": True},
+            {"name": "손익금액", "value": f"{pnl_amount:+,}원", "inline": True},
+            {"name": "",         "value": "고점 대비 하락 청산","inline": False},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "트레일링", f"{name}({code})")
 
 
-def notify_time_stop(code, name, qty, price, entry_price, reason="TIME_STOP", **kwargs):
-    pnl = _pnl_str(entry_price, price)
-    reason_kr = "거래량급감" if "VOL" in reason else "타임스탑"
-    lines = [
-        f"⏰ **{reason_kr} 청산** | {name} `{code}`",
-        f"청산가: **{price:,}원** | 수익률: {pnl}",
-        f"수량: {qty:,}주 | 매수가: {entry_price:,}원",
-    ]
-    return _send("\n".join(lines), reason_kr, _label(code, name))
+# ══════════════════════════════════════════════════════
+# 8) 타임스탑 / 거래량급감
+# ══════════════════════════════════════════════════════
+def notify_time_stop(code: str, name: str, qty: int,
+                     price: int, entry_price: int,
+                     reason: str = "TIME_STOP", **kwargs):
+    pnl_rate   = (price - entry_price) / entry_price * 100
+    pnl_amount = (price - entry_price) * qty
+    title      = "⏱ 타임스탑 청산" if "VOL" not in reason else "📉 거래량 급감 청산"
+    embed = {
+        "title": title,
+        "color": COLOR_YELLOW,
+        "fields": [
+            {"name": "종목",     "value": f"{name} ({code})",   "inline": False},
+            {"name": "매도가",   "value": _fmt_price(price),    "inline": True},
+            {"name": "수량",     "value": f"{qty:,}주",          "inline": True},
+            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",  "inline": True},
+            {"name": "손익금액", "value": f"{pnl_amount:+,}원", "inline": True},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    alert_type = "거래량급감" if "VOL" in reason else "타임스탑"
+    _send(embed, alert_type, f"{name}({code})")
 
 
-def notify_force_liquidation(code, name, qty, entry_price, **kwargs):
-    lines = [
-        f"🗑️ **강제청산** | {name} `{code}`",
-        f"매수가: {entry_price:,}원 | 수량: {qty:,}주",
-        f"시각: {datetime.now().strftime('%H:%M:%S')}",
-    ]
-    return _send("\n".join(lines), "강제청산", _label(code, name))
+# ══════════════════════════════════════════════════════
+# 9) 강제청산
+# ══════════════════════════════════════════════════════
+def notify_force_liquidation(code: str, name: str, qty: int,
+                              entry_price: int, **kwargs):
+    try:
+        from config import FORCE_LIQUIDATION_HOUR, FORCE_LIQUIDATION_MIN
+        time_str = f"{FORCE_LIQUIDATION_HOUR:02d}:{FORCE_LIQUIDATION_MIN:02d}"
+    except Exception:
+        time_str = "강제"
+    embed = {
+        "title": f"🚨 {time_str} 강제 청산",
+        "color": COLOR_ORANGE,
+        "fields": [
+            {"name": "종목",   "value": f"{name} ({code})",          "inline": False},
+            {"name": "수량",   "value": f"{qty:,}주",                  "inline": True},
+            {"name": "매수가", "value": _fmt_price(entry_price),      "inline": True},
+            {"name": "",       "value": "장 마감 전 강제 시장가 매도","inline": False},
+        ],
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "강제청산", f"{name}({code})")
+
+
+# ══════════════════════════════════════════════════════
+# 10) 범용 시스템 알림
+# ══════════════════════════════════════════════════════
+def notify_system(msg: str, level: str = "INFO"):
+    color_map = {"INFO": COLOR_BLUE, "WARNING": COLOR_YELLOW, "CRITICAL": COLOR_RED}
+    embed = {
+        "title": "🚨 AUTO-TRADE ALERT",
+        "description": msg,
+        "color": color_map.get(level, COLOR_YELLOW),
+        "footer": {"text": "Kiwoom Auto-Trade"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    _send(embed, "시스템", level)

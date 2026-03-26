@@ -2120,6 +2120,14 @@ class KiwoomAPI(QAxWidget):
                     f"[COND_IN_IGNORE] {self.cn(code)} 사유=이미보유중"
                 )
                 return
+            # ⭐ FIX: 주문 접수 중(pending)인 종목 재진입 방지
+            # RC4007 등 거절 응답이 오기 전에 2번째 COND_IN이 들어오면
+            # pending_orders에서 pop되기 전이므로 여기서 차단
+            if code in self.pending_orders:
+                self.log_trade.info(
+                    f"[COND_IN_IGNORE] {self.cn(code)} 사유=주문접수중"
+                )
+                return
             # ⭐ 당일 이미 거래한 종목(체결 완료 or 거절) 재진입 방지
             if code in self.traded_today:
                 self.log_trade.info(

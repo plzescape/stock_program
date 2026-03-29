@@ -660,8 +660,9 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"모멘텀:{momentum_type}"
             )
         else:
+            # ⭐ BREAKOUT_CHECK: 실패 조건별 가시화 (기존 ENTRY_CHECK와 동일 내용)
             logger.info(
-                f"[ENTRY_CHECK] {code} "
+                f"[BREAKOUT_CHECK] {code} "
                 f"ema={ema_aligned}({ema20:.0f}>{ema60:.0f}) "
                 f"rsi={rsi_ok}({rsi14:.1f}) "
                 f"macd={macd_ok}({macd_l:.2f}vs{macd_s:.2f}) "
@@ -672,7 +673,8 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"sr_break={sr_breakout_ok} "
                 f"momentum={momentum_ok}({momentum_type}) "
                 f"ema_gap={ema_gap_ok}({ema_gap_pct:.2f}%≥1%) "
-                f"ema_dist={ema_dist_ok}({ema_dist_pct:.2f}%≤{_dist_limit}%)"
+                f"ema_dist={ema_dist_ok}({ema_dist_pct:.2f}%≤{_dist_limit}%) "
+                f"progress={progress_ok}({candle_progress*100:.0f}%≤70%)"
             )
 
     return is_valid
@@ -905,13 +907,15 @@ def get_pullback_signal_data(candles) -> dict | None:
 
 def is_flag_entry(candles, logger=None, code=None) -> bool:
     """
-    깃발 패턴 진입 전략 (변경 없음)
+    깃발 패턴 진입 전략
 
     [조건 요약]
-    1. 기준봉: 양봉 + 상승폭 ≥ 1.0% + 캔들강도 ≥ 60% + 거래량 3배↑
-    2. 횡보 구간 (3~15봉): 고저 범위 ≤ 기준봉 몸통 60% + 거래량 수렴
-    3. 재돌파봉: 박스 상단 돌파 + 양봉 + 거래량 2배↑
-    4. EMA 정배열: EMA20 > EMA60
+    1. EMA 정배열: EMA20 > EMA60 (대세 상승 확인)
+    2. 기준봉: 양봉 + 상승폭 ≥ 1.0% + 캔들강도 ≥ 60% + 거래량 3배↑
+    3. 횡보 구간 (3~15봉): 고저 범위 ≤ 기준봉 몸통 60% + 거래량 수렴 ≤ 60%
+    4. 재돌파봉: 박스 상단 돌파 + 양봉 + 거래량 2배↑
+       ※ BREAKOUT 필터(ENTRY_CHECK) 미적용 — FLAG는 패턴 자체가 진입 신호
+
     손절: 기준봉 시가
     """
     MIN_FLAG = 3
@@ -982,6 +986,19 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
             c0['volume'] >= avg_flag_vol * 2.0
         )
         if not rebreak_ok:
+            continue
+
+        # ⭐ FLAG 전용 추가 필터: 재돌파봉 캔들강도 ≥ 50% (너무 약한 봉 제거)
+        c0_rng  = c0['high'] - c0['low']
+        c0_body = c0['close'] - c0['open']
+        c0_str  = c0_body / c0_rng if c0_rng > 0 else 0
+        if c0_str < 0.50:
+            if logger:
+                logger.info(
+                    f"[FLAG_CHECK] {code} "
+                    f"flag_len={flag_len} 재돌파 감지됐으나 "
+                    f"캔들강도({c0_str*100:.0f}%<50%) 불충분 → 스킵"
+                )
             continue
 
         sr_boxes = _find_sr_boxes(candles)

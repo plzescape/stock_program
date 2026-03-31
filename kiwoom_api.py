@@ -23,7 +23,7 @@ from config import (
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
     MAX_POSITIONS, TOTAL_BUDGET,
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC,
-    MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP
+    MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP, MINI_TRAIL_GAP_OPEN
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data
@@ -1085,6 +1085,7 @@ class KiwoomAPI(QAxWidget):
         # TP1에 못 미치더라도 수익이 MINI_TRAIL_TRIGGER 이상 오르면 고점 추적,
         # 고점 대비 MINI_TRAIL_GAP 이상 하락 시 즉시 익절
         # 조건: TP1 미체결 + 전량매수 완료 + 트레일링 미활성 상태
+        # ⭐ FIX3: 장 시작 10분(09:00~09:10) 고변동성 구간은 GAP 완화 (1% → 2%)
         # =========================
         if not pos.tp1_done and pos.buy_done and not pos.trailing_active:
             pnl_rate = (cur - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
@@ -1104,15 +1105,21 @@ class KiwoomAPI(QAxWidget):
                 if pnl_rate > pos.mini_trail_peak:
                     pos.mini_trail_peak = pnl_rate
 
+                # ⭐ 시간대별 GAP 분기: 09:10 이전은 완화된 GAP 적용
+                _now_t = datetime.now().time()
+                _open_end = datetime.now().replace(hour=9, minute=10, second=0, microsecond=0).time()
+                _active_gap = MINI_TRAIL_GAP_OPEN if _now_t < _open_end else MINI_TRAIL_GAP
+
                 drop = pos.mini_trail_peak - pnl_rate
-                if drop >= MINI_TRAIL_GAP:
+                if drop >= _active_gap:
                     if not self.can_try_sell(pos):
                         return
                     self.log_trade.info(
                         f"[MINI_TRAIL_STOP] {self.cn(code)} "
                         f"고점={pos.mini_trail_peak*100:.2f}% "
                         f"현재={pnl_rate*100:.2f}% "
-                        f"하락={drop*100:.2f}% → 익절 청산"
+                        f"하락={drop*100:.2f}% "
+                        f"GAP={_active_gap*100:.1f}%({'장초반' if _now_t < _open_end else '일반'}) → 익절 청산"
                     )
                     ok = self.send_market_order("SELL", code, pos.remain_qty, "MINI_TRAIL_STOP")
                     if ok:
@@ -1418,6 +1425,7 @@ class KiwoomAPI(QAxWidget):
                     self.ordering = False
                     self._pending_buy_code = None
                     self._pending_buy_qty = 0
+                    self.traded_today.add(code)  # ⭐ FIX1: 미체결 포기 후 당일 재진입 방지
                     self._resume_scan_if_possible()
                     continue
                 # 로그 스팸 방지: 5초마다 한 번만 경고
@@ -1443,6 +1451,7 @@ class KiwoomAPI(QAxWidget):
                     self.ordering = bool(self.pending_orders)
                     self._pending_buy_code = None
                     self._pending_buy_qty = 0
+                    self.traded_today.add(code)  # ⭐ FIX1: 취소 좀비 정리 후 당일 재진입 방지
                     self._resume_scan_if_possible()
                 continue
 
@@ -1452,6 +1461,7 @@ class KiwoomAPI(QAxWidget):
                 self.ordering = bool(self.pending_orders)
                 self._pending_buy_code = None
                 self._pending_buy_qty = 0
+                self.traded_today.add(code)  # ⭐ FIX1: 취소 포기 후 당일 재진입 방지
                 self._resume_scan_if_possible()
                 continue
             

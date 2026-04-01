@@ -535,146 +535,91 @@ def get_breakout_position_size(entry_price: float,
 
 def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bool:
     """
-    돌파 진입 전략 VER6 — EMA 간격/이격 필터 추가 (과열·횡보 제거)
+    급등 모멘텀 진입 전략 (BREAKOUT)
 
-    [VER6 변경사항]
-      + 조건 J: EMA 간격 필터 (ema20-ema60)/ema60 >= 1%
-                → 횡보장 EMA 붙어있는 가짜 돌파 제거
-      + 조건 K: EMA 이격 필터 (close-ema20)/ema20 <= 4%
-                → 이미 많이 오른 과열 종목 고점 물림 제거
+    조건검색(CHUSAE_INDICATE 등)이 이미 급등 중인 종목을 잡아줌.
+    → 복잡한 추세 필터(EMA이격, EMA간격) 불필요 — 이미 조건검색이 검증함
+    → 핵심 질문: "지금 이 분봉에서 올라타도 되는가?"
 
-    [VER5 유지]
-      + 조건 I: 모멘텀 캔들 확인 (_check_momentum_candle)
-      ± 조건 G: 캔들강도 65%
+    [진입 조건]
+    A. 최소 데이터: 20봉 이상
+    B. 양봉 + 캔들강도 ≥ 50% (약한 봉 제거)
+    C. 거래량 급증: 직전 5봉 평균 대비 2배 이상 (실제 수급 확인)
+    D. 현재봉이 5봉 고점 이상 (상승 모멘텀 유지)
+    E. 당일 누적 상승률 ≤ 25% (상한가 직전 / 너무 늦은 진입 방지)
+    F. 신호봉 진행률 ≤ 80% (봉 후반부 고점 물림 방지, 급등봉 특성상 70%→80% 완화)
+    G. EMA 정배열: 종가 > EMA20 (최소 추세 확인, EMA60 조건 제거)
 
-    [기존 조건 유지]
-      A. EMA 정배열: 종가 > EMA20 > EMA60
-      B. RSI14 ≥ 55
-      C. MACD > 시그널
-      D. MA20 기울기 ≥ 0.3%
-      E. 5봉 고점 돌파 + 양봉
-      F. 거래량 2~15배 (최소 5,000주)
-      G. 캔들강도 ≥ 65%
-      H. SR 박스 저항 돌파 확인
-      I. 모멘텀 캔들 확인
+    [제거된 조건]
+    - EMA 이격 필터 (급등 시 구조적으로 크게 벌어짐)
+    - EMA 간격 필터 (급등 초기엔 EMA20~60 간격 좁을 수 있음)
+    - MACD 조건 (급등 초기엔 MACD 후행)
+    - SR 박스 저항 (조건검색이 이미 돌파 확인)
+    - 모멘텀 캔들 패턴 (급등봉 자체가 모멘텀)
     """
-    if len(candles) < 35:
+    if len(candles) < 20:
         if logger:
-            logger.info(f"[STRATEGY_SKIP] {code} 데이터 부족(필요:35 현재:{len(candles)})")
+            logger.info(f"[BREAKOUT_SKIP] {code} 데이터 부족(필요:20 현재:{len(candles)})")
         return False
 
-    ind = _calc_indicators(candles)
-    if ind is None:
-        if logger:
-            logger.info(f"[STRATEGY_SKIP] {code} 지표 계산 실패")
-        return False
+    c0 = candles[0]   # 현재(가장 최신) 분봉
+    rng  = c0['high'] - c0['low']
+    body = c0['close'] - c0['open']
 
-    c1 = candles[0]
+    # A. 양봉
+    is_bull = body > 0
+    # B. 캔들강도 ≥ 50%
+    str_ok = (body / rng >= 0.50) if rng > 0 else False
 
-    ema20  = ind["ema20"]
-    ema60  = ind["ema60"]
-    rsi14  = ind["rsi14"]
-    macd_l = ind["macd_line"]
-    macd_s = ind["macd_signal"]
-    slope  = ind["ma20_slope_pct"]
+    # C. 거래량 급증: 직전 5봉 평균 대비 2배+
+    avg_vol5 = sum(c['volume'] for c in candles[1:6]) / 5 if len(candles) >= 6 else 0
+    vol_ratio = c0['volume'] / avg_vol5 if avg_vol5 > 0 else 0
+    vol_ok = vol_ratio >= 2.0 and c0['volume'] >= 3000
 
-    # A. EMA 정배열
-    ema_aligned = (c1['close'] > ema20 > ema60)
+    # D. 현재봉 고가가 직전 5봉 최고가 이상 (상승 모멘텀)
+    prev5_high = max(c['high'] for c in candles[1:6]) if len(candles) >= 6 else 0
+    price_ok = c0['high'] >= prev5_high
 
-    # B. RSI
-    rsi_ok = rsi14 >= 55
+    # E. 당일 누적 상승률 ≤ 25%
+    # 가장 오래된 봉(≈장 시작 시점) 대비 현재가 상승률
+    day_open = candles[-1]['open'] if candles else c0['open']
+    day_rise = (c0['close'] - day_open) / day_open * 100 if day_open > 0 else 0
+    surge_ok = day_rise <= 25.0
 
-    # C. MACD
-    macd_ok = macd_l > macd_s
+    # F. 신호봉 진행률 ≤ 80% (고점에서 진입 방지)
+    h_o = c0['high'] - c0['open']
+    progress = (c0['close'] - c0['open']) / h_o if h_o > 0 else 1.0
+    progress_ok = progress <= 0.80
 
-    # D. MA20 기울기
-    trend_ok = slope >= 0.3
+    # G. 최소 추세: 종가 > EMA20
+    closes = [c['close'] for c in candles]
+    ema20 = _calc_ema(closes, 20)
+    ema_ok = (ema20 is not None) and (c0['close'] > ema20)
 
-    # E. 5봉 고점 돌파 (VER7: 2단계 조건)
-    # STRONG: 종가가 5봉고점 완전 돌파 → 강한 진입 신호
-    # NEAR  : 종가가 5봉고점의 1% 이내 근접 + 현재봉 고가가 돌파
-    #         → 위꼬리로 신고점 찍은 경우, 다음 봉 돌파 확률 높음
-    prev_5_high  = max(c['high'] for c in candles[1:6])
-    _price_strong = (c1['close'] > prev_5_high)
-    _price_near   = (c1['close'] >= prev_5_high * 0.99 and c1['high'] > prev_5_high)
-    price_ok      = (_price_strong or _price_near) and c1['close'] > c1['open']
-
-    # F. 거래량
-    avg_vol   = sum(c['volume'] for c in candles[1:6]) / 5
-    vol_ratio = c1['volume'] / avg_vol if avg_vol > 0 else 0
-    vol_ok    = (MIN_VOL_RATIO <= vol_ratio <= MAX_VOL_RATIO and c1['volume'] >= 5000)
-
-    # G. 캔들강도 ≥ 65% (기존 60% → 강화)
-    rng    = c1['high'] - c1['low']
-    body   = c1['close'] - c1['open']
-    str_ok = (body / rng) >= 0.65 if rng > 0 else False
-
-    # H. SR 박스 저항 돌파
-    sr_boxes       = _find_sr_boxes(candles)
-    near_resist, r_lo, r_hi = _near_sr_box(
-        c1['close'], sr_boxes, 'resistance', proximity=0.025
-    )
-    sr_breakout_ok = (not near_resist) or (c1['close'] > r_hi)
-
-    # I. 모멘텀 캔들 확인
-    momentum_ok, momentum_type = _check_momentum_candle(candles)
-
-    # L. 신호봉 진행률 필터 (고점 물림 방지)
-    # 현재봉이 이미 상승 후반부(70%+)면 다음봉 눌림 손절 가능성 높음
-    # body_progress = (close - open) / (high - open) : 봉 고가 대비 현재 도달률
-    h_o = c1['high'] - c1['open']
-    candle_progress = (c1['close'] - c1['open']) / h_o if h_o > 0 else 1.0
-    progress_ok = candle_progress <= 0.70   # 70% 이하만 허용
-
-    # J. EMA 간격 필터 (횡보장 가짜 돌파 제거)
-    # EMA20과 EMA60 사이가 최소 1% 이상 벌어진 강한 추세만 허용
-    # EMA가 붙어있는 횡보 구간에서 나오는 돌파는 false breakout 가능성 높음
-    ema_gap_pct    = (ema20 - ema60) / ema60 * 100 if ema60 > 0 else 0
-    ema_gap_ok     = ema_gap_pct >= 1.0
-
-    # K. EMA 이격 필터 (과열 고점 물림 제거)
-    # 종가가 EMA20 대비 4% 이상 벌어진 과열 구간은 진입 금지
-    # strict=True(CHUSAE_INDICATE 등 품질 낮은 조건식): 2.5%로 강화
-    ema_dist_pct   = (c1['close'] - ema20) / ema20 * 100 if ema20 > 0 else 0
-    _dist_limit    = 2.5 if strict else 4.5   # VER7: 4.0→4.5 완화 (미세초과 탈락 방지)
-    ema_dist_ok    = ema_dist_pct <= _dist_limit
-
-    is_valid = (ema_aligned and rsi_ok and macd_ok and trend_ok and
-                price_ok and vol_ok and str_ok and
-                sr_breakout_ok and momentum_ok and
-                ema_gap_ok and ema_dist_ok and
-                progress_ok)
+    is_valid = is_bull and str_ok and vol_ok and price_ok and surge_ok and progress_ok and ema_ok
 
     if logger:
         str_pct = body / rng * 100 if rng > 0 else 0
         if is_valid:
             logger.info(
-                f"[ENTRY_CONFIRMED] {code} | "
-                f"종가:{c1['close']} EMA20:{ema20:.0f} EMA60:{ema60:.0f} | "
-                f"RSI:{rsi14:.1f} MACD:{macd_l:.2f}>{macd_s:.2f} | "
-                f"기울기:{slope:.2f}% | "
-                f"EMA간격:{ema_gap_pct:.2f}%(≥1%) EMA이격:{ema_dist_pct:.2f}%(≤4.5%) | "
-                f"5봉고점{'돌파' if _price_strong else '근접'}:{prev_5_high}(현재고가={c1['high']}) | "
-                f"거래량:{c1['volume']}(평균의 {vol_ratio:.1f}배) | "
-                f"SR저항돌파:{sr_breakout_ok}(저항박스:{r_lo}~{r_hi}) | "
-                f"모멘텀:{momentum_type}"
+                f"[BREAKOUT_CONFIRMED] {code} | "
+                f"현재가:{c0['close']} EMA20:{ema20:.0f} | "
+                f"캔들강도:{str_pct:.0f}% | "
+                f"거래량:{vol_ratio:.1f}배({c0['volume']:,}주) | "
+                f"5봉고점:{prev5_high}(돌파={price_ok}) | "
+                f"당일상승:{day_rise:.1f}% | "
+                f"진행률:{progress*100:.0f}%"
             )
         else:
-            # ⭐ BREAKOUT_CHECK: 실패 조건별 가시화 (기존 ENTRY_CHECK와 동일 내용)
             logger.info(
                 f"[BREAKOUT_CHECK] {code} "
-                f"ema={ema_aligned}({ema20:.0f}>{ema60:.0f}) "
-                f"rsi={rsi_ok}({rsi14:.1f}) "
-                f"macd={macd_ok}({macd_l:.2f}vs{macd_s:.2f}) "
-                f"trend={trend_ok}(slope={slope:.2f}%) "
-                f"price={price_ok}({'돌파' if _price_strong else '근접'},{prev_5_high}) "
+                f"bull={is_bull} "
+                f"strength={str_ok}({str_pct:.0f}%≥50%) "
                 f"vol={vol_ok}({vol_ratio:.1f}배) "
-                f"strength={str_ok}({str_pct:.0f}%≥65%) "
-                f"sr_break={sr_breakout_ok} "
-                f"momentum={momentum_ok}({momentum_type}) "
-                f"ema_gap={ema_gap_ok}({ema_gap_pct:.2f}%≥1%) "
-                f"ema_dist={ema_dist_ok}({ema_dist_pct:.2f}%≤{_dist_limit}%) "
-                f"progress={progress_ok}({candle_progress*100:.0f}%≤70%)"
+                f"price={price_ok}(5봉고={prev5_high}) "
+                f"surge={surge_ok}({day_rise:.1f}%≤25%) "
+                f"progress={progress_ok}({progress*100:.0f}%≤80%) "
+                f"ema={ema_ok}({c0['close']}>{ema20:.0f if ema20 else 0})"
             )
 
     return is_valid

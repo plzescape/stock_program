@@ -459,20 +459,12 @@ class KiwoomAPI(QAxWidget):
         #   FLAG    : 횡보 수렴 후 재돌파 → 패턴 명확, 손절선 뚜렷
         #   BREAKOUT: 신고점 돌파 → 체결 많지만 고점 물림 위험 → 마지막 확인
         entry_type = None
-        if len(completed_candles) >= 35:
-            # CHUSAE_INDICATE 조건식은 품질 낮은 종목 다수 포함
-            # → BREAKOUT 판정 시 EMA이격 기준 2.5%로 강화 (strict 모드)
-            _cname_chk   = info.get("cond_name", "")
-            _strict_mode = (_cname_chk == "CHUSAE_INDICATE")
-
+        if len(completed_candles) >= 20:   # 새 BREAKOUT 전략은 20봉만 필요
             if is_pullback_entry(completed_candles, self.log_signal, code):
                 entry_type = "PULLBACK"
             elif is_flag_entry(completed_candles, self.log_signal, code):
                 entry_type = "FLAG"
-            elif is_entry_candidate_VER2(
-                completed_candles, self.log_signal, code,
-                strict=_strict_mode      # CHUSAE 시 이격 기준 강화
-            ):
+            elif is_entry_candidate_VER2(completed_candles, self.log_signal, code):
                 entry_type = "BREAKOUT"
 
         if entry_type and len(self.positions) < MAX_POSITIONS:

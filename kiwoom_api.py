@@ -39,6 +39,7 @@ class PositionState:
     tp1_done: bool = False
     tp2_done: bool = False
     tp1_filled_processed: bool = False  # TP1 CHEJAN 전량체결 후처리 완료 여부 (TP2 목표가 갱신용)
+    tp2_filled_processed: bool = False  # TP2 CHEJAN 전량체결 후처리 완료 여부 (디스코드 알림용)
     trailing_active: bool = False
 
     # ── 미니 트레일링 스탑 (TP1 미달 구간 수익 보호) ──
@@ -827,21 +828,27 @@ class KiwoomAPI(QAxWidget):
                                 f"[DISCORD_FAIL] TP1알림: {e}\n{traceback.format_exc()}"
                             )
 
-                elif "TP2" in reason and not pos.tp2_done:
-                    pos.tp2_done = True
-                    pos.tp2_done_ts = pytime.time()
-                    pos.trailing_active = True
-                    self.log_trade.info(f"[TP2_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주 트레일링=ON")
-                    try:
-                        from discord_notify import notify_tp2_fill
-                        # TP2 주문 수량도 동일하게 pend["qty"] 사용
-                        tp2_filled_qty = pend.get("qty", delta)
-                        notify_tp2_fill(code, self.get_stock_name(code), tp2_filled_qty, price, pos.entry_price, pos.remain_qty)
-                    except Exception as e:
-                        import traceback
-                        self.log_system.error(
-                            f"[DISCORD_FAIL] TP2알림: {e}\n{traceback.format_exc()}"
-                        )
+                elif "TP2" in reason and not pos.tp2_filled_processed:
+                    # ⭐ FIX 버그1: tp2_done(중복방지)과 tp2_filled_processed(알림용) 분리
+                    # tp2_done은 TP2_TRIGGER에서 즉시 세팅 → CHEJAN 조건에 사용 불가
+                    # tp2_filled_processed는 CHEJAN 전량체결 후에만 세팅 → 알림 트리거용
+                    tp2_order_qty = pend.get("qty", 0)
+                    tp2_filled_so_far = pend.get("filled_qty", 0)
+                    _tp2_fully_filled = (tp2_order_qty > 0 and tp2_filled_so_far >= tp2_order_qty)
+                    if _tp2_fully_filled:
+                        pos.tp2_filled_processed = True
+                        pos.tp2_done_ts = pytime.time()
+                        pos.trailing_active = True
+                        self.log_trade.info(f"[TP2_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주 트레일링=ON")
+                        try:
+                            from discord_notify import notify_tp2_fill
+                            tp2_filled_qty = pend.get("qty", delta)
+                            notify_tp2_fill(code, self.get_stock_name(code), tp2_filled_qty, price, pos.entry_price, pos.remain_qty)
+                        except Exception as e:
+                            import traceback
+                            self.log_system.error(
+                                f"[DISCORD_FAIL] TP2알림: {e}\n{traceback.format_exc()}"
+                            )
 
             if pos.remain_qty > 0:
                 # ⭐ 부분체결: selling 유지 (중복 매도 방지)
@@ -1160,7 +1167,10 @@ class KiwoomAPI(QAxWidget):
         # TP2 시장가 익절 (ATR 기반 - TP1 고점 기준 갱신된 목표가)
         # =========================
         tp2_target = pos.atr_tp2_price if pos.atr_tp2_price > 0 else self.adjust_tick_size(int(pos.entry_price * 1.03))
-        if pos.tp1_done and not pos.tp2_done and cur >= tp2_target:
+        # ⭐ FIX 버그2: tp1_filled_processed 완료 후에만 TP2 발동
+        # TP1 CHEJAN 전량체결 전에 TP2가 발동되면 atr_tp2_price가 갱신되지 않은 초기값
+        # (TP1과 동일한 가격)으로 발동되어 분할 의미가 없어짐
+        if pos.tp1_done and pos.tp1_filled_processed and not pos.tp2_done and cur >= tp2_target:
             if not self.can_try_sell(pos):
                 return
             # TP2 수량 계산

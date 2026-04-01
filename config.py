@@ -35,7 +35,7 @@ EMERGENCY_SL_RATE    = 0.025     # 실시간 안전망: -2.5% (ATR 손절과 별
 #   트레일링: TP2 후 최고가 - ATR × ATR_TRAIL_MULT 이하 시 청산
 ATR_PERIOD    = 14      # ATR 계산에 사용할 분봉 수
 ATR_SL_MULT   = 1.5    # 손절 배수
-ATR_TP_MULT   = 3.0    # 익절 배수 (TP1, TP2 공통)
+ATR_TP_MULT   = 2.0    # 익절 배수 (TP1, TP2 공통) ← 3.0→2.0 조정 (10분 보유 내 달성 가능성 향상)
 ATR_SAFE_MULT = 1.5    # 본절보호 배수 (TP1 후 매수가 이하 보호선)
 ATR_TRAIL_MULT = 1.5   # 트레일링 스탑 배수 (고점 기준)
 

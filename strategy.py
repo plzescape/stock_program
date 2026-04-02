@@ -37,7 +37,7 @@ PULLBACK / FLAG: 변경 없음
 
 from datetime import datetime, time
 
-MIN_VOL_RATIO = 1.5   # VER7: 2.0→1.5 완화 (거래량 약한 장 대응)
+MIN_VOL_RATIO = 3.0   # 급등주 진입: 최소 3배 이상 거래량 급증 ← 1.5→3.0 강화
 MAX_VOL_RATIO = 15.0
 
 
@@ -619,7 +619,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"price={price_ok}(5봉고={prev5_high}) "
                 f"surge={surge_ok}({day_rise:.1f}%≤25%) "
                 f"progress={progress_ok}({progress*100:.0f}%≤80%) "
-                f"ema={ema_ok}({c0['close']}>{ema20:.0f if ema20 else 0})"
+                f"ema={ema_ok}({c0['close']}>{(ema20 or 0):.0f})"
             )
 
     return is_valid

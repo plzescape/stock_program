@@ -118,6 +118,7 @@ def notify_market_open(account_no: str = "", is_real: bool = False,
 # ══════════════════════════════════════════════════════
 def notify_buy_fill(code: str, name: str, qty: int, price: int,
                     tp1_price: int = 0, tp2_price: int = 0,
+                    sl_price: int = 0, atr: float = 0,
                     signal_data=None, **kwargs):
     fields = [
         {"name": "종목",     "value": f"{name} ({code})",       "inline": False},
@@ -125,10 +126,14 @@ def notify_buy_fill(code: str, name: str, qty: int, price: int,
         {"name": "체결가",   "value": _fmt_price(price),         "inline": True},
         {"name": "매수금액", "value": _fmt_price(price * qty),   "inline": True},
     ]
+    if sl_price:
+        fields.append({"name": "손절가",   "value": _fmt_price(sl_price),  "inline": True})
     if tp1_price:
         fields.append({"name": "TP1 목표", "value": _fmt_price(tp1_price), "inline": True})
     if tp2_price:
         fields.append({"name": "TP2 목표", "value": _fmt_price(tp2_price), "inline": True})
+    if atr:
+        fields.append({"name": "ATR",      "value": f"{atr:.1f}원",        "inline": True})
 
     if signal_data and isinstance(signal_data, dict):
         indicator_lines = []
@@ -158,7 +163,8 @@ def notify_buy_fill(code: str, name: str, qty: int, price: int,
 # 3) 손절
 # ══════════════════════════════════════════════════════
 def notify_stop_loss(code: str, name: str, qty: int,
-                     price: int, entry_price: int, **kwargs):
+                     price: int, entry_price: int,
+                     atr: float = 0, **kwargs):
     pnl_rate   = (price - entry_price) / entry_price * 100
     pnl_amount = (price - entry_price) * qty
     embed = {
@@ -170,7 +176,7 @@ def notify_stop_loss(code: str, name: str, qty: int,
             {"name": "수량",     "value": f"{qty:,}주",        "inline": True},
             {"name": "손해율",   "value": f"{pnl_rate:.2f}%", "inline": True},
             {"name": "손해금액", "value": f"{pnl_amount:,}원","inline": True},
-        ],
+        ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -181,21 +187,24 @@ def notify_stop_loss(code: str, name: str, qty: int,
 # 4) TP1 부분익절
 # ══════════════════════════════════════════════════════
 def notify_tp1_fill(code: str, name: str, qty: int,
-                    price: int, entry_price: int, remain_qty: int, **kwargs):
+                    price: int, entry_price: int, remain_qty: int,
+                    tp2_target: int = 0, atr: float = 0, **kwargs):
     pnl_rate   = (price - entry_price) / entry_price * 100
     pnl_amount = (price - entry_price) * qty
+    # TP2 목표가 표시: 전달된 값이 없거나 0이면 "갱신 중" 표시
+    tp2_str = _fmt_price(tp2_target) if tp2_target > 0 else "갱신 중"
     embed = {
         "title": "💰 TP1 부분익절",
         "color": COLOR_GREEN,
         "fields": [
-            {"name": "종목",     "value": f"{name} ({code})",  "inline": False},
-            {"name": "매도가",   "value": _fmt_price(price),   "inline": True},
-            {"name": "수량",     "value": f"{qty:,}주",         "inline": True},
-            {"name": "수익률",   "value": f"+{pnl_rate:.2f}%", "inline": True},
-            {"name": "손익금액", "value": f"+{pnl_amount:,}원","inline": True},
-            {"name": "잔여수량", "value": f"{remain_qty:,}주", "inline": True},
-            {"name": "다음목표", "value": "TP2 / 트레일링 대기","inline": False},
-        ],
+            {"name": "종목",      "value": f"{name} ({code})",   "inline": False},
+            {"name": "TP1 체결가", "value": _fmt_price(price),    "inline": True},
+            {"name": "수량",      "value": f"{qty:,}주",           "inline": True},
+            {"name": "수익률",    "value": f"+{pnl_rate:.2f}%",   "inline": True},
+            {"name": "손익금액",  "value": f"+{pnl_amount:,}원",  "inline": True},
+            {"name": "잔여수량",  "value": f"{remain_qty:,}주",   "inline": True},
+            {"name": "TP2 목표가","value": tp2_str,               "inline": True},
+        ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -206,21 +215,23 @@ def notify_tp1_fill(code: str, name: str, qty: int,
 # 5) TP2 익절
 # ══════════════════════════════════════════════════════
 def notify_tp2_fill(code: str, name: str, qty: int,
-                    price: int, entry_price: int, remain_qty: int, **kwargs):
+                    price: int, entry_price: int, remain_qty: int,
+                    trail_target: int = 0, atr: float = 0, **kwargs):
     pnl_rate   = (price - entry_price) / entry_price * 100
     pnl_amount = (price - entry_price) * qty
+    trail_str  = _fmt_price(trail_target) if trail_target > 0 else "트레일링 추적 중"
     embed = {
         "title": "🚀 TP2 익절",
         "color": COLOR_GREEN,
         "fields": [
-            {"name": "종목",     "value": f"{name} ({code})",  "inline": False},
-            {"name": "매도가",   "value": _fmt_price(price),   "inline": True},
-            {"name": "수량",     "value": f"{qty:,}주",         "inline": True},
-            {"name": "수익률",   "value": f"+{pnl_rate:.2f}%", "inline": True},
-            {"name": "손익금액", "value": f"+{pnl_amount:,}원","inline": True},
-            {"name": "잔여수량", "value": f"{remain_qty:,}주", "inline": True},
-            {"name": "",         "value": "📈 트레일링 시작",  "inline": False},
-        ],
+            {"name": "종목",        "value": f"{name} ({code})",   "inline": False},
+            {"name": "TP2 체결가",  "value": _fmt_price(price),    "inline": True},
+            {"name": "수량",        "value": f"{qty:,}주",           "inline": True},
+            {"name": "수익률",      "value": f"+{pnl_rate:.2f}%",  "inline": True},
+            {"name": "손익금액",    "value": f"+{pnl_amount:,}원", "inline": True},
+            {"name": "잔여수량",    "value": f"{remain_qty:,}주",  "inline": True},
+            {"name": "트레일링 기준","value": trail_str,            "inline": True},
+        ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -231,7 +242,8 @@ def notify_tp2_fill(code: str, name: str, qty: int,
 # 6) 본절보호
 # ══════════════════════════════════════════════════════
 def notify_profit_safe(code: str, name: str, qty: int,
-                       price: int, entry_price: int, **kwargs):
+                       price: int, entry_price: int,
+                       atr: float = 0, **kwargs):
     pnl_rate   = (price - entry_price) / entry_price * 100
     pnl_amount = (price - entry_price) * qty
     embed = {
@@ -244,7 +256,7 @@ def notify_profit_safe(code: str, name: str, qty: int,
             {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",   "inline": True},
             {"name": "손익금액", "value": f"{pnl_amount:+,}원",  "inline": True},
             {"name": "",         "value": "TP1 이후 하락 방어",  "inline": False},
-        ],
+        ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -255,7 +267,8 @@ def notify_profit_safe(code: str, name: str, qty: int,
 # 7) 트레일링 청산
 # ══════════════════════════════════════════════════════
 def notify_trail_stop(code: str, name: str, qty: int,
-                      price: int, entry_price: int, **kwargs):
+                      price: int, entry_price: int,
+                      atr: float = 0, **kwargs):
     pnl_rate   = (price - entry_price) / entry_price * 100
     pnl_amount = (price - entry_price) * qty
     embed = {
@@ -268,7 +281,7 @@ def notify_trail_stop(code: str, name: str, qty: int,
             {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",  "inline": True},
             {"name": "손익금액", "value": f"{pnl_amount:+,}원", "inline": True},
             {"name": "",         "value": "고점 대비 하락 청산","inline": False},
-        ],
+        ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -276,7 +289,8 @@ def notify_trail_stop(code: str, name: str, qty: int,
 
 
 def notify_mini_trail_stop(code: str, name: str, qty: int,
-                           price: int, entry_price: int, **kwargs):
+                           price: int, entry_price: int,
+                           atr: float = 0, **kwargs):
     pnl_rate   = (price - entry_price) / entry_price * 100
     pnl_amount = (price - entry_price) * qty
     embed = {
@@ -289,7 +303,7 @@ def notify_mini_trail_stop(code: str, name: str, qty: int,
             {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",            "inline": True},
             {"name": "손익금액", "value": f"{pnl_amount:+,}원",           "inline": True},
             {"name": "",         "value": "수익 보호 트레일링 (TP1 전)", "inline": False},
-        ],
+        ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -301,7 +315,7 @@ def notify_mini_trail_stop(code: str, name: str, qty: int,
 # ══════════════════════════════════════════════════════
 def notify_time_stop(code: str, name: str, qty: int,
                      price: int, entry_price: int,
-                     reason: str = "TIME_STOP", **kwargs):
+                     reason: str = "TIME_STOP", atr: float = 0, **kwargs):
     pnl_rate   = (price - entry_price) / entry_price * 100
     pnl_amount = (price - entry_price) * qty
     title      = "⏱ 타임스탑 청산" if "VOL" not in reason else "📉 거래량 급감 청산"
@@ -314,7 +328,7 @@ def notify_time_stop(code: str, name: str, qty: int,
             {"name": "수량",     "value": f"{qty:,}주",          "inline": True},
             {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",  "inline": True},
             {"name": "손익금액", "value": f"{pnl_amount:+,}원", "inline": True},
-        ],
+        ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }

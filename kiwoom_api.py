@@ -746,6 +746,8 @@ class KiwoomAPI(QAxWidget):
                         price=pos.entry_price,
                         tp1_price=tp1_target,
                         tp2_price=tp2_target,
+                        sl_price=pos.atr_sl_price,
+                        atr=pos.atr_value,
                         signal_data=self._entry_signals.pop(code, None)
                     )
                 except Exception as e:
@@ -813,7 +815,10 @@ class KiwoomAPI(QAxWidget):
                         pos.vol_candle_lows     = []
                         try:
                             from discord_notify import notify_tp1_fill
-                            notify_tp1_fill(code, self.get_stock_name(code), tp1_order_qty, price, pos.entry_price, pos.remain_qty)
+                            notify_tp1_fill(code, self.get_stock_name(code), tp1_order_qty, price,
+                                            pos.entry_price, pos.remain_qty,
+                                            tp2_target=pos.atr_tp2_price,
+                                            atr=pos.atr_value)  # ⭐ TP2 목표가 + ATR 전달
                         except Exception as e:
                             import traceback
                             self.log_system.error(
@@ -835,7 +840,7 @@ class KiwoomAPI(QAxWidget):
                         try:
                             from discord_notify import notify_tp2_fill
                             tp2_filled_qty = pend.get("qty", delta)
-                            notify_tp2_fill(code, self.get_stock_name(code), tp2_filled_qty, price, pos.entry_price, pos.remain_qty)
+                            notify_tp2_fill(code, self.get_stock_name(code), tp2_filled_qty, price, pos.entry_price, pos.remain_qty, atr=pos.atr_value)
                         except Exception as e:
                             import traceback
                             self.log_system.error(
@@ -868,25 +873,25 @@ class KiwoomAPI(QAxWidget):
                 if "TP1" in sell_reason and not pos.tp1_done:
                     # TP1 주문이 전량 소진되며 SELL_DONE 도달한 경우
                     from discord_notify import notify_tp1_fill
-                    notify_tp1_fill(code, stock_name, sold_qty, price, entry_p, 0)
+                    notify_tp1_fill(code, stock_name, sold_qty, price, entry_p, 0, atr=pos.atr_value)
                 elif "TP2" in sell_reason and not pos.tp2_done:
                     from discord_notify import notify_tp2_fill
-                    notify_tp2_fill(code, stock_name, sold_qty, price, entry_p, 0)
+                    notify_tp2_fill(code, stock_name, sold_qty, price, entry_p, 0, atr=pos.atr_value)
                 elif "STOP_LOSS" in sell_reason:
                     from discord_notify import notify_stop_loss
-                    notify_stop_loss(code, stock_name, sold_qty, price, entry_p)
+                    notify_stop_loss(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "PROFIT_SAFE" in sell_reason:
                     from discord_notify import notify_profit_safe
-                    notify_profit_safe(code, stock_name, sold_qty, price, entry_p)
+                    notify_profit_safe(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "MINI_TRAIL_STOP" in sell_reason:
                     from discord_notify import notify_mini_trail_stop
-                    notify_mini_trail_stop(code, stock_name, sold_qty, price, entry_p)
+                    notify_mini_trail_stop(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "TRAIL" in sell_reason:
                     from discord_notify import notify_trail_stop
-                    notify_trail_stop(code, stock_name, sold_qty, price, entry_p)
+                    notify_trail_stop(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "TIME_STOP" in sell_reason or "VOL_TIME_STOP" in sell_reason:
                     from discord_notify import notify_time_stop
-                    notify_time_stop(code, stock_name, sold_qty, price, entry_p, sell_reason)
+                    notify_time_stop(code, stock_name, sold_qty, price, entry_p, sell_reason, atr=pos.atr_value)
                 elif "FORCE_LIQUIDATION" in sell_reason or "LEFTOVER_LIQUIDATION" in sell_reason:
                     from discord_notify import notify_force_liquidation
                     notify_force_liquidation(code, stock_name, sold_qty, entry_p)
@@ -1191,10 +1196,16 @@ class KiwoomAPI(QAxWidget):
         _raw_safe = pos.atr_safe_price if pos.atr_safe_price > 0 else pos.entry_price
         safe_price = max(pos.entry_price, _raw_safe)
         if pos.tp1_done and cur <= safe_price:
-            if self.can_try_sell(pos):
+            # ⭐ FIX③: TP1 체결 직후 30초 유예 — 체결 직후 순간 눌림 방지
+            # TP1 체결 후 바로 본절보호가 발동되면 정상적인 조정 폭에도 청산됨
+            _tp1_elapsed = now - pos.tp1_done_ts if pos.tp1_done_ts else 999
+            if _tp1_elapsed < 30:
+                pass  # 유예 중 — 발동 보류
+            elif self.can_try_sell(pos):
                 self.log_trade.info(
                     f"[PROFIT_SAFEGUARD] {self.cn(code)} 본절보호 매도 "
-                    f"현재가:{cur} 보호선:{safe_price} (ATR×{ATR_SAFE_MULT})"
+                    f"현재가:{cur} 보호선:{safe_price} (ATR×{ATR_SAFE_MULT}) "
+                    f"TP1후={_tp1_elapsed:.0f}초"
                 )
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "PROFIT_SAFE")
                 if ok:

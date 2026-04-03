@@ -69,7 +69,9 @@ class PositionState:
     entry_type: str = ""          # 진입 전략 타입 (BREAKOUT/PULLBACK/FLAG)
     flag_stop_price: int = 0      # FLAG 전용 손절가 (기준봉 시가, 0이면 미사용)
 
-    # ⭐ 완성봉 기준 손절용 — 틱에서 1분봉을 직접 합산
+    # ⭐ 정확한 손익 계산용 — 분할체결 가중평균
+    avg_buy_price:   float = 0.0  # 가중평균 매수가 (분할체결 전체 반영)
+    buy_cost_total:  int   = 0    # 총 매수비용 (price×qty 누적합)
     sl_candle_minute: int = -1     # 현재 쌓고 있는 분봉의 minute(-1=미초기화)
     sl_candle_open:   int = 0      # 현재 분봉 시가
     sl_candle_high:   int = 0      # 현재 분봉 고가
@@ -687,11 +689,19 @@ class KiwoomAPI(QAxWidget):
             # --------------------------------------------------
             if pos.remain_qty + qty <= pos.total_qty:
                 # 일반적인 "증분 체결수량" 케이스
+                delta_buy = qty
                 pos.remain_qty += qty
             else:
                 # "누적 체결수량" 또는 중복 이벤트 가능성 → 누적로 해석해 보정
                 # (현재 remain과 qty 중 큰 값을 누적 체결로 보고 total_qty로 캡)
+                delta_buy = min(pos.total_qty, max(pos.remain_qty, qty)) - pos.remain_qty
                 pos.remain_qty = min(pos.total_qty, max(pos.remain_qty, qty))
+
+            # ⭐ 가중평균 매수가 누적 (분할체결 정확한 손익 계산용)
+            if delta_buy > 0:
+                pos.buy_cost_total += price * delta_buy
+                if pos.remain_qty > 0:
+                    pos.avg_buy_price = pos.buy_cost_total / pos.remain_qty
 
             # 안전장치: 어떤 경우에도 total_qty 초과 금지
             if pos.remain_qty > pos.total_qty:
@@ -865,10 +875,15 @@ class KiwoomAPI(QAxWidget):
             # ── 디스코드 매도 알림 (reason별 분기) ──
             try:
                 stock_name = self.get_stock_name(code)
-                entry_p = pos.entry_price
+                # ⭐ FIX 버그2: entry_price(첫 체결가) → avg_buy_price(가중평균) 사용
+                # 분할체결 시 첫 체결가와 실제 평균 매수가 차이 → 손익 오표시 수정
+                entry_p = int(pos.avg_buy_price) if pos.avg_buy_price > 0 else pos.entry_price
                 # TP1/TP2 후 잔여분만 매도하는 경우 total_qty가 아닌 실제 주문 수량을 사용
                 # sell_pend["qty"]가 이번 매도 주문의 실제 수량 (remain_qty 기준으로 주문됨)
                 sold_qty = sell_pend.get("qty", pos.total_qty) if sell_pend else pos.total_qty
+                # ⭐ FIX 버그1: SELL_STUCK 후 pending 재생성 시 원래 reason 복원
+                if not sell_reason:
+                    sell_reason = getattr(pos, '_preserved_sell_reason', '') or sell_reason
 
                 if "TP1" in sell_reason and not pos.tp1_done:
                     # TP1 주문이 전량 소진되며 SELL_DONE 도달한 경우
@@ -1520,6 +1535,10 @@ class KiwoomAPI(QAxWidget):
                     f"stuck 표시 (주문이 살아있을 수 있음)"
                 )
                 pend["stuck"] = True
+                # ⭐ FIX 버그1: pending 제거 전에 sell_reason을 pos에 보존
+                # pending_orders.pop 후 재매도 시 원래 reason이 사라져 알림 누락 방지
+                if pos and not getattr(pos, '_preserved_sell_reason', None):
+                    pos._preserved_sell_reason = pend.get("reason", "")
                 # pending 제거 + selling 해제하여 재시도 허용
                 # (중복 매도 방지: send_market_order에서 remain_qty 체크)
                 self.pending_orders.pop(code, None)

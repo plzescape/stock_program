@@ -32,10 +32,10 @@ from openpyxl.chart.series import DataPoint
 # 1. 로그 파싱
 # ──────────────────────────────────────────────
 def _parse_cn(token: str):
-    m = re.match(r'^(.+?)\((\d{6})\)$', token.strip())
+    m = re.match(r'^(.+?)\(([\dA-Za-z]{5,7})\)$', token.strip())
     if m:
         return m.group(1).strip(), m.group(2).strip()
-    m = re.match(r'^code=(\d{6})$', token.strip())
+    m = re.match(r'^code=([\dA-Za-z]{5,7})$', token.strip())
     if m:
         return m.group(1), m.group(1)
     return None, None
@@ -45,42 +45,42 @@ def parse_log(path: str) -> list[dict]:
     """trade.log 파싱 -> 거래 세션 리스트"""
 
     re_ts     = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-    re_atr    = re.compile(r"\[ATR_CALC\]\s+(.+?\(\d{6}\))\s+ATR=([\d.]+)원")
-    re_atr_old= re.compile(r"\[ATR_CALC\]\s+code=(\d{6})\s+ATR=([\d.]+)원")
-    re_buy    = re.compile(r"\[BUY_FILL_NEW\]\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)$")
-    re_qty    = re.compile(r"\[BUY_DONE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)/(\d+)")
+    re_atr    = re.compile(r"\[ATR_CALC\]\s+(.+?\([\dA-Za-z]{5,7}\))\s+ATR=([\d.]+)원")
+    re_atr_old= re.compile(r"\[ATR_CALC\]\s+code=([\dA-Za-z]{5,7})\s+ATR=([\d.]+)원")
+    re_buy    = re.compile(r"\[BUY_FILL_NEW\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+price=(\d+)$")
+    re_qty    = re.compile(r"\[BUY_DONE\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+잔여=(\d+)/(\d+)")
     re_tp     = re.compile(
-        r"\[TP_TARGET_SET\]\s+(.+?\(\d{6}\)|code=\d{6})\s+ATR=([\d.]+)원\s+손절=(\d+)\s+TP1=(\d+)\s+TP2\(초기\)=(\d+)"
+        r"\[TP_TARGET_SET\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+ATR=([\d.]+)원\s+손절=(\d+)\s+TP1=(\d+)\s+TP2\(초기\)=(\d+)"
     )
-    re_tp1    = re.compile(r"\[TP1_FILLED\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)주")
-    re_tp2    = re.compile(r"\[TP2_FILLED\]\s+(.+?\(\d{6}\)|code=\d{6})\s+잔여=(\d+)주")
-    re_trail  = re.compile(r"\[TRAIL_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+")
-    re_sell   = re.compile(r"\[ORDER_TRY\]\s+방향=SELL\s+(.+?\(\d{6}\)|code=\d{6})\s+수량=(\d+)주\s+사유=(\S+)")
-    re_done   = re.compile(r"\[SELL_DONE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+전량매도완료")
-    re_psafe  = re.compile(r"\[PROFIT_SAFEGUARD\]\s+(.+?\(\d{6}\)|code=\d{6})\s+본절보호")
-    re_emerg  = re.compile(r"\[STOP_LOSS_EMERGENCY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+비상 손절 현재가:(\d+)\s+pnl=([-\d.]+)")
-    re_candle = re.compile(r"\[STOP_LOSS_CANDLE\]\s+(.+?\(\d{6}\)|code=\d{6})\s+완성봉 ATR손절 종가:(\d+)\s+손절기준:\d+\s+pnl=([-\d.]+)")
-    re_time   = re.compile(r"\[TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+보유=\d+초\s+매도수량=\d+주\s+pnl=([-\d.]+)")
-    re_vol    = re.compile(r"\[VOL_TIME_STOP\]\s+(.+?\(\d{6}\)|code=\d{6})\s+구간=\S+\s+매도수량=\d+주.*pnl=([-\d.]+)")
+    re_tp1    = re.compile(r"\[TP1_FILLED\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+잔여=(\d+)주")
+    re_tp2    = re.compile(r"\[TP2_FILLED\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+잔여=(\d+)주")
+    re_trail  = re.compile(r"\[TRAIL_STOP\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+")
+    re_sell   = re.compile(r"\[ORDER_TRY\]\s+방향=SELL\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+수량=(\d+)주\s+사유=(\S+)")
+    re_done   = re.compile(r"\[SELL_DONE\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+전량매도완료")
+    re_psafe  = re.compile(r"\[PROFIT_SAFEGUARD\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+본절보호")
+    re_emerg  = re.compile(r"\[STOP_LOSS_EMERGENCY\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+비상 손절 현재가:(\d+)\s+pnl=([-\d.]+)")
+    re_candle = re.compile(r"\[STOP_LOSS_CANDLE\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+완성봉 ATR손절 종가:(\d+)\s+손절기준:\d+\s+pnl=([-\d.]+)")
+    re_time   = re.compile(r"\[TIME_STOP\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+보유=\d+초\s+매도수량=\d+주\s+pnl=([-\d.]+)")
+    re_vol    = re.compile(r"\[VOL_TIME_STOP\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+구간=\S+\s+매도수량=\d+주.*pnl=([-\d.]+)")
     # 매도 CHEJAN: price + qty (가중평균 체결가 계산용)
-    re_chejan     = re.compile(r"\[CHEJAN\]\s+-매도\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)(?:\s+qty=(\d+))?")
+    re_chejan     = re.compile(r"\[CHEJAN\]\s+-매도\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+price=(\d+)(?:\s+qty=(\d+))?")
     # 매수 CHEJAN: price + qty (가중평균 매수가 재계산용)
-    re_chejan_buy = re.compile(r"\[CHEJAN\]\s+\+매수\s+(.+?\(\d{6}\)|code=\d{6})\s+price=(\d+)(?:\s+qty=(\d+))?")
+    re_chejan_buy = re.compile(r"\[CHEJAN\]\s+\+매수\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+price=(\d+)(?:\s+qty=(\d+))?")
     # [FIX4] 전일잔고 청산: LEFTOVER_SELL → 세션 생성용
     # 형식: [LEFTOVER_SELL] 종목명(코드) 전일잔고 qty=N entry=N entry_ts=...
     re_leftover = re.compile(
-        r"\[LEFTOVER_SELL\]\s+(.+?\(\d{6}\))\s+전일잔고\s+qty=(\d+)\s+entry=(\d+)"
+        r"\[LEFTOVER_SELL\]\s+(.+?\([\dA-Za-z]{5,7}\))\s+전일잔고\s+qty=(\d+)\s+entry=(\d+)"
     )
     # 형식: [ENTRY_QTY] 종목명(코드) 현재가=N 전략=BREAKOUT|PULLBACK|FLAG ...
     re_entry_qty = re.compile(
-        r"\[ENTRY_QTY\]\s+(.+?\(\d{6}\)|code=\d{6})\s+현재가=\d+\s+전략=(BREAKOUT|PULLBACK|FLAG)"
+        r"\[ENTRY_QTY\]\s+(.+?\([\dA-Za-z]{5,7}\)|code=[\dA-Za-z]{5,7})\s+현재가=\d+\s+전략=(BREAKOUT|PULLBACK|FLAG)"
     )
 
     def extract_code(token: str):
-        m = re.match(r'^(.+?)\((\d{6})\)$', token.strip())
+        m = re.match(r'^(.+?)\(([\dA-Za-z]{5,7})\)$', token.strip())
         if m:
             return m.group(1).strip(), m.group(2)
-        m = re.match(r'^code=(\d{6})$', token.strip())
+        m = re.match(r'^code=([\dA-Za-z]{5,7})$', token.strip())
         if m:
             return m.group(1), m.group(1)
         return token, token

@@ -1030,7 +1030,8 @@ class KiwoomAPI(QAxWidget):
                         f"[STOP_LOSS_CANDLE] {self.cn(code)} 완성봉 ATR손절 "
                         f"종가:{completed_close} 손절기준:{sl_threshold} pnl={sl_rate:.4f}"
                     )
-                    ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+                    ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS",
+                                                       sl_limit_price=pos.atr_sl_price)
                     if ok:
                         pos.last_sell_attempt_ts = now
                         pos.selling = True
@@ -1073,7 +1074,8 @@ class KiwoomAPI(QAxWidget):
                 f"현재가:{cur} pnl={pnl_rate:.4f} "
                 f"(안전망 -{EMERGENCY_SL_RATE*100:.1f}%)"
             )
-            ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+            ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS",
+                                               sl_limit_price=pos.atr_sl_price)
             if ok:
                 pos.last_sell_attempt_ts = now
                 pos.selling = True
@@ -1091,7 +1093,8 @@ class KiwoomAPI(QAxWidget):
                     f"[STOP_LOSS] {self.cn(code)} 실시간 ATR손절 "
                     f"현재가:{cur} 손절기준:{sl_threshold} pnl={pnl_rate:.4f}"
                 )
-                ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+                ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS",
+                                                   sl_limit_price=pos.atr_sl_price)
                 if ok:
                     pos.last_sell_attempt_ts = now
                     pos.selling = True
@@ -1211,10 +1214,12 @@ class KiwoomAPI(QAxWidget):
         _raw_safe = pos.atr_safe_price if pos.atr_safe_price > 0 else pos.entry_price
         safe_price = max(pos.entry_price, _raw_safe)
         if pos.tp1_done and cur <= safe_price:
-            # ⭐ FIX③: TP1 체결 직후 30초 유예 — 체결 직후 순간 눌림 방지
-            # TP1 체결 후 바로 본절보호가 발동되면 정상적인 조정 폭에도 청산됨
+            # ⭐ FIX 원인④: TP1 체결 직후 120초 유예 (기존 30초→120초)
+            # 오늘 분석: 본절보호 9건 중 8건이 TP1→본절 30~434초, 평균 손실 -36,219원
+            # 짧은 유예(30초)로는 진입 직후 정상 조정도 모두 청산됨
+            # 120초 유예로 TP2 달성 기회 확보
             _tp1_elapsed = now - pos.tp1_done_ts if pos.tp1_done_ts else 999
-            if _tp1_elapsed < 30:
+            if _tp1_elapsed < 120:
                 pass  # 유예 중 — 발동 보류
             elif self.can_try_sell(pos):
                 self.log_trade.info(
@@ -1581,7 +1586,7 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # 매도 / 매수 주문 함수
     # ==================================================
-    def send_market_order(self, side, code, qty, reason=""):
+    def send_market_order(self, side, code, qty, reason="", **kwargs):
         if qty <= 0 or not is_market_time():
             self.log_trade.warning(
                 f"[ORDER_ABORT] 방향={side} {self.cn(code)} 수량={qty} 사유={reason}"
@@ -1645,7 +1650,8 @@ class KiwoomAPI(QAxWidget):
         # ─── 매수 주문가격 결정 ───────────────────────────────────────
         # BUY: 저가주(현재가 < 2,000원)는 지정가+1호가로 슬리피지 제어
         #      고가주는 시장가(03)로 체결 속도 우선
-        # SELL: 항상 시장가(빠른 청산 필요)
+        # SELL 시장가: 항상 시장가 (TP/Trail 등 빠른 청산)
+        # SELL 지정가: STOP_LOSS 시 atr_sl_price 지정가 → 슬리피지 방어
         if side == "BUY":
             _cur = self.pending_orders.get(code, {}).get("cur_price", 0)
             if _cur > 0 and _cur < 2000:
@@ -1659,8 +1665,19 @@ class KiwoomAPI(QAxWidget):
                 _lmt_p  = 0
                 _ord_tp = "03"               # 시장가
         else:
-            _lmt_p  = 0
-            _ord_tp = "03"                   # SELL 항상 시장가
+            # ⭐ FIX 원인③: STOP_LOSS는 ATR 손절가 지정가로 — 슬리피지 방어
+            # 시장가 손절은 급락 구간 호가 공백에서 SL기준보다 1~2% 더 하락 체결됨
+            # → atr_sl_price 지정가 주문으로 해당 가격 이하 체결 방지
+            _sl_lmt = kwargs.get("sl_limit_price", 0) if kwargs else 0
+            if "STOP_LOSS" in reason and _sl_lmt > 0:
+                _lmt_p  = _sl_lmt
+                _ord_tp = "00"               # 지정가 손절
+                self.log_trade.info(
+                    f"[ORDER_LIMIT_SL] {self.cn(code)} 지정가손절={_lmt_p}원 (슬리피지방어)"
+                )
+            else:
+                _lmt_p  = 0
+                _ord_tp = "03"               # 시장가 (TP/Trail 등)
 
         ret = self.dynamicCall(
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",

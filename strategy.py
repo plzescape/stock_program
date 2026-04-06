@@ -541,21 +541,17 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
     → 복잡한 추세 필터(EMA이격, EMA간격) 불필요 — 이미 조건검색이 검증함
     → 핵심 질문: "지금 이 분봉에서 올라타도 되는가?"
 
-    [진입 조건]
+    [진입 조건 — 강화된 버전]
     A. 최소 데이터: 20봉 이상
     B. 양봉 + 캔들강도 ≥ 50% (약한 봉 제거)
-    C. 거래량 급증: 직전 5봉 평균 대비 2배 이상 (실제 수급 확인)
-    D. 현재봉이 5봉 고점 이상 (상승 모멘텀 유지)
-    E. 당일 누적 상승률 ≤ 25% (상한가 직전 / 너무 늦은 진입 방지)
-    F. 신호봉 진행률 ≤ 80% (봉 후반부 고점 물림 방지, 급등봉 특성상 70%→80% 완화)
-    G. EMA 정배열: 종가 > EMA20 (최소 추세 확인, EMA60 조건 제거)
-
-    [제거된 조건]
-    - EMA 이격 필터 (급등 시 구조적으로 크게 벌어짐)
-    - EMA 간격 필터 (급등 초기엔 EMA20~60 간격 좁을 수 있음)
-    - MACD 조건 (급등 초기엔 MACD 후행)
-    - SR 박스 저항 (조건검색이 이미 돌파 확인)
-    - 모멘텀 캔들 패턴 (급등봉 자체가 모멘텀)
+    C. 거래량 급증: 직전 5봉 평균 대비 5배 이상 ← 2배→5배 강화
+       (데이터 분석: 5배 미만 구간 승률 17~36%, 수익 기대치 음수)
+    D. 현재봉 고가가 직전 5봉 최고가 이상 (상승 모멘텀 유지)
+    E. 당일 누적 상승률 5~20% ← 하한 추가, 상한 축소
+       (3% 미만: 모멘텀 부족 / 20% 초과: 뒤늦은 추격)
+    F. 신호봉 진행률 ≤ 72% ← 80%→72% 강화
+       (75~80% 구간 승률 12%, 평균 -74,970원)
+    G. EMA 정배열: 종가 > EMA20 (최소 추세 확인)
     """
     if len(candles) < 20:
         if logger:
@@ -571,25 +567,24 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
     # B. 캔들강도 ≥ 50%
     str_ok = (body / rng >= 0.50) if rng > 0 else False
 
-    # C. 거래량 급증: 직전 5봉 평균 대비 2배+
+    # C. 거래량 급증: 직전 5봉 평균 대비 5배+ ← 강화
     avg_vol5 = sum(c['volume'] for c in candles[1:6]) / 5 if len(candles) >= 6 else 0
     vol_ratio = c0['volume'] / avg_vol5 if avg_vol5 > 0 else 0
-    vol_ok = vol_ratio >= 2.0 and c0['volume'] >= 3000
+    vol_ok = vol_ratio >= 5.0 and c0['volume'] >= 3000
 
     # D. 현재봉 고가가 직전 5봉 최고가 이상 (상승 모멘텀)
     prev5_high = max(c['high'] for c in candles[1:6]) if len(candles) >= 6 else 0
     price_ok = c0['high'] >= prev5_high
 
-    # E. 당일 누적 상승률 ≤ 25%
-    # 가장 오래된 봉(≈장 시작 시점) 대비 현재가 상승률
+    # E. 당일 누적 상승률 5~20% ← 하한(5%) 신규 추가, 상한 25→20%
     day_open = candles[-1]['open'] if candles else c0['open']
     day_rise = (c0['close'] - day_open) / day_open * 100 if day_open > 0 else 0
-    surge_ok = day_rise <= 25.0
+    surge_ok = 5.0 <= day_rise <= 20.0
 
-    # F. 신호봉 진행률 ≤ 80% (고점에서 진입 방지)
+    # F. 신호봉 진행률 ≤ 72% ← 80%→72% 강화
     h_o = c0['high'] - c0['open']
     progress = (c0['close'] - c0['open']) / h_o if h_o > 0 else 1.0
-    progress_ok = progress <= 0.80
+    progress_ok = progress <= 0.72
 
     # G. 최소 추세: 종가 > EMA20
     closes = [c['close'] for c in candles]
@@ -615,10 +610,10 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"[BREAKOUT_CHECK] {code} "
                 f"bull={is_bull} "
                 f"strength={str_ok}({str_pct:.0f}%≥50%) "
-                f"vol={vol_ok}({vol_ratio:.1f}배) "
+                f"vol={vol_ok}({vol_ratio:.1f}배≥5) "
                 f"price={price_ok}(5봉고={prev5_high}) "
-                f"surge={surge_ok}({day_rise:.1f}%≤25%) "
-                f"progress={progress_ok}({progress*100:.0f}%≤80%) "
+                f"surge={surge_ok}({day_rise:.1f}%∈[5,20]%) "
+                f"progress={progress_ok}({progress*100:.0f}%≤72%) "
                 f"ema={ema_ok}({c0['close']}>{(ema20 or 0):.0f})"
             )
 

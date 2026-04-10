@@ -342,11 +342,25 @@ def parse_log(path: str) -> list[dict]:
                 gross_pnl = sell_amt - buy_amt        # 세전 손익
 
                 is_leftover = (s.get("entry_strategy") == "LEFTOVER")
+
+                # ━━ 수수료 계산 ━━
+                # 모의투자: 키움 모의 고정 0.4505% 왕복 (거래세 없음)
+                # 실전투자: 매수 0.019960% + 매도 0.019960% + 증권거래세 0.18%
+                #   (키움 실전 기본 수수료 0.015% + 유관기관비 약 0.00396%)
+                USE_REAL_FEE = False  # True=실전 수수료, False=모의 수수료
+
                 if is_leftover:
-                    # 전일잔고청산: 매도 단방향 수수료만 (매수는 전일 차감됨)
-                    total_fee = round(sell_amt * 0.004505)
+                    if USE_REAL_FEE:
+                        total_fee = round(sell_amt * (0.00015 + 0.0018))  # 매도만
+                    else:
+                        total_fee = round(sell_amt * 0.004505)             # 모의 매도만
                 else:
-                    total_fee = round((buy_amt + sell_amt) * 0.004505)  # 키움 모의투자 실측값
+                    if USE_REAL_FEE:
+                        buy_fee  = round(buy_amt  * 0.00015)               # 매수 수수료
+                        sell_fee = round(sell_amt * (0.00015 + 0.0018))    # 매도 수수료+거래세
+                        total_fee = buy_fee + sell_fee
+                    else:
+                        total_fee = round((buy_amt + sell_amt) * 0.004505) # 모의 왕복
 
                 net_pnl       = gross_pnl - total_fee
                 s["pnl_amt"]   = net_pnl

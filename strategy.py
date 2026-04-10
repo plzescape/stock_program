@@ -654,20 +654,30 @@ def get_entry_signal_data(candles) -> dict | None:
 
 def is_pullback_entry(candles, logger=None, code=None) -> bool:
     """
-    눌림목 진입 전략 VER5 — 오더블록 통합 (변경 없음)
+    눌림목 진입 전략 VER6 — 진입 필터 강화
 
-    [조건 요약]
-    A. EMA 정배열: EMA20 > EMA60
-    B. RSI 45~70
-    C. MACD ≥ 0
-    D. 최근 10봉 고점 대비 -1% ~ -10% 조정
-    E. EMA20 근접 ≤ 3.5%
-    F. 최근 10봉 고점 > EMA20 × 1.02 (돌파 확인)
-    G. 반등 양봉
-    H. 캔들강도: STRONG(≤2%) ≥ 40%, NORMAL(2~3.5%) ≥ 50%
-    I. 반등 거래량 ≥ 조정평균 × 1.0 AND ≥ 3000주
-    J. F1~F3 가짜 신호 필터
-    K. 오더블록 지지 확인
+    [VER6 변경사항 — 데이터 분석 기반]
+      RSI 45~70 → 55~65:
+        RSI 50~55 구간 승률 0%(10건), RSI 65~75 구간 승률 0%(3건)
+        유의미한 구간은 55~65뿐 (55~60: 71%, 60~65: 40%)
+      캔들강도 40~55% → 55% 이상:
+        캔들강도 40~55% 구간 승률 17%(18건), 55~65% 구간 승률 75%
+        반등 신호가 약한 캔들은 추세 지속으로 이어지지 않음
+      눌림폭 -10%~-1% → -3%~-1%:
+        눌림 -5~-3% 구간 승률 11%(9건) — 과도한 눌림은 반등 아닌 하락 추세
+        눌림 -3~-2% 구간 38%, -2~-1% 구간 40%로 적당한 눌림이 유효
+
+    [유지 조건]
+      A. EMA 정배열: EMA20 > EMA60
+      C. MACD ≥ 0
+      D. 최근 10봉 고점 대비 -3% ~ -1% 조정 ← 강화
+      E. EMA20 근접 ≤ 3.5%
+      F. 최근 10봉 고점 > EMA20 × 1.02 (돌파 확인)
+      G. 반등 양봉
+      H. 캔들강도 ≥ 55% ← 강화 (기존 STRONG≥40%/NORMAL≥50%)
+      I. 반등 거래량 ≥ 조정평균 × 1.0 AND ≥ 3000주
+      J. F1~F3 가짜 신호 필터
+      K. 오더블록 지지 확인
     """
     if len(candles) < 35:
         if logger:
@@ -689,12 +699,12 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     macd_l = ind["macd_line"]
 
     ema_aligned = (ema20 > ema60)
-    rsi_ok      = 45 <= rsi14 <= 70
+    rsi_ok      = 55 <= rsi14 <= 65   # ← VER6: 45~70 → 55~65
     macd_ok     = macd_l >= 0
 
     recent_10_high = max(c['high'] for c in candles[0:10])
     pullback_pct   = (c1['close'] - recent_10_high) / recent_10_high
-    pullback_ok    = -0.10 <= pullback_pct <= -0.01
+    pullback_ok    = -0.03 <= pullback_pct <= -0.01   # ← VER6: -0.10 → -0.03
 
     ma_distance    = abs(c1['close'] - ema20) / ema20
     near_ma_ok     = ma_distance <= 0.035
@@ -706,7 +716,7 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     rng     = c1['high'] - c1['low']
     body    = c1['close'] - c1['open']
     str_pct = (body / rng) if rng > 0 else 0
-    final_str_ok = (str_pct >= 0.40 if near_ma_strong else str_pct >= 0.50)
+    final_str_ok = str_pct >= 0.55   # ← VER6: STRONG≥0.40/NORMAL≥0.50 → 통합 0.55
 
     pull_vols    = [c['volume'] for c in candles[1:5]]
     avg_pull_vol = sum(pull_vols) / len(pull_vols) if pull_vols else 1
@@ -781,13 +791,13 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
             logger.info(
                 f"[PULLBACK_CHECK] {code} "
                 f"ema={ema_aligned}(ema20={ema20:.0f},ema60={ema60:.0f}) "
-                f"rsi={rsi_ok}({rsi14:.1f}) "
+                f"rsi={rsi_ok}({rsi14:.1f}∈[55,65]) "
                 f"macd={macd_ok}({macd_l:.2f}) "
                 f"trend=(rising={ema_aligned},high_above={high_above_ma}) "
-                f"pullback={pullback_ok}({pullback_pct*100:.1f}%) "
+                f"pullback={pullback_ok}({pullback_pct*100:.1f}%∈[-3,-1]) "
                 f"near_ma={near_ma_ok}({ma_distance*100:.2f}%) "
                 f"bounce={bounce_ok} "
-                f"strength={final_str_ok}({str_pct*100:.0f}%) "
+                f"strength={final_str_ok}({str_pct*100:.0f}%≥55) "
                 f"vol={vol_ok}({c1['volume']}주) "
                 f"f1={f1} f2={f2} f3={f3} "
                 f"sr_ok={sr_ok} "

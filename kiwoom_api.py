@@ -1544,6 +1544,14 @@ class KiwoomAPI(QAxWidget):
                 # pending_orders.pop 후 재매도 시 원래 reason이 사라져 알림 누락 방지
                 if pos and not getattr(pos, '_preserved_sell_reason', None):
                     pos._preserved_sell_reason = pend.get("reason", "")
+                # ⭐ FIX 현대건설 버그: 지정가 SL 미체결 후 SELL_STUCK → 재시도 시 시장가로 전환
+                # 지정가 SL이 현재가보다 높으면 영원히 미체결 → stuck 발생 시 시장가로 강제청산
+                if pos and pend.get("reason", "").startswith("STOP_LOSS"):
+                    pos._force_market_sell = True  # 재시도 시 지정가 대신 시장가 사용
+                    self.log_system.warning(
+                        f"[SELL_STUCK_MARKET_FALLBACK] {self.cn(code)} "
+                        f"지정가 SL 미체결 → 다음 재시도 시장가로 전환"
+                    )
                 # pending 제거 + selling 해제하여 재시도 허용
                 # (중복 매도 방지: send_market_order에서 remain_qty 체크)
                 self.pending_orders.pop(code, None)
@@ -1668,16 +1676,25 @@ class KiwoomAPI(QAxWidget):
             # ⭐ FIX 원인③: STOP_LOSS는 ATR 손절가 지정가로 — 슬리피지 방어
             # 시장가 손절은 급락 구간 호가 공백에서 SL기준보다 1~2% 더 하락 체결됨
             # → atr_sl_price 지정가 주문으로 해당 가격 이하 체결 방지
+            # ⭐ FIX 현대건설: SELL_STUCK 후 재시도 시 _force_market_sell=True면 시장가 강제 사용
             _sl_lmt = kwargs.get("sl_limit_price", 0) if kwargs else 0
-            if "STOP_LOSS" in reason and _sl_lmt > 0:
+            _pos_ref = self.positions.get(code)
+            _force_mkt = getattr(_pos_ref, '_force_market_sell', False) if _pos_ref else False
+            if "STOP_LOSS" in reason and _sl_lmt > 0 and not _force_mkt:
                 _lmt_p  = _sl_lmt
                 _ord_tp = "00"               # 지정가 손절
                 self.log_trade.info(
                     f"[ORDER_LIMIT_SL] {self.cn(code)} 지정가손절={_lmt_p}원 (슬리피지방어)"
                 )
             else:
+                if _force_mkt and "STOP_LOSS" in reason:
+                    self.log_trade.warning(
+                        f"[ORDER_MARKET_SL_FALLBACK] {self.cn(code)} 지정가 미체결 후 시장가 재시도"
+                    )
+                    if _pos_ref:
+                        _pos_ref._force_market_sell = False  # 플래그 초기화
                 _lmt_p  = 0
-                _ord_tp = "03"               # 시장가 (TP/Trail 등)
+                _ord_tp = "03"               # 시장가 (TP/Trail 등, 또는 SL 폴백)
 
         ret = self.dynamicCall(
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
@@ -2554,4 +2571,14 @@ class KiwoomAPI(QAxWidget):
             )
 
             if ok:
-                pos.selling = True                    
+                pos.selling = True
+            else:
+                # ⭐ FIX 덕양에너젠/액스비스 버그: ret=-300 등 강제청산 실패 시
+                # 특수코드(5자리 00010 등)나 종목 이상으로 주문 거절될 수 있음
+                # → positions에서 직접 제거하여 좀비 포지션 방지
+                self.log_system.error(
+                    f"[FORCE_LIQUIDATION_FAIL] {self.cn(code)} 강제청산 주문 실패 "
+                    f"→ 포지션 강제 제거 (실제 잔고 확인 필요)"
+                )
+                self.positions.pop(code, None)
+                self.pending_orders.pop(code, None)

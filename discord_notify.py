@@ -53,7 +53,7 @@ def _get_logger():
 # ══════════════════════════════════════════════════════
 # 전송 함수 — embed 방식 + 로깅 + 1회 재시도
 # ══════════════════════════════════════════════════════
-def _send(embed: dict, alert_type: str = "", label: str = ""):
+def _send(embed: dict, alert_type: str = "", label: str = "", detail: str = ""):
     """embed dict 전송. 실패해도 매매에 영향 없도록 예외 처리."""
     log = _get_logger()
 
@@ -61,7 +61,11 @@ def _send(embed: dict, alert_type: str = "", label: str = ""):
         log.warning(f"[DISCORD_SKIP] {alert_type} | {label} | WEBHOOK_URL 미설정")
         return False
 
-    log.info(f"[DISCORD_SEND] {alert_type} | {label}")
+    # detail이 있으면 핵심 수치를 한 줄로 함께 기록
+    if detail:
+        log.info(f"[DISCORD_SEND] {alert_type} | {label} | {detail}")
+    else:
+        log.info(f"[DISCORD_SEND] {alert_type} | {label}")
 
     for attempt in range(1, 3):  # 최대 2회 시도
         try:
@@ -110,7 +114,8 @@ def notify_market_open(account_no: str = "", is_real: bool = False,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "장시작", "시스템")
+    _send(embed, "장시작", "시스템",
+          detail=f"모드={'실전' if is_real else '모의'} 계좌={account_no} 기존포지션={position_count}개")
 
 
 # ══════════════════════════════════════════════════════
@@ -156,7 +161,14 @@ def notify_buy_fill(code: str, name: str, qty: int, price: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "매수", f"{name}({code})")
+    _send(embed, "매수", f"{name}({code})",
+          detail=(
+              f"체결가={price:,}원 수량={qty:,}주 금액={price*qty:,}원"
+              + (f" 손절={sl_price:,}" if sl_price else "")
+              + (f" TP1={tp1_price:,}" if tp1_price else "")
+              + (f" TP2={tp2_price:,}" if tp2_price else "")
+              + (f" ATR={atr:.1f}" if atr else "")
+          ))
 
 
 # ══════════════════════════════════════════════════════
@@ -180,7 +192,9 @@ def notify_stop_loss(code: str, name: str, qty: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "손절", f"{name}({code})")
+    _send(embed, "손절", f"{name}({code})",
+          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+                 + (f" ATR={atr:.1f}" if atr else ""))
 
 
 # ══════════════════════════════════════════════════════
@@ -208,7 +222,10 @@ def notify_tp1_fill(code: str, name: str, qty: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "TP1", f"{name}({code})")
+    _send(embed, "TP1", f"{name}({code})",
+          detail=f"매수가={entry_price:,} TP1체결={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%) 잔여={remain_qty:,}주"
+                 + (f" TP2목표={tp2_target:,}" if tp2_target else "")
+                 + (f" ATR={atr:.1f}" if atr else ""))
 
 
 # ══════════════════════════════════════════════════════
@@ -235,7 +252,9 @@ def notify_tp2_fill(code: str, name: str, qty: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "TP2", f"{name}({code})")
+    _send(embed, "TP2", f"{name}({code})",
+          detail=f"매수가={entry_price:,} TP2체결={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%) 잔여={remain_qty:,}주"
+                 + (f" ATR={atr:.1f}" if atr else ""))
 
 
 # ══════════════════════════════════════════════════════
@@ -260,7 +279,9 @@ def notify_profit_safe(code: str, name: str, qty: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "본절보호", f"{name}({code})")
+    _send(embed, "본절보호", f"{name}({code})",
+          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+                 + (f" ATR={atr:.1f}" if atr else ""))
 
 
 # ══════════════════════════════════════════════════════
@@ -285,7 +306,9 @@ def notify_trail_stop(code: str, name: str, qty: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "트레일링", f"{name}({code})")
+    _send(embed, "트레일링", f"{name}({code})",
+          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+                 + (f" ATR={atr:.1f}" if atr else ""))
 
 
 def notify_mini_trail_stop(code: str, name: str, qty: int,
@@ -307,7 +330,9 @@ def notify_mini_trail_stop(code: str, name: str, qty: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "미니트레일", f"{name}({code})")
+    _send(embed, "미니트레일", f"{name}({code})",
+          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+                 + (f" ATR={atr:.1f}" if atr else ""))
 
 
 # ══════════════════════════════════════════════════════
@@ -333,7 +358,9 @@ def notify_time_stop(code: str, name: str, qty: int,
         "timestamp": datetime.utcnow().isoformat()
     }
     alert_type = "거래량급감" if "VOL" in reason else "타임스탑"
-    _send(embed, alert_type, f"{name}({code})")
+    _send(embed, alert_type, f"{name}({code})",
+          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+                 + (f" ATR={atr:.1f}" if atr else ""))
 
 
 # ══════════════════════════════════════════════════════
@@ -358,7 +385,8 @@ def notify_force_liquidation(code: str, name: str, qty: int,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "강제청산", f"{name}({code})")
+    _send(embed, "강제청산", f"{name}({code})",
+          detail=f"매수가={entry_price:,} 수량={qty:,}주")
 
 
 # ══════════════════════════════════════════════════════
@@ -373,4 +401,4 @@ def notify_system(msg: str, level: str = "INFO"):
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "시스템", level)
+    _send(embed, "시스템", level, detail=msg)

@@ -23,7 +23,8 @@ from config import (
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
     MAX_POSITIONS, TOTAL_BUDGET,
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC,
-    MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP, MINI_TRAIL_GAP_OPEN
+    MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP, MINI_TRAIL_GAP_OPEN,
+    MIN_ATR_RATIO, MIN_FILL_MARGIN_RATIO
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data
@@ -543,6 +544,22 @@ class KiwoomAPI(QAxWidget):
                     f"(14분봉 기준, SL배수={ATR_SL_MULT}, TP배수={ATR_TP_MULT})"
                 )
 
+                # ── [수정1] ATR 최솟값 필터 ─────────────────────────────────
+                # ATR이 너무 작으면 손절선-진입가 간격이 슬리피지 1틱에 불과해
+                # 체결 즉시 손절 발동 (모코엠시스: ATR=4.5원, 진입=1,407원 → 0.32%)
+                _atr_ratio = atr_val / cur_price if cur_price > 0 else 0
+                if _atr_ratio < MIN_ATR_RATIO:
+                    self.log_trade.info(
+                        f"[ATR_REJECT] {self.cn(code)} "
+                        f"ATR={atr_val:.1f}원 / 진입가={cur_price:,}원 "
+                        f"= {_atr_ratio:.3%} < 최솟값({MIN_ATR_RATIO:.3%}) → 진입 취소"
+                    )
+                    self.candidates.pop(code, None)
+                    info["state"] = "DONE"
+                    self._finish_tr(delay=True)
+                    return
+                # ────────────────────────────────────────────────────────────
+
                 self.send_market_order("BUY", code, buy_qty, "ENTRY")
                 # 예산 추적용
                 if code in self.pending_orders:
@@ -745,6 +762,28 @@ class KiwoomAPI(QAxWidget):
                         f"[TP_TARGET_SET_FALLBACK] {self.cn(code)} ATR=0 → 고정비율 사용 "
                         f"손절={sl_price} TP1={tp1_target} TP2={tp2_target}"
                     )
+
+                # ── [수정2] 체결가 기준 손절여유 재검증 ─────────────────────
+                # 슬리피지로 체결가와 손절선 간격이 MIN_FILL_MARGIN_RATIO 미만이면
+                # 이미 불리한 위치에 진입한 것 → 즉시 시장가 청산
+                # 예) 뉴엔AI: 체결 15,640 손절 15,340 → 여유 1.92% → 통과
+                # 예) 모코엠시스: 체결 1,416 손절 1,407 → 여유 0.64% → 통과
+                # 예) 슬리피지 극심: 체결 ≈ 손절선 이하 → 차단
+                _fill_price = pos.entry_price  # 첫 BUY_FILL_NEW 체결가
+                _fill_margin = (_fill_price - pos.atr_sl_price) / _fill_price \
+                    if _fill_price > 0 else 1.0
+                if _fill_margin < MIN_FILL_MARGIN_RATIO:
+                    self.log_trade.warning(
+                        f"[FILL_MARGIN_REJECT] {self.cn(code)} "
+                        f"체결가={_fill_price:,} 손절선={pos.atr_sl_price:,} "
+                        f"여유={_fill_margin:.3%} < {MIN_FILL_MARGIN_RATIO:.3%} → 즉시 청산"
+                    )
+                    ok = self.send_market_order("SELL", code, pos.remain_qty, "FILL_MARGIN_REJECT")
+                    if ok:
+                        pos.selling = True
+                        pos.last_sell_attempt_ts = pytime.time()
+                    return
+                # ────────────────────────────────────────────────────────────
 
                 # ── 디스코드 매수 체결 알림 ──
                 try:
@@ -2221,16 +2260,24 @@ class KiwoomAPI(QAxWidget):
                 info["last_try"] = None
                 info.pop("cond_out_ts", None)
 
-                # scan_queue 없으면 다시 등록 (중복 추가 방지)
-                if code not in self.scan_queue:
+                # ── [수정3] 큐 중복 추가 차단 ────────────────────────────────
+                # 기존: scan_queue에 없을 때만 append → 그러나 COND_REENTRY_RESET이
+                # 초당 수십 회 반복되며 candidates는 갱신하되 큐는 1개만 유지됨
+                # → 오후에 큐 70개 누적의 진짜 원인은 신규(else) 경로에서의 append
+                # 수정: 이미 큐에 있으면 정보만 갱신하고 return, 없으면 append
+                if code in self.scan_queue:
+                    self.log_trade.info(
+                        f"[COND_REENTRY_RESET] {self.cn(code)} 재편입리셋 "
+                        f"큐={len(self.scan_queue)} 스캔중={self._scan_running}"
+                    )
+                    # 스캔 트리거는 공통 블록에서 처리
+                else:
                     self.scan_queue.append(code)
-
-                self.log_trade.info(
-                    f"[COND_REENTRY_RESET] {self.cn(code)} 재편입리셋 "
-                    f"큐={len(self.scan_queue)} 스캔중={self._scan_running}"
-                )
-                # ⭐ 재편입도 스캔 트리거 (기존 구멍 수정)
-                # → return 전에 트리거 체크
+                    self.log_trade.info(
+                        f"[COND_REENTRY_RESET] {self.cn(code)} 재편입리셋(큐재등록) "
+                        f"큐={len(self.scan_queue)} 스캔중={self._scan_running}"
+                    )
+                # ────────────────────────────────────────────────────────────
             else:
                 # 신규 후보 등록
                 self.candidates[code] = {

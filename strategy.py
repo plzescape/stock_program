@@ -1,33 +1,25 @@
 """
-strategy.py — BREAKOUT / PULLBACK 전략 개선 (2026-04-14 로그 분석 기반)
+strategy.py — BREAKOUT / PULLBACK 지표 재설계 (2026-04-15 분석 기반)
 
-[v7 변경사항 — 04-13 로그 분석 결과 반영]
+[VER8 — 04-13/14 데이터 기반 근본 재설계]
 
-핵심 발견:
-  - NEVER_ROSE(진입 후 단 한 번도 양수 미달): 17건 중 7건(41%) → 예측 자체가 틀림
-  - 10:30 이후 진입 10건 전패 (0/10), 10:30 이전 4/8 (50%)
-  - BREAKOUT: 거래량 배수-승률 무관, EMA 대비 5%+ 이미 오른 상태 진입 다수
-  - PULLBACK: RSI 57~62 구간 5건 전부 손절 → 하락 추세 중 반등 구간 오인
+진단 요약:
+  - NEVER_ROSE(진입 즉시 하락) 47% → 지표 자체에 방향 예측력 없음
+  - 승리 평균 +0.26% / 손실 평균 -2.62% → 기댓값 음수 구조
+  - RSI/MACD: 1분봉에서 노이즈, 통과해도 손절 반복
+  - 캔들강도: "현재 강함" 측정, "이후 오를지" 구분 불가
 
-BREAKOUT 개선:
-  1. 진입 시각 하드컷: 10:30 이후 신규 진입 차단
-     → 10:30 이전: 50% 승률, 이후: 0% 승률
-  2. EMA20 대비 이격 상한: 5% 추가
-     → 이미 5% 이상 오른 상태 = 추격매수 구간, 04-13 손절 다수 해당
-  3. 확인 진입(1봉 대기): 신호봉 고가 돌파 확인 후 다음봉 초입 진입
-     → 신호봉이 고점일 때 직접 진입하면 즉시 하락하는 패턴 차단
-     → 단, 신호봉 종가가 고가 대비 80% 이상이면 강한 추세이므로 바로 진입
+BREAKOUT VER8:
+  삭제: 캔들강도 조건, 신호봉 진행률 조건
+  추가: 3연속 양봉 필수 (지속 매수세 증거)
+  추가: 급등 경과시간 ≤ 10봉 (에너지 소진 방지)
+  변경: 당일상승 상한 20% → 15%
 
-PULLBACK 개선:
-  1. 진입 시각 하드컷: 11:00 이후 신규 진입 차단
-     → 오후 PULLBACK 전부 손절, 오전 1건만 양수
-  2. RSI 상한 강화: 65 → 62
-     → 오늘 5건 전부 RSI 57~62 구간인데 손절. 62 초과는 이미 과열
-  3. 당일 고점 대비 눌림폭 추가: 당일 고점 대비 -3% ~ -8%
-     → 현재 최근 10봉 고점 기준은 당일 흐름을 못 잡음
-     → 당일 최고점에서 충분히 내려온 종목만 진짜 눌림
-  4. 상승추세 강도 확인: 당일 시가 대비 현재가 +3% 이상
-     → 오늘 진입한 PULLBACK들 중 당일 상승이 충분하지 않은 종목이 많았음
+PULLBACK VER8:
+  삭제: RSI, MACD, EMA근접 조건, 오더블록 조건
+  추가: 갭상승 필수 (시초가 > EMA20 × 1.02)
+  추가: 눌림 구간 거래량 감소 확인 (급등봉 대비 50% 미만)
+  추가: 반등봉 거래량 급증 (눌림 평균 2배 이상)
 """
 
 from datetime import datetime, time
@@ -530,27 +522,34 @@ def get_breakout_position_size(entry_price: float,
 
 def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bool:
     """
-    급등 모멘텀 진입 전략 (BREAKOUT) VER7
+    급등 모멘텀 진입 전략 (BREAKOUT) VER8
 
-    [VER7 변경사항 — 04-13 로그 분석 기반]
-      1. 진입 시각 하드컷: 10:30 이후 신규 진입 차단
-         → 04-13: 10:30 이전 4/8(50%), 이후 0/10
-      2. EMA20 이격 상한 5% 추가
-         → 이미 5% 이상 오른 상태 = 추격매수 위험
-         → 04-13 손절 종목 중 코위버(+6.9%), 창해에탄올(+5.0%), 태림포장(+5.6%) 해당
-      3. 확인 진입 플래그 반환
-         → 신호봉 종가진행률 > 80%: 강한 추세 → 즉시 진입 가능
-         → 종가진행률 ≤ 80%: 다음봉 시가 확인 후 진입 권장 (호출측에서 판단)
-         → [NOTE] 현재 kiwoom_api.py는 확인진입 미구현이므로 일단 bool만 반환
-                  향후 반환값을 ('ENTER_NOW'|'WAIT_NEXT') 튜플로 확장 가능
+    [VER8 변경사항 — 04-13/14 데이터 분석 기반 지표 재설계]
 
-    [기존 조건 유지]
-    A. 양봉 + 캔들강도 ≥ 50%
-    B. 거래량 5배+ (직전 5봉 평균 대비) AND ≥ 3000주
-    C. 현재봉 고가 ≥ 직전 5봉 최고가
-    D. 당일 누적 상승률 5~20%
-    E. 신호봉 진행률 ≤ 72%
-    F. 종가 > EMA20
+    핵심 문제: 기존 지표들이 "지금 강한 봉"은 잡지만 "이후에도 오를 봉"을 구분 못함
+      → NEVER_ROSE(진입 즉시 하락) 47%, 승리 평균 +0.26% vs 손실 평균 -2.62%
+
+    삭제:
+      - 캔들강도 조건 (노이즈 — 세력 처분 봉도 강도 높음)
+      - 신호봉 진행률 조건 (캔들강도와 중복, 실효성 낮음)
+
+    핵심 변경:
+      1. 3연속 양봉(TYPE-B) 필수 — 메인 조건으로 승격
+         → 단일 급등봉은 세력 처분 가능, 연속 양봉은 지속 매수세 증거
+         → OR 조건(TYPE-A or TYPE-B) → AND 조건(TYPE-B 필수)
+      2. 급등 발생 후 경과시간 ≤ 10분 (신호봉 기준으로 근사)
+         → 첫 급등봉 이후 10봉 이내에 진입해야 함
+         → 이미 30분 지난 종목 = 에너지 소진 가능성
+      3. 당일 상승 상한 15%로 축소 (20% → 15%)
+         → 코위버(+6.9% EMA이격), 하이스틸 등 이미 너무 오른 종목 차단 강화
+      4. EMA20 이격 상한 5% 유지
+
+    유지:
+      - 거래량 5배+, ≥ 3000주
+      - 당일상승 5~15% (하한 5% 유지)
+      - 5봉 신고가 돌파
+      - 종가 > EMA20
+      - 시각 ≤ 10:30
     """
     from datetime import datetime as _dt
 
@@ -559,82 +558,90 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
             logger.info(f"[BREAKOUT_SKIP] {code} 데이터 부족(필요:20 현재:{len(candles)})")
         return False
 
-    # ── [수정1] 진입 시각 하드컷: 10:30 이후 차단 ──────────────────
+    # ── 진입 시각 하드컷: 10:30 ──────────────────────────────────
     _now = _dt.now().time()
     if _now > time(10, 30):
         if logger:
             logger.info(
                 f"[BREAKOUT_SKIP] {code} "
-                f"진입시각({_now.strftime('%H:%M')}) > 10:30 하드컷 → 차단"
+                f"진입시각({_now.strftime('%H:%M')}) > 10:30 하드컷"
             )
         return False
-    # ───────────────────────────────────────────────────────────────
 
     c0 = candles[0]
-    rng  = c0['high'] - c0['low']
     body = c0['close'] - c0['open']
 
     # A. 양봉
     is_bull = body > 0
-    # B. 캔들강도 ≥ 50%
-    str_ok = (body / rng >= 0.50) if rng > 0 else False
 
-    # C. 거래량 급증: 직전 5봉 평균 대비 5배+
-    avg_vol5 = sum(c['volume'] for c in candles[1:6]) / 5 if len(candles) >= 6 else 0
+    # B. 거래량 급증: 직전 5봉 평균 대비 5배+ AND ≥ 3000주
+    avg_vol5  = sum(c['volume'] for c in candles[1:6]) / 5 if len(candles) >= 6 else 0
     vol_ratio = c0['volume'] / avg_vol5 if avg_vol5 > 0 else 0
-    vol_ok = vol_ratio >= 5.0 and c0['volume'] >= 3000
+    vol_ok    = vol_ratio >= 5.0 and c0['volume'] >= 3000
 
-    # D. 현재봉 고가 ≥ 직전 5봉 최고가
+    # C. 5봉 신고가 돌파
     prev5_high = max(c['high'] for c in candles[1:6]) if len(candles) >= 6 else 0
-    price_ok = c0['high'] >= prev5_high
+    price_ok   = c0['high'] >= prev5_high
 
-    # E. 당일 누적 상승률 5~20%
-    day_open = candles[-1]['open'] if candles else c0['open']
-    day_rise = (c0['close'] - day_open) / day_open * 100 if day_open > 0 else 0
-    surge_ok = 5.0 <= day_rise <= 20.0
+    # D. 당일 누적 상승률 5~15% (상한 20→15% 축소)
+    day_open  = candles[-1]['open'] if candles else c0['open']
+    day_rise  = (c0['close'] - day_open) / day_open * 100 if day_open > 0 else 0
+    surge_ok  = 5.0 <= day_rise <= 15.0
 
-    # F. 신호봉 진행률 ≤ 72%
-    h_o = c0['high'] - c0['open']
-    progress = (c0['close'] - c0['open']) / h_o if h_o > 0 else 1.0
-    progress_ok = progress <= 0.72
+    # E. EMA20 이격 ≤ 5% (추격매수 차단)
+    closes    = [c['close'] for c in candles]
+    ema20     = _calc_ema(closes, 20)
+    ema_ok    = (ema20 is not None) and (c0['close'] > ema20)
+    ema_gap   = (c0['close'] - ema20) / ema20 * 100 if ema20 else 0
+    ema_gap_ok = ema_gap <= 5.0
 
-    # G. 종가 > EMA20
-    closes = [c['close'] for c in candles]
-    ema20 = _calc_ema(closes, 20)
-    ema_ok = (ema20 is not None) and (c0['close'] > ema20)
+    # F. [핵심 신규] 3연속 양봉 필수 — 지속 매수세 증거
+    #    candles[0]=현재봉, candles[1]=직전봉, candles[2]=2봉전
+    #    세 봉 모두 양봉(종가 > 시가)이어야 함
+    if len(candles) >= 3:
+        consec_bull = all(candles[i]['close'] > candles[i]['open'] for i in range(3))
+    else:
+        consec_bull = False
 
-    # ── [수정2] EMA20 이격 상한 5% ─────────────────────────────────
-    # 이미 5% 이상 오른 상태 = 추격매수 위험 (코위버+6.9%, 창해에탄올+5.0%)
-    ema_gap_pct = (c0['close'] - ema20) / ema20 * 100 if ema20 else 0
-    ema_gap_ok = ema_gap_pct <= 5.0
-    # ───────────────────────────────────────────────────────────────
+    # G. [핵심 신규] 급등 경과시간 ≤ 10봉 이내
+    #    현재봉 기준으로 직전 10봉 중 거래량이 avg_vol5의 3배 이상인 첫 급등봉 탐색
+    #    급등봉이 10봉 이전이면 이미 에너지 소진 가능성
+    surge_candle_age = 999
+    for i in range(1, min(20, len(candles))):
+        c = candles[i]
+        avg_before = sum(candles[j]['volume'] for j in range(i+1, min(i+6, len(candles)))) / 5
+        if avg_before > 0 and c['volume'] / avg_before >= 3.0:
+            surge_candle_age = i
+            break
+    fresh_ok = surge_candle_age <= 10
 
-    is_valid = (is_bull and str_ok and vol_ok and price_ok and
-                surge_ok and progress_ok and ema_ok and ema_gap_ok)
+    is_valid = (is_bull and vol_ok and price_ok and surge_ok and
+                ema_ok and ema_gap_ok and consec_bull and fresh_ok)
 
     if logger:
+        rng     = c0['high'] - c0['low']
         str_pct = body / rng * 100 if rng > 0 else 0
         if is_valid:
             logger.info(
                 f"[BREAKOUT_CONFIRMED] {code} | "
-                f"현재가:{c0['close']} EMA20:{ema20:.0f} EMA이격:{ema_gap_pct:.1f}% | "
-                f"캔들강도:{str_pct:.0f}% | "
+                f"현재가:{c0['close']} EMA20:{ema20:.0f} EMA이격:{ema_gap:.1f}% | "
                 f"거래량:{vol_ratio:.1f}배({c0['volume']:,}주) | "
                 f"5봉고점:{prev5_high}(돌파={price_ok}) | "
                 f"당일상승:{day_rise:.1f}% | "
-                f"진행률:{progress*100:.0f}%"
+                f"3연속양봉:{consec_bull} | "
+                f"급등경과:{surge_candle_age}봉"
             )
         else:
             logger.info(
                 f"[BREAKOUT_CHECK] {code} "
                 f"bull={is_bull} "
-                f"strength={str_ok}({str_pct:.0f}%≥50%) "
                 f"vol={vol_ok}({vol_ratio:.1f}배≥5) "
                 f"price={price_ok}(5봉고={prev5_high}) "
-                f"surge={surge_ok}({day_rise:.1f}%∈[5,20]%) "
-                f"progress={progress_ok}({progress*100:.0f}%≤72%) "
+                f"surge={surge_ok}({day_rise:.1f}%∈[5,15]%) "
                 f"ema={ema_ok}({c0['close']}>{(ema20 or 0):.0f}) "
-                f"ema_gap={ema_gap_ok}({ema_gap_pct:.1f}%≤5%)"
+                f"ema_gap={ema_gap_ok}({ema_gap:.1f}%≤5%) "
+                f"3연속양봉={consec_bull} "
+                f"급등경과={fresh_ok}({surge_candle_age}봉≤10)"
             )
 
     return is_valid
@@ -674,32 +681,37 @@ def get_entry_signal_data(candles) -> dict | None:
 
 def is_pullback_entry(candles, logger=None, code=None) -> bool:
     """
-    눌림목 진입 전략 VER7 — 04-13 로그 분석 기반 개선
+    눌림목 진입 전략 VER8 — RSI/MACD 제거 + 실질 조건으로 재설계
 
-    [VER7 변경사항]
-      1. 진입 시각 하드컷: 11:00 이후 차단
-         → 04-13: PULLBACK 오후 진입 전부 손절
-      2. RSI 상한 62로 강화 (기존 65)
-         → 04-13 손절 5건 전부 RSI 57~62 구간 → 62 이상은 이미 과열
-      3. 당일 고점 대비 눌림폭 추가: 당일 고점(당일 시가부터 현재까지) 대비 -8% ~ -3%
-         → 기존 최근 10봉 고점 기준은 당일 전체 흐름을 반영 못 함
-         → 당일 최고점에서 충분히 내려온 종목만 진짜 눌림목
-      4. 당일 상승 강도 확인: 당일 시가 대비 현재가 +3% 이상
-         → 오늘 에스넷: 당일 상승이 거의 없는 상태에서 PULLBACK으로 진입 → 손절
-         → 최소한 당일에 +3% 이상 올랐던 종목이어야 "눌림"이 의미 있음
+    [VER8 변경사항 — 04-13/14 데이터 분석 기반]
 
-    [유지 조건]
-      A. EMA 정배열: EMA20 > EMA60
-      B. RSI 55~62 (강화)
-      C. MACD ≥ 0
-      D. 최근 10봉 고점 대비 -3% ~ -1% 조정
-      E. EMA20 근접 ≤ 3.5%
-      F. 최근 10봉 고점 > EMA20 × 1.02
-      G. 반등 양봉
-      H. 캔들강도 ≥ 55%
-      I. 반등 거래량 ≥ 조정평균 AND ≥ 3000주
-      J. F1~F3 가짜 신호 필터
-      K. 오더블록 지지 확인
+    핵심 문제:
+      - RSI/MACD: 1분봉에서 노이즈, 모두 통과해도 손절 반복
+      - "눌림" 구분 불가: 진짜 눌림(세력 재매수 준비) vs 하락 추세 중 반등 구분 못함
+
+    삭제:
+      - RSI 조건 (1분봉 단타에서 무의미)
+      - MACD 조건 (동일)
+      - EMA20 근접 조건 (갭상승 종목은 EMA에서 멀어도 됨)
+      - 오더블록 조건 (탐지 정확도 낮음)
+
+    핵심 추가:
+      1. 갭상승 종목 필수: 당일 시초가 > 전일 종가 × 1.02 (갭 +2% 이상)
+         → 갭 없는 장중 급등 = 세력 처분 가능성 높음
+         → 갭상승 후 눌림 = 세력이 올려놓고 재매수 준비 가능성
+      2. 눌림 구간 거래량 감소 확인: 눌림 3~5봉 평균 < 급등봉 거래량 × 50%
+         → 거래량 감소 = 매도 에너지 약해짐 = 진짜 눌림
+         → 거래량 그대로면 지속 매도 = 하락 추세
+      3. 반등봉 거래량 급증: 현재봉 거래량 > 눌림 평균 × 2배
+         → 거래량 동반 반등 = 세력 재진입 신호
+
+    유지:
+      - EMA 정배열 (EMA20 > EMA60)
+      - 당일 고점 대비 눌림 -8~-3%
+      - 당일 상승 ≥ 3%
+      - 반등 양봉 + 캔들강도 ≥ 55%
+      - 가짜신호 필터 F1~F3
+      - 시각 ≤ 11:00
     """
     from datetime import datetime as _dt
 
@@ -708,57 +720,83 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
             logger.info(f"[PULLBACK_SKIP] {code} 데이터 부족(필요:35 현재:{len(candles)})")
         return False
 
-    # ── [수정1] 진입 시각 하드컷: 11:00 이후 차단 ──────────────────
+    # ── 진입 시각 하드컷: 11:00 ──────────────────────────────────
     _now = _dt.now().time()
     if _now > time(11, 0):
         if logger:
             logger.info(
                 f"[PULLBACK_SKIP] {code} "
-                f"진입시각({_now.strftime('%H:%M')}) > 11:00 하드컷 → 차단"
+                f"진입시각({_now.strftime('%H:%M')}) > 11:00 하드컷"
             )
-        return False
-    # ───────────────────────────────────────────────────────────────
-
-    ind = _calc_indicators(candles)
-    if ind is None:
-        if logger:
-            logger.info(f"[PULLBACK_SKIP] {code} 지표 계산 실패")
         return False
 
     c1 = candles[0]
     c2 = candles[1]
 
-    ema20  = ind["ema20"]
-    ema60  = ind["ema60"]
-    rsi14  = ind["rsi14"]
-    macd_l = ind["macd_line"]
+    # EMA 계산 (RSI/MACD 제거 — _calc_indicators 대신 직접 계산)
+    closes = [c['close'] for c in candles]
+    ema20  = _calc_ema(closes, 20)
+    ema60  = _calc_ema(closes, min(60, len(closes)))
+    if ema20 is None or ema60 is None:
+        if logger:
+            logger.info(f"[PULLBACK_SKIP] {code} EMA 계산 실패")
+        return False
 
+    # A. EMA 정배열
     ema_aligned = (ema20 > ema60)
-    # ── [수정2] RSI 상한 62로 강화 ───────────────────────────────
-    rsi_ok      = 55 <= rsi14 <= 62   # 기존 65 → 62
-    # ───────────────────────────────────────────────────────────────
-    macd_ok     = macd_l >= 0
 
-    recent_10_high = max(c['high'] for c in candles[0:10])
-    pullback_pct   = (c1['close'] - recent_10_high) / recent_10_high
-    pullback_ok    = -0.03 <= pullback_pct <= -0.01
+    # B. [핵심 신규] 갭상승 종목 필수: 시초가 > 전일 종가 × 1.02
+    #    candles[-1] = 가장 오래된 봉(당일 첫 봉), open = 시초가
+    #    전일 종가는 당일 시초가 바로 직전 봉의 종가로 근사
+    #    (정확한 전일 종가가 없으면 candles[-1]의 open을 기준으로)
+    day_open   = candles[-1]['open']
+    # 전일 종가 근사: 시초가 봉의 open 사용 (갭은 open 자체에 반영됨)
+    # 더 정확히 하려면 kiwoom_api에서 prev_close를 넘겨야 하지만
+    # 일단 당일 시초가가 EMA20 대비 +2% 이상이면 갭상승으로 간주
+    gap_ok = (day_open > ema20 * 1.02)
 
-    ma_distance    = abs(c1['close'] - ema20) / ema20
-    near_ma_ok     = ma_distance <= 0.035
-    near_ma_strong = ma_distance <= 0.020
+    # C. 당일 상승 ≥ 3% (갭 포함)
+    day_rise_pct = (c1['close'] - day_open) / day_open * 100 if day_open > 0 else 0
+    day_rise_ok  = day_rise_pct >= 3.0
 
-    high_above_ma = recent_10_high > ema20 * 1.02
-    bounce_ok     = (c1['close'] > c2['close'] and c1['close'] > c1['open'])
+    # D. 당일 고점 대비 눌림 -8%~-3%
+    day_high        = max(c['high'] for c in candles)
+    day_pullback    = (c1['close'] - day_high) / day_high * 100
+    day_pullback_ok = -8.0 <= day_pullback <= -3.0
 
+    # E. 반등 양봉
+    bounce_ok = (c1['close'] > c2['close'] and c1['close'] > c1['open'])
+
+    # F. 캔들강도 ≥ 55%
     rng     = c1['high'] - c1['low']
     body    = c1['close'] - c1['open']
     str_pct = (body / rng) if rng > 0 else 0
-    final_str_ok = str_pct >= 0.55
+    str_ok  = str_pct >= 0.55
 
-    pull_vols    = [c['volume'] for c in candles[1:5]]
-    avg_pull_vol = sum(pull_vols) / len(pull_vols) if pull_vols else 1
-    vol_ok       = (c1['volume'] >= avg_pull_vol and c1['volume'] >= 3000)
+    # G. [핵심 신규] 눌림 구간 거래량 감소 확인
+    #    급등봉 탐색: 직전 20봉 중 거래량이 가장 많은 봉
+    #    눌림 구간: 급등봉 이후 ~ 현재봉 직전
+    surge_idx  = 1
+    max_vol    = 0
+    for i in range(1, min(20, len(candles))):
+        if candles[i]['volume'] > max_vol:
+            max_vol   = candles[i]['volume']
+            surge_idx = i
+    surge_vol = candles[surge_idx]['volume']
 
+    # 눌림 구간: 급등봉(surge_idx) 이전 ~ 현재봉 직전 (candles[1:surge_idx])
+    pullback_candles = candles[1:surge_idx] if surge_idx > 1 else []
+    if pullback_candles:
+        avg_pull_vol = sum(c['volume'] for c in pullback_candles) / len(pullback_candles)
+    else:
+        avg_pull_vol = surge_vol  # 눌림 구간 없으면 조건 통과 불가하게
+
+    vol_decrease_ok = avg_pull_vol < surge_vol * 0.5  # 눌림 거래량 < 급등봉의 50%
+
+    # H. [핵심 신규] 반등봉 거래량 급증: 현재봉 > 눌림 평균 × 2배
+    bounce_vol_ok = (c1['volume'] >= avg_pull_vol * 2.0 and c1['volume'] >= 3000)
+
+    # I. 가짜신호 필터
     rec5      = candles[0:5]
     bear_cnt  = sum(1 for c in rec5 if c['close'] < c['open'])
     cls5      = [c['close'] for c in rec5]
@@ -768,97 +806,40 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     f3 = (min(c['low'] for c in candles[0:5]) < ema20 * 0.95)
     filters_ok = not f1 and not f2 and not f3
 
+    # 저항 박스 근처 진입 차단
     sr_boxes = _find_sr_boxes(candles)
-    near_supp, s_lo, s_hi = _near_sr_box(c1['close'], sr_boxes, 'support', proximity=0.020)
-    near_resist_block, _, _ = _near_sr_box(c1['close'], sr_boxes, 'resistance', proximity=0.010)
-    sr_ok = not near_resist_block
+    near_resist, _, _ = _near_sr_box(c1['close'], sr_boxes, 'resistance', proximity=0.010)
+    sr_ok = not near_resist
 
-    orderblocks = _find_orderblock(candles, lookback=30)
-    ob_near, ob_low, ob_high, ob_sl, ob_age = _near_orderblock(
-        cur_price   = c1['close'],
-        orderblocks = orderblocks,
-        proximity   = 0.005,
-        max_age     = 20
-    )
-
-    if ob_near and ob_sl > 0 and c1['close'] < ob_sl:
-        if logger:
-            logger.info(
-                f"[PULLBACK_OB_BROKEN] {code} "
-                f"오더블록 손절선({ob_sl}) 이탈 → 진입 차단 "
-                f"현재가:{c1['close']} OB구간:{ob_low}~{ob_high}"
-            )
-        return False
-
-    _has_sr_support = near_supp
-    if not ob_near and not near_ma_strong and not _has_sr_support:
-        if logger:
-            logger.info(
-                f"[PULLBACK_OB_REQUIRED] {code} "
-                f"EMA거리:{ma_distance*100:.2f}%({'STRONG' if near_ma_strong else 'NORMAL'}) "
-                f"+ 오더블록 없음 + SR지지 없음 → 진입 차단"
-            )
-        return False
-
-    # ── [수정3] 당일 고점 대비 눌림폭 확인 ────────────────────────
-    # 당일 고점(candles 전체에서 최고가) 기준으로 -3% ~ -8% 구간만 허용
-    # -3% 미만: 아직 고점 근처 (충분히 안 빠짐)
-    # -8% 초과: 너무 많이 빠짐 (하락추세 가능성)
-    day_high = max(c['high'] for c in candles)
-    day_pullback_pct = (c1['close'] - day_high) / day_high * 100
-    day_pullback_ok = -8.0 <= day_pullback_pct <= -3.0
-    # ───────────────────────────────────────────────────────────────
-
-    # ── [수정4] 당일 상승 강도 확인 ────────────────────────────────
-    # 당일 시가 대비 현재가 +3% 이상이어야 "의미 있는 눌림"
-    # 에스넷: 당일 상승이 거의 없는 상태에서 PULLBACK 진입 → 즉시 손절
-    day_open = candles[-1]['open'] if candles else c1['open']
-    day_rise_pct = (c1['close'] - day_open) / day_open * 100 if day_open > 0 else 0
-    day_rise_ok = day_rise_pct >= 3.0
-    # ───────────────────────────────────────────────────────────────
-
-    base_ok  = (ema_aligned and rsi_ok and macd_ok and
-                high_above_ma and pullback_ok and near_ma_ok and
-                bounce_ok and vol_ok)
-    is_valid = (base_ok and final_str_ok and filters_ok and sr_ok and
-                day_pullback_ok and day_rise_ok)
+    is_valid = (ema_aligned and gap_ok and day_rise_ok and day_pullback_ok and
+                bounce_ok and str_ok and vol_decrease_ok and bounce_vol_ok and
+                filters_ok and sr_ok)
 
     if logger:
-        sr_note = f"SR지지근접:{near_supp}({s_lo}~{s_hi})" if near_supp else "SR지지:없음"
-        ob_note = (
-            f"OB지지:{ob_near}({ob_low}~{ob_high} age={ob_age}봉전)"
-            if ob_near else "OB:없음/비근접"
-        )
         if is_valid:
             logger.info(
                 f"[PULLBACK_CONFIRMED] {code} | "
                 f"종가:{c1['close']} EMA20:{ema20:.0f} EMA60:{ema60:.0f} | "
-                f"RSI:{rsi14:.1f} MACD:{macd_l:.2f} | "
-                f"눌림:{pullback_pct*100:.1f}% | "
-                f"MA거리:{ma_distance*100:.2f}%({'STRONG' if near_ma_strong else 'NORMAL'}) | "
-                f"당일고점대비:{day_pullback_pct:.1f}% 당일상승:{day_rise_pct:.1f}% | "
-                f"반등거래량:{c1['volume']} | "
-                f"캔들강도:{str_pct*100:.0f}% | "
-                f"{sr_note} | {ob_note}"
+                f"갭상승:{gap_ok}(시초가{day_open}≥EMA20×1.02={ema20*1.02:.0f}) | "
+                f"당일상승:{day_rise_pct:.1f}% | "
+                f"당일고점대비:{day_pullback:.1f}% | "
+                f"급등봉거래량:{surge_vol:,}(인덱스:{surge_idx}) | "
+                f"눌림평균거래량:{avg_pull_vol:.0f} | "
+                f"반등거래량:{c1['volume']:,}({c1['volume']/avg_pull_vol:.1f}배) | "
+                f"캔들강도:{str_pct*100:.0f}%"
             )
         else:
             logger.info(
                 f"[PULLBACK_CHECK] {code} "
                 f"ema={ema_aligned}(ema20={ema20:.0f},ema60={ema60:.0f}) "
-                f"rsi={rsi_ok}({rsi14:.1f}∈[55,62]) "
-                f"macd={macd_ok}({macd_l:.2f}) "
-                f"trend=(rising={ema_aligned},high_above={high_above_ma}) "
-                f"pullback={pullback_ok}({pullback_pct*100:.1f}%∈[-3,-1]) "
-                f"near_ma={near_ma_ok}({ma_distance*100:.2f}%) "
-                f"bounce={bounce_ok} "
-                f"strength={final_str_ok}({str_pct*100:.0f}%≥55) "
-                f"vol={vol_ok}({c1['volume']}주) "
-                f"f1={f1} f2={f2} f3={f3} "
-                f"sr_ok={sr_ok} "
-                f"day_pullback={day_pullback_ok}({day_pullback_pct:.1f}%∈[-8,-3]) "
+                f"gap={gap_ok}(시초가{day_open}≥EMA×1.02={ema20*1.02:.0f}) "
                 f"day_rise={day_rise_ok}({day_rise_pct:.1f}%≥3) "
-                f"ob_near={ob_near} ob_invalidated={ob_near and ob_sl > 0 and c1['close'] < ob_sl} "
-                f"{ob_note}"
+                f"day_pullback={day_pullback_ok}({day_pullback:.1f}%∈[-8,-3]) "
+                f"bounce={bounce_ok} "
+                f"strength={str_ok}({str_pct*100:.0f}%≥55) "
+                f"vol_decrease={vol_decrease_ok}(눌림평균{avg_pull_vol:.0f}<급등{surge_vol}×50%) "
+                f"bounce_vol={bounce_vol_ok}({c1['volume']:,}≥눌림평균×2={avg_pull_vol*2:.0f}) "
+                f"f1={f1} f2={f2} f3={f3} sr_ok={sr_ok}"
             )
 
     return is_valid

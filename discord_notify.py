@@ -61,7 +61,6 @@ def _send(embed: dict, alert_type: str = "", label: str = "", detail: str = ""):
         log.warning(f"[DISCORD_SKIP] {alert_type} | {label} | WEBHOOK_URL 미설정")
         return False
 
-    # detail이 있으면 핵심 수치를 한 줄로 함께 기록
     if detail:
         log.info(f"[DISCORD_SEND] {alert_type} | {label} | {detail}")
     else:
@@ -94,6 +93,22 @@ def _fmt_pnl(pnl_rate: float, pnl_amount: int) -> str:
     sign = "+" if pnl_rate >= 0 else ""
     return f"{sign}{pnl_rate:.2f}% ({sign}{pnl_amount:,}원)"
 
+def _calc_fee(buy_amt: int, sell_amt: int, is_real: bool = False) -> int:
+    """
+    거래 수수료 계산.
+    모의투자: 왕복 0.4505% 고정
+    실전투자: 매수 0.015% + 매도 0.015% + 증권거래세 0.18%
+    """
+    if is_real:
+        return round(buy_amt * 0.00015 + sell_amt * (0.00015 + 0.0018))
+    return round((buy_amt + sell_amt) * 0.004505)
+
+def _fmt_pnl_with_fee(gross_pnl: int, fee: int) -> str:
+    """세전손익 + 수수료 → 수수료후 손익 표시"""
+    net = gross_pnl - fee
+    sign = "+" if net >= 0 else ""
+    return f"{sign}{net:,}원 (세전{'+' if gross_pnl>=0 else ''}{gross_pnl:,} 수수료-{fee:,})"
+
 
 # ══════════════════════════════════════════════════════
 # 1) 장 시작
@@ -114,8 +129,7 @@ def notify_market_open(account_no: str = "", is_real: bool = False,
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "장시작", "시스템",
-          detail=f"모드={'실전' if is_real else '모의'} 계좌={account_no} 기존포지션={position_count}개")
+    _send(embed, "장시작", "시스템")
 
 
 # ══════════════════════════════════════════════════════
@@ -124,13 +138,21 @@ def notify_market_open(account_no: str = "", is_real: bool = False,
 def notify_buy_fill(code: str, name: str, qty: int, price: int,
                     tp1_price: int = 0, tp2_price: int = 0,
                     sl_price: int = 0, atr: float = 0,
+                    avg_buy_price: float = 0,
                     signal_data=None, **kwargs):
+    # [버그1 수정] price = 첫 체결가(entry_price), avg_buy_price = 분할체결 가중평균
+    # 분할체결이 많은 경우 두 값이 다를 수 있으므로 둘 다 표시
+    display_price = int(avg_buy_price) if avg_buy_price > 0 else price
     fields = [
-        {"name": "종목",     "value": f"{name} ({code})",       "inline": False},
-        {"name": "수량",     "value": f"{qty:,}주",              "inline": True},
-        {"name": "체결가",   "value": _fmt_price(price),         "inline": True},
-        {"name": "매수금액", "value": _fmt_price(price * qty),   "inline": True},
+        {"name": "종목",     "value": f"{name} ({code})",            "inline": False},
+        {"name": "평균매수가","value": _fmt_price(display_price),     "inline": True},
+        {"name": "수량",     "value": f"{qty:,}주",                   "inline": True},
+        {"name": "매수금액", "value": _fmt_price(display_price * qty),"inline": True},
     ]
+    # 첫 체결가와 평균가 차이가 있으면 추가 표시
+    if avg_buy_price > 0 and abs(avg_buy_price - price) >= 1:
+        fields.append({"name": "첫체결가", "value": _fmt_price(price), "inline": True})
+
     if sl_price:
         fields.append({"name": "손절가",   "value": _fmt_price(sl_price),  "inline": True})
     if tp1_price:
@@ -163,7 +185,8 @@ def notify_buy_fill(code: str, name: str, qty: int, price: int,
     }
     _send(embed, "매수", f"{name}({code})",
           detail=(
-              f"체결가={price:,}원 수량={qty:,}주 금액={price*qty:,}원"
+              f"평균매수가={display_price:,}원 수량={qty:,}주 금액={display_price*qty:,}원"
+              + (f" 첫체결가={price:,}" if avg_buy_price > 0 and abs(avg_buy_price - price) >= 1 else "")
               + (f" 손절={sl_price:,}" if sl_price else "")
               + (f" TP1={tp1_price:,}" if tp1_price else "")
               + (f" TP2={tp2_price:,}" if tp2_price else "")
@@ -176,24 +199,35 @@ def notify_buy_fill(code: str, name: str, qty: int, price: int,
 # ══════════════════════════════════════════════════════
 def notify_stop_loss(code: str, name: str, qty: int,
                      price: int, entry_price: int,
-                     atr: float = 0, **kwargs):
-    pnl_rate   = (price - entry_price) / entry_price * 100
-    pnl_amount = (price - entry_price) * qty
+                     atr: float = 0, avg_buy_price: float = 0,
+                     buy_amount: int = 0, **kwargs):
+    # [버그1 수정] avg_buy_price 우선 사용
+    avg_p = avg_buy_price if avg_buy_price > 0 else entry_price
+    gross_pnl = (price - avg_p) * qty
+    pnl_rate  = (price - avg_p) / avg_p * 100 if avg_p > 0 else 0
+    # [버그2 수정] 수수료 반영
+    sell_amt = price * qty
+    buy_amt  = buy_amount if buy_amount > 0 else int(avg_p * qty)
+    fee      = _calc_fee(buy_amt, sell_amt)
+    net_pnl  = gross_pnl - fee
+
     embed = {
         "title": "❌ 손절",
         "color": COLOR_RED,
         "fields": [
-            {"name": "종목",     "value": f"{name} ({code})", "inline": False},
-            {"name": "매도가",   "value": _fmt_price(price),  "inline": True},
-            {"name": "수량",     "value": f"{qty:,}주",        "inline": True},
-            {"name": "손해율",   "value": f"{pnl_rate:.2f}%", "inline": True},
-            {"name": "손해금액", "value": f"{pnl_amount:,}원","inline": True},
+            {"name": "종목",      "value": f"{name} ({code})",             "inline": False},
+            {"name": "평균매수가","value": _fmt_price(int(avg_p)),          "inline": True},
+            {"name": "매도가",    "value": _fmt_price(price),               "inline": True},
+            {"name": "수량",      "value": f"{qty:,}주",                    "inline": True},
+            {"name": "손익(세전)","value": f"{gross_pnl:+,}원 ({pnl_rate:+.2f}%)", "inline": True},
+            {"name": "수수료",    "value": f"-{fee:,}원",                   "inline": True},
+            {"name": "순손익",    "value": f"{net_pnl:+,}원",               "inline": True},
         ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
     _send(embed, "손절", f"{name}({code})",
-          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+          detail=f"평균매수가={int(avg_p):,} 매도가={price:,} 수량={qty:,}주 세전={gross_pnl:+,}원 수수료={fee:,} 순손익={net_pnl:+,}원({pnl_rate:+.2f}%)"
                  + (f" ATR={atr:.1f}" if atr else ""))
 
 
@@ -202,28 +236,35 @@ def notify_stop_loss(code: str, name: str, qty: int,
 # ══════════════════════════════════════════════════════
 def notify_tp1_fill(code: str, name: str, qty: int,
                     price: int, entry_price: int, remain_qty: int,
-                    tp2_target: int = 0, atr: float = 0, **kwargs):
-    pnl_rate   = (price - entry_price) / entry_price * 100
-    pnl_amount = (price - entry_price) * qty
-    # TP2 목표가 표시: 전달된 값이 없거나 0이면 "갱신 중" 표시
-    tp2_str = _fmt_price(tp2_target) if tp2_target > 0 else "갱신 중"
+                    tp2_target: int = 0, atr: float = 0,
+                    avg_buy_price: float = 0, buy_amount: int = 0, **kwargs):
+    avg_p      = avg_buy_price if avg_buy_price > 0 else entry_price
+    gross_pnl  = (price - avg_p) * qty
+    pnl_rate   = (price - avg_p) / avg_p * 100 if avg_p > 0 else 0
+    sell_amt   = price * qty
+    buy_amt    = buy_amount if buy_amount > 0 else int(avg_p * qty)
+    fee        = _calc_fee(buy_amt, sell_amt)
+    net_pnl    = gross_pnl - fee
+    tp2_str    = _fmt_price(tp2_target) if tp2_target > 0 else "갱신 중"
     embed = {
         "title": "💰 TP1 부분익절",
         "color": COLOR_GREEN,
         "fields": [
-            {"name": "종목",      "value": f"{name} ({code})",   "inline": False},
-            {"name": "TP1 체결가", "value": _fmt_price(price),    "inline": True},
-            {"name": "수량",      "value": f"{qty:,}주",           "inline": True},
-            {"name": "수익률",    "value": f"+{pnl_rate:.2f}%",   "inline": True},
-            {"name": "손익금액",  "value": f"+{pnl_amount:,}원",  "inline": True},
-            {"name": "잔여수량",  "value": f"{remain_qty:,}주",   "inline": True},
-            {"name": "TP2 목표가","value": tp2_str,               "inline": True},
+            {"name": "종목",       "value": f"{name} ({code})",             "inline": False},
+            {"name": "평균매수가", "value": _fmt_price(int(avg_p)),          "inline": True},
+            {"name": "TP1 체결가", "value": _fmt_price(price),               "inline": True},
+            {"name": "수량",       "value": f"{qty:,}주",                    "inline": True},
+            {"name": "손익(세전)", "value": f"{gross_pnl:+,}원 ({pnl_rate:+.2f}%)", "inline": True},
+            {"name": "수수료",     "value": f"-{fee:,}원",                   "inline": True},
+            {"name": "순손익",     "value": f"{net_pnl:+,}원",               "inline": True},
+            {"name": "잔여수량",   "value": f"{remain_qty:,}주",             "inline": True},
+            {"name": "TP2 목표가", "value": tp2_str,                         "inline": True},
         ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
     _send(embed, "TP1", f"{name}({code})",
-          detail=f"매수가={entry_price:,} TP1체결={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%) 잔여={remain_qty:,}주"
+          detail=f"평균매수가={int(avg_p):,} TP1체결={price:,} 수량={qty:,}주 세전={gross_pnl:+,}원 수수료={fee:,} 순손익={net_pnl:+,}원({pnl_rate:+.2f}%) 잔여={remain_qty:,}주"
                  + (f" TP2목표={tp2_target:,}" if tp2_target else "")
                  + (f" ATR={atr:.1f}" if atr else ""))
 
@@ -233,27 +274,35 @@ def notify_tp1_fill(code: str, name: str, qty: int,
 # ══════════════════════════════════════════════════════
 def notify_tp2_fill(code: str, name: str, qty: int,
                     price: int, entry_price: int, remain_qty: int,
-                    trail_target: int = 0, atr: float = 0, **kwargs):
-    pnl_rate   = (price - entry_price) / entry_price * 100
-    pnl_amount = (price - entry_price) * qty
-    trail_str  = _fmt_price(trail_target) if trail_target > 0 else "트레일링 추적 중"
+                    trail_target: int = 0, atr: float = 0,
+                    avg_buy_price: float = 0, buy_amount: int = 0, **kwargs):
+    avg_p     = avg_buy_price if avg_buy_price > 0 else entry_price
+    gross_pnl = (price - avg_p) * qty
+    pnl_rate  = (price - avg_p) / avg_p * 100 if avg_p > 0 else 0
+    sell_amt  = price * qty
+    buy_amt   = buy_amount if buy_amount > 0 else int(avg_p * qty)
+    fee       = _calc_fee(buy_amt, sell_amt)
+    net_pnl   = gross_pnl - fee
+    trail_str = _fmt_price(trail_target) if trail_target > 0 else "트레일링 추적 중"
     embed = {
         "title": "🚀 TP2 익절",
         "color": COLOR_GREEN,
         "fields": [
-            {"name": "종목",        "value": f"{name} ({code})",   "inline": False},
-            {"name": "TP2 체결가",  "value": _fmt_price(price),    "inline": True},
-            {"name": "수량",        "value": f"{qty:,}주",           "inline": True},
-            {"name": "수익률",      "value": f"+{pnl_rate:.2f}%",  "inline": True},
-            {"name": "손익금액",    "value": f"+{pnl_amount:,}원", "inline": True},
-            {"name": "잔여수량",    "value": f"{remain_qty:,}주",  "inline": True},
-            {"name": "트레일링 기준","value": trail_str,            "inline": True},
+            {"name": "종목",       "value": f"{name} ({code})",             "inline": False},
+            {"name": "평균매수가", "value": _fmt_price(int(avg_p)),          "inline": True},
+            {"name": "TP2 체결가", "value": _fmt_price(price),               "inline": True},
+            {"name": "수량",       "value": f"{qty:,}주",                    "inline": True},
+            {"name": "손익(세전)", "value": f"{gross_pnl:+,}원 ({pnl_rate:+.2f}%)", "inline": True},
+            {"name": "수수료",     "value": f"-{fee:,}원",                   "inline": True},
+            {"name": "순손익",     "value": f"{net_pnl:+,}원",               "inline": True},
+            {"name": "잔여수량",   "value": f"{remain_qty:,}주",             "inline": True},
+            {"name": "트레일링 기준","value": trail_str,                     "inline": True},
         ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
     _send(embed, "TP2", f"{name}({code})",
-          detail=f"매수가={entry_price:,} TP2체결={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%) 잔여={remain_qty:,}주"
+          detail=f"평균매수가={int(avg_p):,} TP2체결={price:,} 수량={qty:,}주 세전={gross_pnl:+,}원 수수료={fee:,} 순손익={net_pnl:+,}원({pnl_rate:+.2f}%) 잔여={remain_qty:,}주"
                  + (f" ATR={atr:.1f}" if atr else ""))
 
 
@@ -262,25 +311,33 @@ def notify_tp2_fill(code: str, name: str, qty: int,
 # ══════════════════════════════════════════════════════
 def notify_profit_safe(code: str, name: str, qty: int,
                        price: int, entry_price: int,
-                       atr: float = 0, **kwargs):
-    pnl_rate   = (price - entry_price) / entry_price * 100
-    pnl_amount = (price - entry_price) * qty
+                       atr: float = 0, avg_buy_price: float = 0,
+                       buy_amount: int = 0, **kwargs):
+    avg_p     = avg_buy_price if avg_buy_price > 0 else entry_price
+    gross_pnl = (price - avg_p) * qty
+    pnl_rate  = (price - avg_p) / avg_p * 100 if avg_p > 0 else 0
+    sell_amt  = price * qty
+    buy_amt   = buy_amount if buy_amount > 0 else int(avg_p * qty)
+    fee       = _calc_fee(buy_amt, sell_amt)
+    net_pnl   = gross_pnl - fee
     embed = {
         "title": "🛡 본절 보호 매도",
         "color": COLOR_YELLOW,
         "fields": [
-            {"name": "종목",     "value": f"{name} ({code})",    "inline": False},
-            {"name": "매도가",   "value": _fmt_price(price),     "inline": True},
-            {"name": "수량",     "value": f"{qty:,}주",           "inline": True},
-            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",   "inline": True},
-            {"name": "손익금액", "value": f"{pnl_amount:+,}원",  "inline": True},
-            {"name": "",         "value": "TP1 이후 하락 방어",  "inline": False},
+            {"name": "종목",       "value": f"{name} ({code})",             "inline": False},
+            {"name": "평균매수가", "value": _fmt_price(int(avg_p)),          "inline": True},
+            {"name": "매도가",     "value": _fmt_price(price),               "inline": True},
+            {"name": "수량",       "value": f"{qty:,}주",                    "inline": True},
+            {"name": "손익(세전)", "value": f"{gross_pnl:+,}원 ({pnl_rate:+.2f}%)", "inline": True},
+            {"name": "수수료",     "value": f"-{fee:,}원",                   "inline": True},
+            {"name": "순손익",     "value": f"{net_pnl:+,}원",               "inline": True},
+            {"name": "",           "value": "TP1 이후 하락 방어",            "inline": False},
         ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
     _send(embed, "본절보호", f"{name}({code})",
-          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+          detail=f"평균매수가={int(avg_p):,} 매도가={price:,} 수량={qty:,}주 세전={gross_pnl:+,}원 수수료={fee:,} 순손익={net_pnl:+,}원({pnl_rate:+.2f}%)"
                  + (f" ATR={atr:.1f}" if atr else ""))
 
 
@@ -289,49 +346,65 @@ def notify_profit_safe(code: str, name: str, qty: int,
 # ══════════════════════════════════════════════════════
 def notify_trail_stop(code: str, name: str, qty: int,
                       price: int, entry_price: int,
-                      atr: float = 0, **kwargs):
-    pnl_rate   = (price - entry_price) / entry_price * 100
-    pnl_amount = (price - entry_price) * qty
+                      atr: float = 0, avg_buy_price: float = 0,
+                      buy_amount: int = 0, **kwargs):
+    avg_p     = avg_buy_price if avg_buy_price > 0 else entry_price
+    gross_pnl = (price - avg_p) * qty
+    pnl_rate  = (price - avg_p) / avg_p * 100 if avg_p > 0 else 0
+    sell_amt  = price * qty
+    buy_amt   = buy_amount if buy_amount > 0 else int(avg_p * qty)
+    fee       = _calc_fee(buy_amt, sell_amt)
+    net_pnl   = gross_pnl - fee
     embed = {
         "title": "📉 트레일링 청산",
         "color": COLOR_PURPLE,
         "fields": [
-            {"name": "종목",     "value": f"{name} ({code})",   "inline": False},
-            {"name": "매도가",   "value": _fmt_price(price),    "inline": True},
-            {"name": "수량",     "value": f"{qty:,}주",          "inline": True},
-            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",  "inline": True},
-            {"name": "손익금액", "value": f"{pnl_amount:+,}원", "inline": True},
-            {"name": "",         "value": "고점 대비 하락 청산","inline": False},
+            {"name": "종목",       "value": f"{name} ({code})",             "inline": False},
+            {"name": "평균매수가", "value": _fmt_price(int(avg_p)),          "inline": True},
+            {"name": "매도가",     "value": _fmt_price(price),               "inline": True},
+            {"name": "수량",       "value": f"{qty:,}주",                    "inline": True},
+            {"name": "손익(세전)", "value": f"{gross_pnl:+,}원 ({pnl_rate:+.2f}%)", "inline": True},
+            {"name": "수수료",     "value": f"-{fee:,}원",                   "inline": True},
+            {"name": "순손익",     "value": f"{net_pnl:+,}원",               "inline": True},
+            {"name": "",           "value": "고점 대비 하락 청산",           "inline": False},
         ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
     _send(embed, "트레일링", f"{name}({code})",
-          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+          detail=f"평균매수가={int(avg_p):,} 매도가={price:,} 수량={qty:,}주 세전={gross_pnl:+,}원 수수료={fee:,} 순손익={net_pnl:+,}원({pnl_rate:+.2f}%)"
                  + (f" ATR={atr:.1f}" if atr else ""))
 
 
 def notify_mini_trail_stop(code: str, name: str, qty: int,
                            price: int, entry_price: int,
-                           atr: float = 0, **kwargs):
-    pnl_rate   = (price - entry_price) / entry_price * 100
-    pnl_amount = (price - entry_price) * qty
+                           atr: float = 0, avg_buy_price: float = 0,
+                           buy_amount: int = 0, **kwargs):
+    avg_p     = avg_buy_price if avg_buy_price > 0 else entry_price
+    gross_pnl = (price - avg_p) * qty
+    pnl_rate  = (price - avg_p) / avg_p * 100 if avg_p > 0 else 0
+    sell_amt  = price * qty
+    buy_amt   = buy_amount if buy_amount > 0 else int(avg_p * qty)
+    fee       = _calc_fee(buy_amt, sell_amt)
+    net_pnl   = gross_pnl - fee
     embed = {
         "title": "🎯 미니 트레일링 익절",
-        "color": 0x00CED1,   # 청록색 — 타임스탑/트레일링과 구분
+        "color": 0x00CED1,
         "fields": [
-            {"name": "종목",     "value": f"{name} ({code})",             "inline": False},
-            {"name": "매도가",   "value": _fmt_price(price),              "inline": True},
-            {"name": "수량",     "value": f"{qty:,}주",                    "inline": True},
-            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",            "inline": True},
-            {"name": "손익금액", "value": f"{pnl_amount:+,}원",           "inline": True},
-            {"name": "",         "value": "수익 보호 트레일링 (TP1 전)", "inline": False},
+            {"name": "종목",       "value": f"{name} ({code})",             "inline": False},
+            {"name": "평균매수가", "value": _fmt_price(int(avg_p)),          "inline": True},
+            {"name": "매도가",     "value": _fmt_price(price),               "inline": True},
+            {"name": "수량",       "value": f"{qty:,}주",                    "inline": True},
+            {"name": "손익(세전)", "value": f"{gross_pnl:+,}원 ({pnl_rate:+.2f}%)", "inline": True},
+            {"name": "수수료",     "value": f"-{fee:,}원",                   "inline": True},
+            {"name": "순손익",     "value": f"{net_pnl:+,}원",               "inline": True},
+            {"name": "",           "value": "수익 보호 트레일링 (TP1 전)",  "inline": False},
         ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
     _send(embed, "미니트레일", f"{name}({code})",
-          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+          detail=f"평균매수가={int(avg_p):,} 매도가={price:,} 수량={qty:,}주 세전={gross_pnl:+,}원 수수료={fee:,} 순손익={net_pnl:+,}원({pnl_rate:+.2f}%)"
                  + (f" ATR={atr:.1f}" if atr else ""))
 
 
@@ -340,26 +413,34 @@ def notify_mini_trail_stop(code: str, name: str, qty: int,
 # ══════════════════════════════════════════════════════
 def notify_time_stop(code: str, name: str, qty: int,
                      price: int, entry_price: int,
-                     reason: str = "TIME_STOP", atr: float = 0, **kwargs):
-    pnl_rate   = (price - entry_price) / entry_price * 100
-    pnl_amount = (price - entry_price) * qty
-    title      = "⏱ 타임스탑 청산" if "VOL" not in reason else "📉 거래량 급감 청산"
+                     reason: str = "TIME_STOP", atr: float = 0,
+                     avg_buy_price: float = 0, buy_amount: int = 0, **kwargs):
+    avg_p     = avg_buy_price if avg_buy_price > 0 else entry_price
+    gross_pnl = (price - avg_p) * qty
+    pnl_rate  = (price - avg_p) / avg_p * 100 if avg_p > 0 else 0
+    sell_amt  = price * qty
+    buy_amt   = buy_amount if buy_amount > 0 else int(avg_p * qty)
+    fee       = _calc_fee(buy_amt, sell_amt)
+    net_pnl   = gross_pnl - fee
+    title     = "⏱ 타임스탑 청산" if "VOL" not in reason else "📉 거래량 급감 청산"
     embed = {
         "title": title,
         "color": COLOR_YELLOW,
         "fields": [
-            {"name": "종목",     "value": f"{name} ({code})",   "inline": False},
-            {"name": "매도가",   "value": _fmt_price(price),    "inline": True},
-            {"name": "수량",     "value": f"{qty:,}주",          "inline": True},
-            {"name": "수익률",   "value": f"{pnl_rate:+.2f}%",  "inline": True},
-            {"name": "손익금액", "value": f"{pnl_amount:+,}원", "inline": True},
+            {"name": "종목",       "value": f"{name} ({code})",             "inline": False},
+            {"name": "평균매수가", "value": _fmt_price(int(avg_p)),          "inline": True},
+            {"name": "매도가",     "value": _fmt_price(price),               "inline": True},
+            {"name": "수량",       "value": f"{qty:,}주",                    "inline": True},
+            {"name": "손익(세전)", "value": f"{gross_pnl:+,}원 ({pnl_rate:+.2f}%)", "inline": True},
+            {"name": "수수료",     "value": f"-{fee:,}원",                   "inline": True},
+            {"name": "순손익",     "value": f"{net_pnl:+,}원",               "inline": True},
         ] + ([{"name": "ATR", "value": f"{atr:.1f}원", "inline": True}] if atr else []),
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
     alert_type = "거래량급감" if "VOL" in reason else "타임스탑"
     _send(embed, alert_type, f"{name}({code})",
-          detail=f"매수가={entry_price:,} 매도가={price:,} 수량={qty:,}주 손익={pnl_amount:+,}원({pnl_rate:+.2f}%)"
+          detail=f"평균매수가={int(avg_p):,} 매도가={price:,} 수량={qty:,}주 세전={gross_pnl:+,}원 수수료={fee:,} 순손익={net_pnl:+,}원({pnl_rate:+.2f}%)"
                  + (f" ATR={atr:.1f}" if atr else ""))
 
 
@@ -401,4 +482,4 @@ def notify_system(msg: str, level: str = "INFO"):
         "footer": {"text": "Kiwoom Auto-Trade"},
         "timestamp": datetime.utcnow().isoformat()
     }
-    _send(embed, "시스템", level, detail=msg)
+    _send(embed, "시스템", level)

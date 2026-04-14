@@ -558,13 +558,22 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
             logger.info(f"[BREAKOUT_SKIP] {code} 데이터 부족(필요:20 현재:{len(candles)})")
         return False
 
-    # ── 진입 시각 하드컷: 10:30 ──────────────────────────────────
+    # ── 진입 시각 하드컷 (모니터링 모드 시 비활성화) ────────────
+    # config.py: BREAKOUT_TIME_CUT_ENABLED = False 로 전체 시간 허용
     _now = _dt.now().time()
-    if _now > time(10, 30):
+    try:
+        from config import BREAKOUT_TIME_CUT_ENABLED, BREAKOUT_TIME_CUT
+        _cut_enabled = BREAKOUT_TIME_CUT_ENABLED
+        _cut_time    = BREAKOUT_TIME_CUT
+    except ImportError:
+        _cut_enabled = True
+        _cut_time    = time(10, 30)
+    if _cut_enabled and _now > _cut_time:
         if logger:
             logger.info(
                 f"[BREAKOUT_SKIP] {code} "
-                f"진입시각({_now.strftime('%H:%M')}) > 10:30 하드컷"
+                f"진입시각({_now.strftime('%H:%M')}) > "
+                f"{_cut_time.strftime('%H:%M')} 하드컷"
             )
         return False
 
@@ -720,13 +729,22 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
             logger.info(f"[PULLBACK_SKIP] {code} 데이터 부족(필요:35 현재:{len(candles)})")
         return False
 
-    # ── 진입 시각 하드컷: 11:00 ──────────────────────────────────
+    # ── 진입 시각 하드컷 (모니터링 모드 시 비활성화) ────────────
+    # config.py: PULLBACK_TIME_CUT_ENABLED = False 로 전체 시간 허용
     _now = _dt.now().time()
-    if _now > time(11, 0):
+    try:
+        from config import PULLBACK_TIME_CUT_ENABLED, PULLBACK_TIME_CUT
+        _cut_enabled = PULLBACK_TIME_CUT_ENABLED
+        _cut_time    = PULLBACK_TIME_CUT
+    except ImportError:
+        _cut_enabled = True
+        _cut_time    = time(11, 0)
+    if _cut_enabled and _now > _cut_time:
         if logger:
             logger.info(
                 f"[PULLBACK_SKIP] {code} "
-                f"진입시각({_now.strftime('%H:%M')}) > 11:00 하드컷"
+                f"진입시각({_now.strftime('%H:%M')}) > "
+                f"{_cut_time.strftime('%H:%M')} 하드컷"
             )
         return False
 

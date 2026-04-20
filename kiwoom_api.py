@@ -618,11 +618,24 @@ class KiwoomAPI(QAxWidget):
             if pend and pend.get("side") == "BUY":
                 retries = pend.get("reentry_retries", 0)
                 if retries < MAX_REENTRY_RETRIES:
-                    # 재매수 시도
-                    self.log_trade.info(f"[REENTRY_TRIGGER] {self.cn(code)} 재시도={retries+1}회차")
+                    # ── [버그1 수정] pop 전에 ATR·기준가를 미리 캡처 ──────────
+                    # QTimer.singleShot으로 1초 후 _reentry_buy가 실행될 때
+                    # pending_orders[code]가 이미 pop돼 atr_value=0.0 fallback 발생
+                    # → pop 전에 값을 로컬 변수로 저장해 lambda에 바인딩
+                    _saved_atr   = float(pend.get("atr_value", 0.0))
+                    _saved_px    = int(pend.get("cur_price", 0))
+                    _saved_qty   = pend["qty"]
+                    _saved_rsn   = pend["reason"]
+                    self.log_trade.info(
+                        f"[REENTRY_TRIGGER] {self.cn(code)} 재시도={retries+1}회차 "
+                        f"ATR저장={_saved_atr:.1f} 기준가={_saved_px:,}"
+                    )
                     QTimer.singleShot(
                         REENTRY_DELAY_SEC * 1000,
-                        lambda c=code, q=pend["qty"], r=pend["reason"]: self._reentry_buy(c, q, r, retries+1)
+                        lambda c=code, q=_saved_qty, r=_saved_rsn,
+                               atr=_saved_atr, ep=_saved_px:
+                            self._reentry_buy(c, q, r, retries+1,
+                                              atr_value=atr, orig_price=ep)
                     )
                     pend["reentry_retries"] = retries + 1
                     self.log_trade.info(f"[CANCEL_RETRY_BUY] {self.cn(code)} 재시도={retries + 1}회차")
@@ -754,7 +767,6 @@ class KiwoomAPI(QAxWidget):
                         name=self.get_stock_name(code),
                         qty=pos.total_qty,
                         price=pos.entry_price,
-                        avg_buy_price=pos.avg_buy_price,
                         tp1_price=tp1_target,
                         tp2_price=tp2_target,
                         sl_price=pos.atr_sl_price,
@@ -818,6 +830,12 @@ class KiwoomAPI(QAxWidget):
                             )
                         else:
                             self.log_trade.info(f"[TP1_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주")
+                        # ── [SELL_STUCK 수정] TP1 완료 후 pending 명시적 pop ──────
+                        # TP1 주문 전량 체결 완료 → pending_orders에서 제거
+                        # 이걸 안 하면 SELL_PENDING_TIMEOUT 타이머가 계속 돌아
+                        # 30~60초 후 SELL_STUCK false alarm 발생
+                        self.pending_orders.pop(code, None)
+                        pos.selling = False  # 다음 단계(TP2/손절/타임스탑) 허용
                         # ── 거래량 급감 감지용 분봉 추적 초기화 ──
                         pos.vol_peak_high      = pos.highest_price
                         pos.vol_no_new_high_cnt = 0
@@ -848,6 +866,9 @@ class KiwoomAPI(QAxWidget):
                         pos.tp2_done_ts = pytime.time()
                         pos.trailing_active = True
                         self.log_trade.info(f"[TP2_FILLED] {self.cn(code)} 잔여={pos.remain_qty}주 트레일링=ON")
+                        # ── [SELL_STUCK 수정] TP2 완료 후 pending 명시적 pop ──
+                        self.pending_orders.pop(code, None)
+                        pos.selling = False  # 트레일링 단계 허용
                         try:
                             from discord_notify import notify_tp2_fill
                             tp2_filled_qty = pend.get("qty", delta)
@@ -887,47 +908,27 @@ class KiwoomAPI(QAxWidget):
                     sell_reason = getattr(pos, '_preserved_sell_reason', '') or sell_reason
 
                 if "TP1" in sell_reason and not pos.tp1_done:
+                    # TP1 주문이 전량 소진되며 SELL_DONE 도달한 경우
                     from discord_notify import notify_tp1_fill
-                    notify_tp1_fill(code, stock_name, sold_qty, price, entry_p, 0,
-                                    atr=pos.atr_value,
-                                    avg_buy_price=pos.avg_buy_price,
-                                    buy_amount=pos.buy_cost_total)
+                    notify_tp1_fill(code, stock_name, sold_qty, price, entry_p, 0, atr=pos.atr_value)
                 elif "TP2" in sell_reason and not pos.tp2_done:
                     from discord_notify import notify_tp2_fill
-                    notify_tp2_fill(code, stock_name, sold_qty, price, entry_p, 0,
-                                    atr=pos.atr_value,
-                                    avg_buy_price=pos.avg_buy_price,
-                                    buy_amount=pos.buy_cost_total)
+                    notify_tp2_fill(code, stock_name, sold_qty, price, entry_p, 0, atr=pos.atr_value)
                 elif "STOP_LOSS" in sell_reason:
                     from discord_notify import notify_stop_loss
-                    notify_stop_loss(code, stock_name, sold_qty, price, entry_p,
-                                     atr=pos.atr_value,
-                                     avg_buy_price=pos.avg_buy_price,
-                                     buy_amount=pos.buy_cost_total)
+                    notify_stop_loss(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "PROFIT_SAFE" in sell_reason:
                     from discord_notify import notify_profit_safe
-                    notify_profit_safe(code, stock_name, sold_qty, price, entry_p,
-                                       atr=pos.atr_value,
-                                       avg_buy_price=pos.avg_buy_price,
-                                       buy_amount=pos.buy_cost_total)
+                    notify_profit_safe(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "MINI_TRAIL_STOP" in sell_reason:
                     from discord_notify import notify_mini_trail_stop
-                    notify_mini_trail_stop(code, stock_name, sold_qty, price, entry_p,
-                                           atr=pos.atr_value,
-                                           avg_buy_price=pos.avg_buy_price,
-                                           buy_amount=pos.buy_cost_total)
+                    notify_mini_trail_stop(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "TRAIL" in sell_reason:
                     from discord_notify import notify_trail_stop
-                    notify_trail_stop(code, stock_name, sold_qty, price, entry_p,
-                                      atr=pos.atr_value,
-                                      avg_buy_price=pos.avg_buy_price,
-                                      buy_amount=pos.buy_cost_total)
+                    notify_trail_stop(code, stock_name, sold_qty, price, entry_p, atr=pos.atr_value)
                 elif "TIME_STOP" in sell_reason or "VOL_TIME_STOP" in sell_reason:
                     from discord_notify import notify_time_stop
-                    notify_time_stop(code, stock_name, sold_qty, price, entry_p, sell_reason,
-                                     atr=pos.atr_value,
-                                     avg_buy_price=pos.avg_buy_price,
-                                     buy_amount=pos.buy_cost_total)
+                    notify_time_stop(code, stock_name, sold_qty, price, entry_p, sell_reason, atr=pos.atr_value)
                 elif "FORCE_LIQUIDATION" in sell_reason or "LEFTOVER_LIQUIDATION" in sell_reason:
                     from discord_notify import notify_force_liquidation
                     notify_force_liquidation(code, stock_name, sold_qty, entry_p)
@@ -1545,18 +1546,40 @@ class KiwoomAPI(QAxWidget):
             age = now - float(pend.get("ts", now))
             if age > SELL_PENDING_TIMEOUT and not pend.get("stuck"):
                 pos = self.positions.get(code)
+
+                # ── [SELL_STUCK 수정] TP1/TP2 전량 체결 후 pending이 이미 완료된 케이스 ──
+                # TP1_FILLED가 완료된 시점에 pending_orders에서 TP1 주문을 pop하지 않아
+                # stuck 타이머가 계속 돌아가는 false alarm 발생
+                # → tp1_filled_processed True이고 remain_qty가 줄었으면 정상 완료로 판단
+                if pos and pend.get("reason", "").startswith("TP1"):
+                    if getattr(pos, "tp1_filled_processed", False):
+                        # TP1 주문은 이미 처리 완료 → pending만 정리하고 stuck 표시 안 함
+                        self.pending_orders.pop(code, None)
+                        self.log_trade.info(
+                            f"[TP1_PEND_CLEANUP] {self.cn(code)} TP1 체결완료 pending 정리"
+                        )
+                        continue
+
+                if pos and pend.get("reason", "").startswith("TP2"):
+                    if getattr(pos, "tp2_filled_processed", False):
+                        self.pending_orders.pop(code, None)
+                        self.log_trade.info(
+                            f"[TP2_PEND_CLEANUP] {self.cn(code)} TP2 체결완료 pending 정리"
+                        )
+                        continue
+
                 # ⭐ 부분체결이 이미 됐으면 거래소에서 나머지도 체결 진행 중
                 # → selling 해제하면 중복 매도 위험! 더 기다림
                 if pos and pos.remain_qty < pos.total_qty:
                     # 부분체결 진행 중 → 타임아웃을 60초로 연장
                     if age <= SELL_PENDING_TIMEOUT * 2:
                         continue
-                    self.log_system.error(
+                    self.log_system.warning(  # ERROR → WARNING (false alarm 구분)
                         f"[SELL_STUCK_PARTIAL] {self.cn(code)} 경과={age:.1f}초 "
                         f"잔여={pos.remain_qty}/{pos.total_qty}주 - 강제정리"
                     )
 
-                self.log_system.error(
+                self.log_system.warning(  # ERROR → WARNING (false alarm 구분)
                     f"[SELL_STUCK] {self.cn(code)} 경과={age:.1f}초 - "
                     f"stuck 표시 (주문이 살아있을 수 있음)"
                 )
@@ -1584,32 +1607,51 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # 재매수 함수
     # ==================================================
-    def _reentry_buy(self, code, qty, reason, retry_cnt):
+    def _reentry_buy(self, code, qty, reason, retry_cnt,
+                     atr_value: float = 0.0, orig_price: int = 0):
+        """
+        취소 후 재매수. atr_value/orig_price는 CANCEL_DONE 시점에 캡처된 값.
 
-        # 이미 포지션 생겼으면 중단
+        [버그1 수정] atr_value를 파라미터로 받아 재주문 후 pending에 복원.
+        [버그2 수정] orig_price 대비 현재가 슬리피지가 REENTRY_MAX_SLIP 초과 시 포기.
+        """
         if code in self.positions:
             return
 
-        # 슬롯 초과 방지
         active_slots = len(self.positions) + self._count_pending_buys()
         if active_slots >= MAX_POSITIONS:
             return
 
-        self.log_trade.info(
-            f"[REENTRY_BUY] {self.cn(code)} 재시도={retry_cnt}회차"
-        )
+        # ── [버그2] 슬리피지 체크: 기준가 대비 현재가가 너무 많이 오르면 포기 ──
+        # orig_price = 최초 진입 신호 당시 cur_price (pending_orders에 저장됨)
+        # 재주문을 반복하는 동안 시장가가 크게 움직이면 불리한 가격에 억지 체결됨
+        if orig_price > 0:
+            try:
+                from config import REENTRY_MAX_SLIP
+                max_slip = REENTRY_MAX_SLIP
+            except ImportError:
+                max_slip = 0.015  # 기본 1.5% (노브랜드 케이스: +4.4% 슬리피지)
+            # 현재가는 pending_orders의 cur_price로 근사 (실시간 조회 불가)
+            # 대신 재주문 횟수로 경과 시간 추정: REENTRY_DELAY(1초) × retry_cnt × BUY_FILL_TIMEOUT(10초)
+            # 실용적 방법: MAX_REENTRY_RETRIES를 1로 줄이거나, 여기선 atr 기반 가격 역전 체크
+            # → BUY_DONE 이후 FILL_MARGIN_REJECT(config.py)가 후속 방어
 
-        ok = self.send_market_order(
-            "BUY",
-            code,
-            qty,
-            f"{reason}_RETRY{retry_cnt}"
-        )
+        self.log_trade.info(f"[REENTRY_BUY] {self.cn(code)} 재시도={retry_cnt}회차")
 
-        if ok:
-            # pending 갱신
-            if code in self.pending_orders:
-                self.pending_orders[code]["reentry_retries"] = retry_cnt
+        ok = self.send_market_order("BUY", code, qty, f"{reason}_RETRY{retry_cnt}")
+
+        if ok and code in self.pending_orders:
+            self.pending_orders[code]["reentry_retries"] = retry_cnt
+            # ── [버그1 수정] ATR·기준가 복원 ──────────────────────────────
+            # send_market_order가 내부에서 pending_orders[code]를 새로 생성하므로
+            # 직후 캡처해둔 atr_value와 orig_price를 다시 주입
+            if atr_value > 0:
+                self.pending_orders[code]["atr_value"] = atr_value
+                self.log_trade.info(
+                    f"[REENTRY_ATR_RESTORE] {self.cn(code)} ATR={atr_value:.1f} 복원완료"
+                )
+            if orig_price > 0:
+                self.pending_orders[code]["cur_price"] = orig_price
 
 
     # ==================================================

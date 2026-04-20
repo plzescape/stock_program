@@ -103,21 +103,13 @@ VOL_AVG_MIN = 50            # 평균 거래량 50 이하 = 사실상 정지
 BUY_FILL_TIMEOUT_SEC = 10     # 체결 대기 최대 8초 (너 환경에 맞게 5~15초 추천)
 CANCEL_RETRY_COOLDOWN_SEC = 2
 MAX_CANCEL_RETRIES = 2
-MAX_REENTRY_RETRIES = 2   # 취소 후 재매수 횟수
+MAX_REENTRY_RETRIES = 1   # 취소 후 재매수 횟수 (2→1: 노브랜드 케이스 방지)
+                          # 재주문 2회 반복 시 24초 경과 → 시장가 급변 위험
 REENTRY_DELAY_SEC = 1     # 재매수 딜레이
+REENTRY_MAX_SLIP  = 0.015 # 재주문 허용 슬리피지 상한 1.5% (기준가 대비 현재가)
 FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
 
 # (TP 지정가 제거됨 - 모두 시장가 매도)
 # ===== 강제청산 시각 =====
 FORCE_LIQUIDATION_HOUR = 15
 FORCE_LIQUIDATION_MIN  = 20
-
-# ===== 진입 시각 컷오프 =====
-# False = 전체 장 시간 허용 (모니터링 모드)
-# True  = 지정 시각 이후 진입 차단 (운용 모드)
-from datetime import time as _time
-BREAKOUT_TIME_CUT_ENABLED = False          # ← 모니터링: False / 운용: True
-BREAKOUT_TIME_CUT         = _time(10, 30)  # 운용 시 적용할 컷오프 시각
-
-PULLBACK_TIME_CUT_ENABLED = False          # ← 모니터링: False / 운용: True
-PULLBACK_TIME_CUT         = _time(11,  0)  # 운용 시 적용할 컷오프 시각

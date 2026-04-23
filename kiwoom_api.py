@@ -1602,6 +1602,7 @@ class KiwoomAPI(QAxWidget):
                 if pos:
                     pos.selling = False
                     pos.time_stop_done = False  # stuck 후 재시도 가능하도록 리셋
+                    pos.sell_reject_retries = 0  # ⭐ FIX: SELL_STUCK 후 재시도 카운터 리셋 (LS네트웍스 버그)
                 self.ordering = bool(self.pending_orders)
 
     # ==================================================
@@ -2481,20 +2482,50 @@ class KiwoomAPI(QAxWidget):
         [800033] 매도가능수량 부족 REJECT 후 1초 뒤 재호출.
         - 포지션이 살아있으면 현재 remain_qty 기준으로 재매도
         - 이미 매도 완료됐으면 스킵
+
+        ⭐ FIX LS네트웍스 버그:
+          기존: pos.selling=True이면 SKIP → SELL_STUCK이 selling=False로 리셋해도
+                뒤늦게 도달한 REJECT 이벤트가 다시 retry를 호출할 때는 이미
+                다른 경로에서 selling=True가 된 상태일 수 있어 SKIP됨 (타이밍 버그)
+          수정: selling 체크 대신 last_sell_attempt_ts 기준 쿨다운으로 중복 방지.
+                selling=True여도 쿨다운(3초)만 지났으면 강제 재시도 허용.
+                또한 _force_market_sell 플래그를 여기서도 활용하여 시장가 전환.
         """
         pos = self.positions.get(code)
         if not pos or pos.remain_qty <= 0:
             self.log_system.info(f"[SELL_REJECT_RETRY_SKIP] {self.cn(code)} 이미 청산됨")
             return
-        if pos.selling:
-            self.log_system.info(f"[SELL_REJECT_RETRY_SKIP] {self.cn(code)} 이미 매도중")
+
+        # ⭐ selling=True 체크 제거 → last_sell_attempt_ts 기준 쿨다운으로 대체
+        # 이유: SELL_STUCK이 selling=False 리셋 후 새 주문을 냈는데,
+        #       그 사이 pending에 남아있던 REJECT 이벤트가 뒤늦게 retry를 호출하면
+        #       selling=True 상태가 되어 정상 재시도가 차단됨 (LS네트웍스 케이스)
+        now_ts = pytime.time()
+        RETRY_COOLDOWN = 3.0  # 마지막 매도 시도 후 3초 이내 중복 재시도 방지
+        if now_ts - pos.last_sell_attempt_ts < RETRY_COOLDOWN:
+            self.log_system.info(
+                f"[SELL_REJECT_RETRY_SKIP] {self.cn(code)} 쿨다운 중 "
+                f"(마지막시도={now_ts - pos.last_sell_attempt_ts:.1f}초전)"
+            )
             return
 
         actual_qty = pos.remain_qty
-        self.log_trade.info(
-            f"[SELL_REJECT_RETRY] {self.cn(code)} "
-            f"재매도 qty={actual_qty} reason={reason}"
-        )
+
+        # ⭐ FIX: SELL_STUCK에서 _force_market_sell=True 설정된 경우 시장가로 강제 전환
+        if getattr(pos, '_force_market_sell', False):
+            self.log_system.warning(
+                f"[SELL_REJECT_RETRY_MARKET] {self.cn(code)} "
+                f"_force_market_sell=True → 시장가로 재시도 qty={actual_qty}"
+            )
+            pos._force_market_sell = False  # 플래그 초기화
+        else:
+            self.log_trade.info(
+                f"[SELL_REJECT_RETRY] {self.cn(code)} "
+                f"재매도 qty={actual_qty} reason={reason}"
+            )
+
+        # selling 강제 해제 후 재시도 (쿨다운으로 이미 중복 방지됨)
+        pos.selling = False
         ok = self.send_market_order("SELL", code, actual_qty, reason)
         if ok:
             pos.selling = True
@@ -2594,16 +2625,41 @@ class KiwoomAPI(QAxWidget):
     def force_liquidation_all(self):
         """
         14:50 강제 전량 청산
+
+        ⭐ FIX LS네트웍스 버그:
+          기존: pos.selling=True이면 스킵 → SELL_STUCK 후 selling이 True로 남은
+                좀비 포지션이 강제청산에서도 제외되어 미청산으로 하루 마감
+          수정: selling=True여도 last_sell_attempt_ts 기준으로 일정 시간(30초) 이상
+                경과했으면 강제청산 대상에 포함. selling 강제 리셋 후 재시도.
         """
         self.log_system.warning("[FORCE_LIQUIDATION_START] 강제청산 시작")
+        FORCE_SELLING_TIMEOUT = 30.0  # selling=True여도 30초 경과 시 강제 재시도
 
         for code, pos in list(self.positions.items()):
 
             if pos.remain_qty <= 0:
                 continue
 
+            now_ts = pytime.time()
+
+            # ⭐ selling=True인 좀비 포지션 처리
             if pos.selling:
-                continue
+                elapsed = now_ts - pos.last_sell_attempt_ts
+                if elapsed < FORCE_SELLING_TIMEOUT:
+                    # 아직 진행 중인 정상 매도 주문 → 기다림
+                    self.log_system.info(
+                        f"[FORCE_LIQUIDATION_WAIT] {self.cn(code)} "
+                        f"매도진행중 {elapsed:.0f}초 경과 → 스킵"
+                    )
+                    continue
+                else:
+                    # selling=True지만 30초 이상 경과 = 좀비 포지션
+                    self.log_system.warning(
+                        f"[FORCE_LIQUIDATION_ZOMBIE] {self.cn(code)} "
+                        f"selling=True 이나 {elapsed:.0f}초 경과 → 강제 리셋 후 재시도"
+                    )
+                    pos.selling = False
+                    self.pending_orders.pop(code, None)  # 스택된 pending 제거
 
             self.log_trade.warning(
                 f"[FORCE_SELL] {self.cn(code)} qty={pos.remain_qty}"

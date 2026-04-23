@@ -85,6 +85,13 @@ class PositionState:
     atr_tp2_price:    int = 0      # ATR TP2 목표가 (TP1 고점 + ATR × 3, TP1 체결 시 갱신)
     atr_safe_price:   int = 0      # 본절보호선 (매수가 - ATR × 0.5): TP1 후 이하 진입 시 탈출
 
+    # ⭐ [버그1 수정] STOP_LOSS_CANDLE 중복 발동 방지 플래그
+    # 문제: SELL_STUCK이 pos.selling=False로 리셋하면 다음 완성봉에서 STOP_LOSS_CANDLE이 재발동
+    #       → 1차 SL 주문이 거래소에 살아있는데 2차 주문 → [800033] 에러 반복
+    # 수정: STOP_LOSS_CANDLE 발동 시 True 세팅, SELL_DONE에서만 False 초기화
+    #       SELL_STUCK의 pos.selling=False 리셋 시에는 이 플래그를 건드리지 않음
+    sl_ordered: bool = False       # True = 이미 손절 주문 발송됨 (SELL_DONE 전까지 재발동 차단)
+
     # ⭐ 거래량 급감 청산용 — 분봉 단위 추적
     # 조건: 최근 5분봉 평균 거래량 대비 50% 이하
     #      + 고점 갱신 실패 2회 이상
@@ -470,6 +477,23 @@ class KiwoomAPI(QAxWidget):
                 entry_type = "BREAKOUT"
 
         if entry_type and len(self.positions) < MAX_POSITIONS:
+                # ── [버그3 수정] ENTRY_CONFIRMED 중복 발동 방지 ──────────────
+                # 문제: COND_OUT 후에도 candidates에 남아있다가 다음 스캔에서
+                #       같은 종목이 ENTRY_CONFIRMED 2회 발생 → 각각 주문+재주문 → 총 4회 주문
+                # 수정: pending_orders에 이미 같은 종목 BUY 주문이 있으면 차단
+                if code in self.pending_orders:
+                    existing = self.pending_orders[code]
+                    if existing.get("side") == "BUY":
+                        self.log_signal.info(
+                            f"[ENTRY_CONFIRMED_DUP] {self.cn(code)} "
+                            f"이미 BUY 주문 진행중 → 중복 진입 차단 "
+                            f"(retries={existing.get('reentry_retries',0)})"
+                        )
+                        info["state"] = "DONE"
+                        self._finish_tr(delay=True)
+                        return
+                # ──────────────────────────────────────────────────────────────
+
                 # ── 진입 확정 로그 ──
                 self.log_signal.info(
                     f"[ENTRY_CONFIRMED] {self.cn(code)} 전략={entry_type} "
@@ -1047,7 +1071,15 @@ class KiwoomAPI(QAxWidget):
             # atr_sl_price가 설정된 경우 우선 사용, 없으면 고정비율 fallback
             sl_threshold = pos.atr_sl_price if pos.atr_sl_price > 0 else int(entry * (1 - STOP_LOSS_RATE))
             if CANDLE_SL_ENABLED and completed_close <= sl_threshold:
-                if self.can_try_sell(pos):
+                # ⭐ [버그1 수정] sl_ordered 체크: 이미 손절 주문을 냈으면 재발동 차단
+                # SELL_STUCK이 pos.selling=False로 리셋해도 sl_ordered는 유지 → 중복 발동 방지
+                if pos.sl_ordered:
+                    self.log_trade.info(
+                        f"[STOP_LOSS_CANDLE_SKIP] {self.cn(code)} "
+                        f"이미 손절주문 발송됨(sl_ordered=True) → 재발동 차단 "
+                        f"종가:{completed_close} 기준:{sl_threshold}"
+                    )
+                elif self.can_try_sell(pos):
                     self.log_trade.info(
                         f"[STOP_LOSS_CANDLE] {self.cn(code)} 완성봉 ATR손절 "
                         f"종가:{completed_close} 손절기준:{sl_threshold} pnl={sl_rate:.4f}"
@@ -1057,6 +1089,7 @@ class KiwoomAPI(QAxWidget):
                     if ok:
                         pos.last_sell_attempt_ts = now
                         pos.selling = True
+                        pos.sl_ordered = True  # ⭐ 손절 주문 발송 마킹
                     else:
                         pos.selling = False
                     # 새 분봉 초기화 후 return
@@ -1578,6 +1611,26 @@ class KiwoomAPI(QAxWidget):
                         f"[SELL_STUCK_PARTIAL] {self.cn(code)} 경과={age:.1f}초 "
                         f"잔여={pos.remain_qty}/{pos.total_qty}주 - 강제정리"
                     )
+                    # ⭐ [버그2 수정 - LS네트웍스] SELL_STUCK_PARTIAL에서 pending을 pop하지 않음
+                    # 기존: pending.pop() → 거래소에 살아있는 나머지 주문의 CHEJAN을 잃어버림
+                    #        → pos.remain_qty가 영구적으로 남아 좀비 포지션 발생
+                    # 수정: pending을 유지하되 _force_market_sell=True로 마킹
+                    #        → 이후 CHEJAN이 오면 정상적으로 SELL_PARTIAL/SELL_DONE 처리됨
+                    #        → 동시에 MARKET_FALLBACK으로 시장가 재주문도 허용
+                    if pos and pend.get("reason", "").startswith("STOP_LOSS"):
+                        pos._force_market_sell = True
+                        self.log_system.warning(
+                            f"[SELL_STUCK_MARKET_FALLBACK] {self.cn(code)} "
+                            f"부분체결 후 잔여분 지정가 미체결 → 시장가로 전환 예약"
+                        )
+                    # pending은 유지 (CHEJAN 추적 보존)
+                    pend["stuck"] = True
+                    if pos:
+                        pos.selling = False  # 재주문 허용
+                        pos.time_stop_done = False
+                        pos.sell_reject_retries = 0
+                    self.ordering = bool(self.pending_orders)
+                    continue  # pending pop 없이 다음으로
 
                 self.log_system.warning(  # ERROR → WARNING (false alarm 구분)
                     f"[SELL_STUCK] {self.cn(code)} 경과={age:.1f}초 - "
@@ -2659,6 +2712,7 @@ class KiwoomAPI(QAxWidget):
                         f"selling=True 이나 {elapsed:.0f}초 경과 → 강제 리셋 후 재시도"
                     )
                     pos.selling = False
+                    pos.sl_ordered = False  # ⭐ [버그2] 강제청산 허용을 위해 sl_ordered 리셋
                     self.pending_orders.pop(code, None)  # 스택된 pending 제거
 
             self.log_trade.warning(

@@ -918,14 +918,17 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
     1. EMA 정배열: EMA20 > EMA60 (대세 상승 확인)
     2. 기준봉: 양봉 + 상승폭 ≥ 1.0% + 캔들강도 ≥ 60% + 거래량 3배↑
     3. 횡보 구간 (3~15봉): 고저 범위 ≤ 기준봉 몸통 60% + 거래량 수렴 ≤ 60%
-    4. 재돌파봉: 박스 상단 돌파 + 양봉 + 거래량 2배↑
-       ※ BREAKOUT 필터(ENTRY_CHECK) 미적용 — FLAG는 패턴 자체가 진입 신호
+    4. 재돌파봉(c1=candles[1]): 박스 상단 돌파 + 양봉 + 거래량 2배↑
+    5. [확인진입] 확인봉(c0=candles[0]): 재돌파봉 이후 현재봉이 수준 유지
+       → 팜스코 케이스 방지: 재돌파봉 자체가 고점이 되어 즉시 손절
+       → c0 저가 ≥ c1 종가 × 0.990 (재돌파봉 종가 -1% 이내)
+       → c0 종가 ≥ c1 종가 × 0.995 (재돌파봉 종가 -0.5% 이내)
 
     손절: 기준봉 시가
     """
     MIN_FLAG = 3
     MAX_FLAG = 15
-    need = MAX_FLAG + 25
+    need = MAX_FLAG + 26  # 확인봉(c0) 추가로 +1
 
     if len(candles) < need:
         if logger:
@@ -943,15 +946,18 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
             )
         return False
 
+    # c0 = 확인봉(현재 스캔 봉), c1 = 재돌파봉
     c0 = candles[0]
+    c1 = candles[1]
 
     for flag_len in range(MIN_FLAG, MAX_FLAG + 1):
-        if 1 + flag_len + 5 >= len(candles):
+        if 2 + flag_len + 5 >= len(candles):
             break
 
-        flag_candles = candles[1 : 1 + flag_len]
-        base         = candles[1 + flag_len]
-        prev_base    = candles[1 + flag_len + 1 : 1 + flag_len + 6]
+        # 인덱스 +1: c0=확인봉, c1=재돌파봉, candles[2:]=횡보+기준봉
+        flag_candles = candles[2 : 2 + flag_len]
+        base         = candles[2 + flag_len]
+        prev_base    = candles[2 + flag_len + 1 : 2 + flag_len + 6]
 
         base_body  = base['close'] - base['open']
         base_range = base['high'] - base['low']
@@ -984,27 +990,46 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
         if not is_flag:
             continue
 
-        box_top    = max(flag_highs)
+        box_top = max(flag_highs)
+
+        # ── 재돌파봉(c1) 조건 ────────────────────────────────────
         rebreak_ok = (
-            c0['close'] > box_top        and
-            c0['close'] > c0['open']     and
-            c0['volume'] >= avg_flag_vol * 2.0
+            c1['close'] > box_top        and
+            c1['close'] > c1['open']     and
+            c1['volume'] >= avg_flag_vol * 2.0
         )
         if not rebreak_ok:
             continue
 
-        # ⭐ FLAG 전용 추가 필터: 재돌파봉 캔들강도 ≥ 50% (너무 약한 봉 제거)
-        c0_rng  = c0['high'] - c0['low']
-        c0_body = c0['close'] - c0['open']
-        c0_str  = c0_body / c0_rng if c0_rng > 0 else 0
-        if c0_str < 0.50:
+        # 재돌파봉 캔들강도 ≥ 50%
+        c1_rng  = c1['high'] - c1['low']
+        c1_body = c1['close'] - c1['open']
+        c1_str  = c1_body / c1_rng if c1_rng > 0 else 0
+        if c1_str < 0.50:
             if logger:
                 logger.info(
                     f"[FLAG_CHECK] {code} "
-                    f"flag_len={flag_len} 재돌파 감지됐으나 "
-                    f"캔들강도({c0_str*100:.0f}%<50%) 불충분 → 스킵"
+                    f"flag_len={flag_len} 재돌파봉 캔들강도({c1_str*100:.0f}%<50%) 불충분"
                 )
             continue
+
+        # ── 확인봉(c0) 조건 ──────────────────────────────────────
+        # 재돌파봉(c1) 다음 봉(c0)이 재돌파 수준을 유지하는지 확인
+        # 팜스코: 재돌파봉(3,555)이 고점 → 다음봉 즉시 하락 → 손절
+        confirm_low_ok   = c0['low']   >= c1['close'] * 0.990
+        confirm_close_ok = c0['close'] >= c1['close'] * 0.995
+        confirm_ok = confirm_low_ok and confirm_close_ok
+
+        if not confirm_ok:
+            if logger:
+                drop = (c0['low'] - c1['close']) / c1['close'] * 100
+                logger.info(
+                    f"[FLAG_CHECK] {code} flag_len={flag_len} "
+                    f"확인봉 미유지: 재돌파종가={c1['close']} "
+                    f"현재봉저가={c0['low']}({drop:+.1f}%) → 진입 차단"
+                )
+            continue
+        # ─────────────────────────────────────────────────────────
 
         sr_boxes = _find_sr_boxes(candles)
         _, _, r_hi = _near_sr_box(c0['close'], sr_boxes, 'resistance', proximity=0.010)
@@ -1012,7 +1037,7 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
             if logger:
                 logger.info(
                     f"[FLAG_CHECK] {code} "
-                    f"flag_len={flag_len} 재돌파 감지됐으나 저항박스({r_hi}) 미돌파 → 스킵"
+                    f"flag_len={flag_len} 저항박스({r_hi}) 미돌파 → 스킵"
                 )
             continue
 
@@ -1023,8 +1048,9 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
                 f"거래량{base_vol_ratio:.1f}배) | "
                 f"횡보:{flag_len}봉(범위비율{flag_range_ratio:.2f}, "
                 f"거래량수렴{vol_shrink:.2f}) | "
-                f"재돌파:{c0['close']}(박스상단{box_top}, "
-                f"거래량{c0['volume']/avg_flag_vol:.1f}배) | "
+                f"재돌파:{c1['close']}(박스상단{box_top}, "
+                f"거래량{c1['volume']/avg_flag_vol:.1f}배) | "
+                f"확인봉:{c0['close']}(재돌파대비{(c0['close']-c1['close'])/c1['close']*100:+.1f}%) | "
                 f"EMA20:{ema20:.0f}>EMA60:{ema60:.0f} | "
                 f"손절기준봉시가:{base['open']}"
             )
@@ -1041,20 +1067,19 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
 def get_flag_signal_data(candles) -> dict | None:
     """FLAG 진입 시 디스코드 알림용 지표"""
     MIN_FLAG, MAX_FLAG = 3, 15
-    need = MAX_FLAG + 25
+    need = MAX_FLAG + 26  # 확인봉(c0) 추가로 +1
     if len(candles) < need:
         return None
 
-    closes = [c['close'] for c in candles]
-    ema20  = _calc_ema(closes, 20)
-    c0     = candles[0]
+    c0 = candles[0]   # 확인봉
+    c1 = candles[1]   # 재돌파봉
 
     for flag_len in range(MIN_FLAG, MAX_FLAG + 1):
-        if 1 + flag_len + 5 >= len(candles):
+        if 2 + flag_len + 5 >= len(candles):
             break
-        flag_candles = candles[1 : 1 + flag_len]
-        base         = candles[1 + flag_len]
-        prev_base    = candles[1 + flag_len + 1 : 1 + flag_len + 6]
+        flag_candles = candles[2 : 2 + flag_len]
+        base         = candles[2 + flag_len]
+        prev_base    = candles[2 + flag_len + 1 : 2 + flag_len + 6]
 
         base_body = base['close'] - base['open']
         if base_body <= 0:
@@ -1071,9 +1096,9 @@ def get_flag_signal_data(candles) -> dict | None:
         avg_flag_vol = sum(flag_vols) / len(flag_vols) if flag_vols else 1
         box_top      = max(flag_highs)
 
-        if c0['close'] > box_top and c0['volume'] >= avg_flag_vol * 2.0:
+        if c1['close'] > box_top and c1['volume'] >= avg_flag_vol * 2.0:
             return {
-                "vol_ratio":       c0['volume'] / avg_flag_vol,
+                "vol_ratio":       c1['volume'] / avg_flag_vol,
                 "trend":           f"깃발 재돌파(기준봉+{base_rise*100:.1f}%)",
                 "breakout":        f"박스상단({box_top}) 돌파",
                 "candle_strength": base_body / (base['high'] - base['low']) * 100

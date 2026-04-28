@@ -103,13 +103,17 @@ VOL_AVG_MIN = 50            # 평균 거래량 50 이하 = 사실상 정지
 BUY_FILL_TIMEOUT_SEC = 10     # 체결 대기 최대 8초 (너 환경에 맞게 5~15초 추천)
 CANCEL_RETRY_COOLDOWN_SEC = 2
 MAX_CANCEL_RETRIES = 2
-MAX_REENTRY_RETRIES = 1   # 취소 후 재매수 횟수 (2→1: 노브랜드 케이스 방지)
-                          # 재주문 2회 반복 시 24초 경과 → 시장가 급변 위험
+MAX_REENTRY_RETRIES = 2   # 취소 후 재매수 횟수
 REENTRY_DELAY_SEC = 1     # 재매수 딜레이
-REENTRY_MAX_SLIP  = 0.015 # 재주문 허용 슬리피지 상한 1.5% (기준가 대비 현재가)
 FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
 
 # (TP 지정가 제거됨 - 모두 시장가 매도)
 # ===== 강제청산 시각 =====
 FORCE_LIQUIDATION_HOUR = 15
 FORCE_LIQUIDATION_MIN  = 20
+
+# ===== BREAKOUT 에너지 소진 방지 =====
+# 당일 첫 COND_IN 이후 이 시간(초)이 경과한 종목은 BREAKOUT 진입 차단
+# 나노팀 케이스: 09:37 첫 급등 → 10:17(40분 후) 재급등 → 즉시 손절
+# → 20분(1,200초) 이상 경과 = 급등 에너지 소진 가능성
+BREAKOUT_FIRST_COND_TIMEOUT = 1200   # 20분 (조정 가능)

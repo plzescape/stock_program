@@ -92,6 +92,13 @@ class PositionState:
     #       SELL_STUCK의 pos.selling=False 리셋 시에는 이 플래그를 건드리지 않음
     sl_ordered: bool = False       # True = 이미 손절 주문 발송됨 (SELL_DONE 전까지 재발동 차단)
 
+    # ⭐ [버그2 수정] SELL_STUCK_PARTIAL 후 거래소 주문 소실 감지용 타임스탬프
+    # 문제: pending 보존 후 거래소 주문이 실제 취소된 경우 CHEJAN이 안 와서
+    #       잔여 수량이 표류 (팜스코 35분 표류 케이스)
+    # 수정: SELL_STUCK_PARTIAL 발생 시 타임스탬프 기록
+    #       → STUCK_PARTIAL_TIMEOUT(300초) 내 체결 없으면 강제 시장가 재주문
+    stuck_partial_ts: float = 0.0  # SELL_STUCK_PARTIAL 발생 시각 (0 = 미발생)
+
     # ⭐ 거래량 급감 청산용 — 분봉 단위 추적
     # 조건: 최근 5분봉 평균 거래량 대비 50% 이하
     #      + 고점 갱신 실패 2회 이상
@@ -469,10 +476,32 @@ class KiwoomAPI(QAxWidget):
         #   BREAKOUT: 신고점 돌파 → 체결 많지만 고점 물림 위험 → 마지막 확인
         entry_type = None
         if len(completed_candles) >= 20:   # 새 BREAKOUT 전략은 20봉만 필요
+
+            # ── BREAKOUT 에너지 소진 체크 ────────────────────────────────
+            # 나노팀 케이스: 09:37 첫 급등(COND_IN) → 10:17(40분 후) CONFIRMED
+            # → 40분간 COND_IN/OUT 반복 = 급등 에너지 소진 종목 특징
+            # → 첫 COND_IN에서 BREAKOUT_FIRST_COND_TIMEOUT 이상 경과 시 BREAKOUT 차단
+            # FLAG/PULLBACK은 별도 패턴이므로 제외
+            _first_ts = info.get("first_cond_in_ts", 0)
+            _elapsed  = pytime.time() - _first_ts if _first_ts else 0
+            try:
+                from config import BREAKOUT_FIRST_COND_TIMEOUT
+                _br_timeout = BREAKOUT_FIRST_COND_TIMEOUT
+            except ImportError:
+                _br_timeout = 1200  # 기본 20분
+            _breakout_stale = (_first_ts > 0 and _elapsed > _br_timeout)
+            # ─────────────────────────────────────────────────────────────
+
             if is_pullback_entry(completed_candles, self.log_signal, code):
                 entry_type = "PULLBACK"
             elif is_flag_entry(completed_candles, self.log_signal, code):
                 entry_type = "FLAG"
+            elif _breakout_stale:
+                self.log_signal.info(
+                    f"[BREAKOUT_STALE_SKIP] {self.cn(code)} "
+                    f"첫COND_IN 경과={_elapsed:.0f}초 > {_br_timeout}초 → BREAKOUT 차단 "
+                    f"(에너지 소진 가능성)"
+                )
             elif is_entry_candidate_VER2(completed_candles, self.log_signal, code):
                 entry_type = "BREAKOUT"
 
@@ -1122,6 +1151,15 @@ class KiwoomAPI(QAxWidget):
         # EMERGENCY_SL_RATE = 0.0 이면 비활성화
         # ==================================================
         if EMERGENCY_SL_RATE > 0 and pnl_rate <= -EMERGENCY_SL_RATE:
+            # ⭐ sl_ordered 체크: 이미 손절 주문 발송됐으면 재발동 차단
+            # SELL_STUCK 후 selling=False 리셋 시 EMERGENCY가 재발동하는 문제 방지
+            if pos.sl_ordered:
+                self.log_trade.info(
+                    f"[STOP_LOSS_EMERGENCY_SKIP] {self.cn(code)} "
+                    f"이미 손절주문 발송됨(sl_ordered=True) → 재발동 차단 "
+                    f"현재가:{cur} pnl={pnl_rate:.4f}"
+                )
+                return
             if not self.can_try_sell(pos):
                 return
             self.log_trade.info(
@@ -1133,7 +1171,8 @@ class KiwoomAPI(QAxWidget):
                                                sl_limit_price=pos.atr_sl_price)
             if ok:
                 pos.last_sell_attempt_ts = now
-                pos.selling = True
+                pos.selling    = True
+                pos.sl_ordered = True  # ⭐ EMERGENCY 경로 손절 마킹 (재발동 방지)
             else:
                 pos.selling = False
             return
@@ -1607,32 +1646,32 @@ class KiwoomAPI(QAxWidget):
                     # 부분체결 진행 중 → 타임아웃을 60초로 연장
                     if age <= SELL_PENDING_TIMEOUT * 2:
                         continue
-                    self.log_system.warning(  # ERROR → WARNING (false alarm 구분)
+                    self.log_system.warning(
                         f"[SELL_STUCK_PARTIAL] {self.cn(code)} 경과={age:.1f}초 "
                         f"잔여={pos.remain_qty}/{pos.total_qty}주 - 강제정리"
                     )
-                    # ⭐ [버그2 수정 - LS네트웍스] SELL_STUCK_PARTIAL에서 pending을 pop하지 않음
-                    # 기존: pending.pop() → 거래소에 살아있는 나머지 주문의 CHEJAN을 잃어버림
-                    #        → pos.remain_qty가 영구적으로 남아 좀비 포지션 발생
-                    # 수정: pending을 유지하되 _force_market_sell=True로 마킹
-                    #        → 이후 CHEJAN이 오면 정상적으로 SELL_PARTIAL/SELL_DONE 처리됨
-                    #        → 동시에 MARKET_FALLBACK으로 시장가 재주문도 허용
+                    # ⭐ [버그2] SELL_STUCK_PARTIAL: pending 보존 + stuck_partial_ts 기록
+                    # 기존: pending.pop() → 거래소 잔여 주문 CHEJAN을 놓쳐 좀비 포지션 발생
+                    #       (팜스코: 1401주 35분 표류)
+                    # 수정: pending 유지 + stuck_partial_ts 기록
+                    #   → STUCK_PARTIAL_TIMEOUT(300초) 내 체결 없으면 강제 시장가 재주문
                     if pos and pend.get("reason", "").startswith("STOP_LOSS"):
                         pos._force_market_sell = True
                         self.log_system.warning(
                             f"[SELL_STUCK_MARKET_FALLBACK] {self.cn(code)} "
                             f"부분체결 후 잔여분 지정가 미체결 → 시장가로 전환 예약"
                         )
-                    # pending은 유지 (CHEJAN 추적 보존)
                     pend["stuck"] = True
                     if pos:
-                        pos.selling = False  # 재주문 허용
+                        if not pos.stuck_partial_ts:
+                            pos.stuck_partial_ts = pytime.time()  # 처음만 기록
+                        pos.selling        = False  # 재주문 허용
                         pos.time_stop_done = False
                         pos.sell_reject_retries = 0
                     self.ordering = bool(self.pending_orders)
                     continue  # pending pop 없이 다음으로
 
-                self.log_system.warning(  # ERROR → WARNING (false alarm 구분)
+                self.log_system.warning(
                     f"[SELL_STUCK] {self.cn(code)} 경과={age:.1f}초 - "
                     f"stuck 표시 (주문이 살아있을 수 있음)"
                 )
@@ -1657,6 +1696,38 @@ class KiwoomAPI(QAxWidget):
                     pos.time_stop_done = False  # stuck 후 재시도 가능하도록 리셋
                     pos.sell_reject_retries = 0  # ⭐ FIX: SELL_STUCK 후 재시도 카운터 리셋 (LS네트웍스 버그)
                 self.ordering = bool(self.pending_orders)
+
+        # ── stuck_partial_ts 타임아웃 감지 → 강제 시장가 재주문 ──────────
+        # SELL_STUCK_PARTIAL 발생 후 거래소 주문이 소실된 경우
+        # CHEJAN이 오지 않아 잔여 수량이 표류하는 문제 방지
+        # (팜스코: 09:38 SL → 09:39 STUCK_PARTIAL → 10:00까지 1401주 35분 표류)
+        STUCK_PARTIAL_TIMEOUT = 300  # 5분 내 체결 CHEJAN 없으면 강제 재주문
+        for code, pos in list(self.positions.items()):
+            if not pos.stuck_partial_ts:
+                continue
+            if pos.remain_qty <= 0:
+                pos.stuck_partial_ts = 0.0  # 이미 청산 → 초기화
+                continue
+            elapsed = now - pos.stuck_partial_ts
+            if elapsed < STUCK_PARTIAL_TIMEOUT:
+                continue
+            if pos.selling:
+                continue  # 이미 다른 매도 진행중
+            self.log_system.warning(
+                f"[STUCK_PARTIAL_TIMEOUT] {self.cn(code)} "
+                f"{elapsed:.0f}초 경과 후에도 잔여={pos.remain_qty}주 미체결 "
+                f"→ 시장가 강제 재주문"
+            )
+            pos.stuck_partial_ts = 0.0  # 타이머 리셋 (무한 반복 방지)
+            ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
+            if ok:
+                pos.selling = True
+                pos.last_sell_attempt_ts = pytime.time()
+            else:
+                self.log_system.error(
+                    f"[STUCK_PARTIAL_TIMEOUT_FAIL] {self.cn(code)} "
+                    f"강제 재주문 실패 — 강제청산 타이머에서 처리"
+                )
 
     # ==================================================
     # 재매수 함수
@@ -2272,7 +2343,10 @@ class KiwoomAPI(QAxWidget):
                 "state": "NEW",
                 "retry": 0,
                 "added_at": datetime.now(),
-                "cond_name": cond_name,   # 어느 조건식에서 잡혔는지 추적
+                "cond_name": cond_name,
+                # ⭐ 당일 첫 COND_IN 시각 기록 (BREAKOUT 에너지 소진 방지)
+                # 나노팀 케이스: 09:37 첫 급등 → 10:17(40분 후) 재급등 진입 → 즉시 손절
+                "first_cond_in_ts": pytime.time(),
             }
 
             # ⭐ 버그 수정: 중복 추가 방지
@@ -2355,7 +2429,9 @@ class KiwoomAPI(QAxWidget):
                     "retry": 0,
                     "last_try": None,
                     "added_at": datetime.now(),
-                    "cond_name": cond_name,   # 어느 조건식에서 잡혔는지 추적
+                    "cond_name": cond_name,
+                    # ⭐ 당일 첫 COND_IN 시각 기록 (BREAKOUT 에너지 소진 방지)
+                    "first_cond_in_ts": pytime.time(),
                 }
 
                 self.scan_queue.append(code)

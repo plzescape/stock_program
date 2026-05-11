@@ -5,8 +5,67 @@ from config import IS_REAL
 from PyQt5.QtCore import QTimer
 from datetime import datetime, time
 import requests
+import config
 
 MAX_SELF_CHECK_RETRY = 10   # 최대 재시도 횟수
+
+
+# ===== ⏱️ 하드컷 런타임 토글 =====
+def disable_hardcut(strategy: str = "ALL") -> None:
+    """
+    실행 중 하드컷을 즉시 해제합니다.
+
+    사용법 (파이썬 인터프리터 또는 디버그 콘솔):
+        disable_hardcut()           # BREAKOUT + PULLBACK 모두 해제
+        disable_hardcut("BREAKOUT") # BREAKOUT만 해제
+        disable_hardcut("PULLBACK") # PULLBACK만 해제
+
+    재활성화:
+        enable_hardcut()            # 원래 config.py 시각으로 복원
+        enable_hardcut("BREAKOUT", "13:00")  # BREAKOUT 하드컷을 13:00으로 변경
+    """
+    strategy = strategy.upper()
+    if strategy in ("ALL", "BREAKOUT"):
+        config.BREAKOUT_TIME_CUT_ENABLED = False
+        print("✅ BREAKOUT 하드컷 해제 (10:30 제한 없음)")
+    if strategy in ("ALL", "PULLBACK"):
+        config.PULLBACK_TIME_CUT_ENABLED = False
+        print("✅ PULLBACK 하드컷 해제 (11:00 제한 없음)")
+
+
+def enable_hardcut(strategy: str = "ALL", cut_time: str = None) -> None:
+    """
+    하드컷을 재활성화하거나 시각을 변경합니다.
+
+    Args:
+        strategy : "ALL" | "BREAKOUT" | "PULLBACK"
+        cut_time : "HH:MM" 형식. None이면 config.py 원래 값 사용.
+
+    사용 예:
+        enable_hardcut()                    # 원래 시각으로 복원
+        enable_hardcut("BREAKOUT", "13:00") # BREAKOUT 하드컷을 13:00으로 변경
+        enable_hardcut("ALL", "14:00")      # 둘 다 14:00으로 변경
+    """
+    from datetime import time as _time
+
+    def _parse(s: str) -> _time:
+        h, m = map(int, s.split(":"))
+        return _time(h, m)
+
+    strategy = strategy.upper()
+    if strategy in ("ALL", "BREAKOUT"):
+        config.BREAKOUT_TIME_CUT_ENABLED = True
+        if cut_time:
+            config.BREAKOUT_TIME_CUT     = _parse(cut_time)
+            config.BREAKOUT_TIME_CUT_STR = cut_time
+        print(f"🔒 BREAKOUT 하드컷 활성화 → {config.BREAKOUT_TIME_CUT_STR}")
+
+    if strategy in ("ALL", "PULLBACK"):
+        config.PULLBACK_TIME_CUT_ENABLED = True
+        if cut_time:
+            config.PULLBACK_TIME_CUT     = _parse(cut_time)
+            config.PULLBACK_TIME_CUT_STR = cut_time
+        print(f"🔒 PULLBACK 하드컷 활성화 → {config.PULLBACK_TIME_CUT_STR}")
 
 #===== 계좌 테스트 =====
 def test_account(api: KiwoomAPI):
@@ -44,6 +103,9 @@ def enable_auto_trade(api: KiwoomAPI):
             print(f"⚠️ Discord 장시작 알림 실패: {e}")
 
         api.run_condition_cycle()
+
+        # ⭐ ZOMBIE 포지션 감시 타이머 시작
+        schedule_zombie_watchdog(api)
 
         # ⭐ 조건검색 주기 타이머 (CONDITION_INTERVAL_MIN마다 자동 재실행)
         from config import CONDITION_INTERVAL_MIN
@@ -88,6 +150,48 @@ def schedule_force_liquidation(api):
         delay_ms,
         lambda: api.force_liquidation_all()
     )
+
+#===== ⭐ 주기적 ZOMBIE 포지션 청산 (5분 주기) =====
+def schedule_zombie_watchdog(api):
+    """
+    5분마다 selling=True 상태로 300초 이상 방치된 포지션을 감지하여 강제 재매도.
+    force_liquidation_all(14:50) 외에도 장중 ZOMBIE를 조기 해결.
+    피제이메탈 케이스(9232초 방치) 재발 방지.
+    """
+    from PyQt5.QtCore import QTimer
+    
+    def _watchdog():
+        import time as pytime
+        ZOMBIE_SEC = 300
+        now_ts = pytime.time()
+        for code, pos in list(api.positions.items()):
+            if pos.remain_qty <= 0 or not pos.selling:
+                continue
+            elapsed = now_ts - pos.last_sell_attempt_ts
+            if elapsed >= ZOMBIE_SEC:
+                api.log_system.warning(
+                    f"[WATCHDOG_ZOMBIE] {api.cn(code)} "
+                    f"selling=True {elapsed:.0f}초 경과 → 강제 리셋 후 재매도"
+                )
+                api.pending_orders.pop(code, None)
+                pos.selling    = False
+                pos.sl_ordered = False
+                pos.sell_reject_retries = 0
+                ok = api.send_market_order("SELL", code, pos.remain_qty, "ZOMBIE_RECOVERY")
+                if ok:
+                    pos.selling = True
+                    pos.last_sell_attempt_ts = pytime.time()
+                else:
+                    api.log_system.error(
+                        f"[WATCHDOG_ZOMBIE_FAIL] {api.cn(code)} 재매도 실패"
+                    )
+    
+    timer = QTimer()
+    timer.timeout.connect(_watchdog)
+    timer.start(300 * 1000)  # 5분마다
+    api._zombie_watchdog_timer = timer  # GC 방지
+    print("🛡️ ZOMBIE 감시 타이머 시작 (5분 주기)")
+
 
 #===== 메인 함수 =====        
 def main():

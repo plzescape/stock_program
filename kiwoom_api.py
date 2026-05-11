@@ -1027,6 +1027,42 @@ class KiwoomAPI(QAxWidget):
         
         if cur <= 0:
             return
+        # ── ⭐ [피제이메탈 버그] ZOMBIE 포지션 주기적 감지 ───────────────
+        # selling=True 이면서 last_sell_attempt_ts 기준 300초(5분) 이상 경과 시
+        # pending 제거 + selling 리셋 → 즉시 시장가 재매도 시도
+        # 기존: force_liquidation_all(14:50)에서만 감지 → 수 시간 방치 가능
+        # 개선: 틱마다(2초 주기) 체크하여 5분 이내 조기 감지
+        _ZOMBIE_INTERVAL    = 300   # 5분마다 감지
+        _ZOMBIE_STUCK_SEC   = 300   # selling=True 이면서 300초 경과 = ZOMBIE
+        if not hasattr(self, '_last_zombie_check_ts'):
+            self._last_zombie_check_ts = 0.0
+        _tick_now = pytime.time()
+        if _tick_now - self._last_zombie_check_ts >= _ZOMBIE_INTERVAL:
+            self._last_zombie_check_ts = _tick_now
+            for _zcode, _zpos in list(self.positions.items()):
+                if _zpos.remain_qty <= 0 or not _zpos.selling:
+                    continue
+                _z_elapsed = _tick_now - _zpos.last_sell_attempt_ts
+                if _z_elapsed >= _ZOMBIE_STUCK_SEC:
+                    self.log_system.warning(
+                        f"[ZOMBIE_DETECTED] {self.cn(_zcode)} "
+                        f"selling=True {_z_elapsed:.0f}초 경과 → 강제 리셋 후 재매도"
+                    )
+                    self.pending_orders.pop(_zcode, None)
+                    _zpos.selling    = False
+                    _zpos.sl_ordered = False
+                    _zpos.sell_reject_retries = 0
+                    _z_qty = _zpos.remain_qty
+                    ok = self.send_market_order("SELL", _zcode, _z_qty, "ZOMBIE_RECOVERY")
+                    if ok:
+                        _zpos.selling = True
+                        _zpos.last_sell_attempt_ts = _tick_now
+                    else:
+                        self.log_system.error(
+                            f"[ZOMBIE_RECOVERY_FAIL] {self.cn(_zcode)} 시장가 재매도 실패"
+                        )
+        # ── ZOMBIE 감지 끝 ─────────────────────────────────────────────────
+
 
         if cur > pos.highest_price:
             pos.highest_price = cur
@@ -1666,7 +1702,12 @@ class KiwoomAPI(QAxWidget):
                         if not pos.stuck_partial_ts:
                             pos.stuck_partial_ts = pytime.time()  # 처음만 기록
                         pos.selling        = False  # 재주문 허용
-                        pos.time_stop_done = False
+                        # ⭐ [버그2 수정] TIME_STOP/VOL_TIME_STOP reason이면 time_stop_done 유지
+                        # 기존: 무조건 False 리셋 → SELL_STUCK 후 TIME_STOP 재발동 → [800033] 이중 주문
+                        # 수정: STOP_LOSS 계열만 리셋, TIME_STOP은 유지하여 재발동 차단
+                        _stuck_reason = pend.get("reason", "")
+                        if "TIME_STOP" not in _stuck_reason and "VOL_TIME_STOP" not in _stuck_reason:
+                            pos.time_stop_done = False
                         pos.sell_reject_retries = 0
                     self.ordering = bool(self.pending_orders)
                     continue  # pending pop 없이 다음으로
@@ -1693,7 +1734,27 @@ class KiwoomAPI(QAxWidget):
                 self.pending_orders.pop(code, None)
                 if pos:
                     pos.selling = False
-                    pos.time_stop_done = False  # stuck 후 재시도 가능하도록 리셋
+                    # ⭐ [버그2 수정] TIME_STOP/VOL_TIME_STOP reason이면 time_stop_done 유지
+                    # 기존: 무조건 False 리셋 → SELL_STUCK 후 TIME_STOP 재발동 → [800033] 이중 주문
+                    # SCL사이언스 케이스: 09:48 TIME_STOP 발동 → 09:48 SELL_STUCK →
+                    #   time_stop_done=False 리셋 → 09:50 TIME_STOP 재발동 → [800033] 거절
+                    # 수정: TIME_STOP 계열은 리셋 안 함. STOP_LOSS 계열만 리셋하여 재시도 허용.
+                    _stuck_reason = pend.get("reason", "") if pend else getattr(pos, '_preserved_sell_reason', '')
+                    if "TIME_STOP" not in _stuck_reason and "VOL_TIME_STOP" not in _stuck_reason:
+                        pos.time_stop_done = False  # STOP_LOSS 계열: 재시도 허용
+                    else:
+                        # TIME_STOP 재시도: time_stop_done은 유지하되 selling만 해제
+                        # → TIME_STOP 로직 재발동 대신 _retry_sell_after_reject 경로로 재시도
+                        self.log_system.info(
+                            f"[SELL_STUCK_TIMESTOP] {self.cn(code)} "
+                            f"TIME_STOP STUCK → time_stop_done 유지, 3초 후 강제 재시도"
+                        )
+                        QTimer.singleShot(
+                            3000,
+                            lambda c=code, q=pos.remain_qty: self._retry_sell_after_reject(
+                                c, q, "TIME_STOP_RETRY"
+                            )
+                        )
                     pos.sell_reject_retries = 0  # ⭐ FIX: SELL_STUCK 후 재시도 카운터 리셋 (LS네트웍스 버그)
                 self.ordering = bool(self.pending_orders)
 
@@ -2245,6 +2306,11 @@ class KiwoomAPI(QAxWidget):
             )
             pos.entry_ts = _entry_ts
             pos.buy_done = True
+            # ⭐ [버그1 수정] last_sell_attempt_ts를 현재 시각으로 초기화
+            # 기존: 기본값 0.0 유지 → ZOMBIE 감지 시 pytime.time() - 0.0 ≈ 17.8억 초(56년) 계산
+            #       → 복구 직후 즉시 ZOMBIE 판정 → 이미 청산 주문이 접수된 종목에 이중 재매도 시도
+            # 수정: 복구 시각을 기록하여 ZOMBIE_STUCK_SEC(300초) 이내 오탐 방지
+            pos.last_sell_attempt_ts = pytime_.time()
 
             self.positions[code] = pos
             self.register_real(code)
@@ -2588,6 +2654,24 @@ class KiwoomAPI(QAxWidget):
                                         f"[SELL_REJECT_ABORT] {self.cn(code)} "
                                         f"[800033] 재시도 {retry_cnt}회 초과 → 포기 (SELL_STUCK 대기)"
                                     )
+                                    # ⭐ [피제이메탈 버그 수정] 재시도 한도 초과 시
+                                    # pending 제거 + selling 리셋 → SELL_STUCK 대기 없이 즉시 재매도
+                                    # 기존: 포기 후 9000초 이상 ZOMBIE로 방치됨 (로그: ZOMBIE 9232초)
+                                    self.pending_orders.pop(code, None)
+                                    pos.selling   = False
+                                    pos.sl_ordered = False
+                                    pos.sell_reject_retries = 0
+                                    _qty_force  = pos.remain_qty
+                                    _rsn_force  = pend.get("reason", "STOP_LOSS") if pend else "STOP_LOSS"
+                                    self.log_system.warning(
+                                        f"[SELL_REJECT_FORCE] {self.cn(code)} "
+                                        f"pending 제거 후 2초 뒤 강제 재매도 "
+                                        f"qty={_qty_force} reason={_rsn_force}"
+                                    )
+                                    QTimer.singleShot(
+                                        2000,
+                                        lambda c=code, q=_qty_force, r=_rsn_force: self._retry_sell_after_reject(c, q, r)
+                                    )
                                 else:
                                     sell_qty = pos.remain_qty
                                     sell_reason = pend.get("reason", "STOP_LOSS") if pend else "STOP_LOSS"
@@ -2762,7 +2846,7 @@ class KiwoomAPI(QAxWidget):
                 경과했으면 강제청산 대상에 포함. selling 강제 리셋 후 재시도.
         """
         self.log_system.warning("[FORCE_LIQUIDATION_START] 강제청산 시작")
-        FORCE_SELLING_TIMEOUT = 30.0  # selling=True여도 30초 경과 시 강제 재시도
+        FORCE_SELLING_TIMEOUT = 60.0  # selling=True여도 60초 경과 시 강제 재시도
 
         for code, pos in list(self.positions.items()):
 

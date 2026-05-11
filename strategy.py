@@ -558,16 +558,14 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
             logger.info(f"[BREAKOUT_SKIP] {code} 데이터 부족(필요:20 현재:{len(candles)})")
         return False
 
-    # ── 진입 시각 하드컷 (모니터링 모드 시 비활성화) ────────────
-    # config.py: BREAKOUT_TIME_CUT_ENABLED = False 로 전체 시간 허용
+    # ── 진입 시각 하드컷 ─────────────────────────────────────────
+    # config.BREAKOUT_TIME_CUT_ENABLED = False  →  해제
+    # config.BREAKOUT_TIME_CUT_STR = "HH:MM"   →  시각 변경
+    # main.py의 disable_hardcut() / enable_hardcut() 으로 런타임 토글 가능
     _now = _dt.now().time()
-    try:
-        from config import BREAKOUT_TIME_CUT_ENABLED, BREAKOUT_TIME_CUT
-        _cut_enabled = BREAKOUT_TIME_CUT_ENABLED
-        _cut_time    = BREAKOUT_TIME_CUT
-    except ImportError:
-        _cut_enabled = True
-        _cut_time    = time(10, 30)
+    import config as _cfg
+    _cut_enabled = getattr(_cfg, "BREAKOUT_TIME_CUT_ENABLED", True)
+    _cut_time    = getattr(_cfg, "BREAKOUT_TIME_CUT", time(10, 30))
     if _cut_enabled and _now > _cut_time:
         if logger:
             logger.info(
@@ -595,20 +593,33 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
     # D. 당일 누적 상승률 5~15% (상한 20→15% 축소)
     day_open  = candles[-1]['open'] if candles else c0['open']
     day_rise  = (c0['close'] - day_open) / day_open * 100 if day_open > 0 else 0
-    surge_ok  = 5.0 <= day_rise <= 15.0
+    try:
+        from config import BREAKOUT_DAY_SURGE_MAX
+        _surge_max = BREAKOUT_DAY_SURGE_MAX
+    except ImportError:
+        _surge_max = 12.0  # 기본 12%
+    surge_ok  = 5.0 <= day_rise <= _surge_max
 
     # E. EMA20 이격 ≤ 5% (추격매수 차단)
     closes    = [c['close'] for c in candles]
     ema20     = _calc_ema(closes, 20)
     ema_ok    = (ema20 is not None) and (c0['close'] > ema20)
     ema_gap   = (c0['close'] - ema20) / ema20 * 100 if ema20 else 0
-    ema_gap_ok = ema_gap <= 5.0
+    try:
+        from config import BREAKOUT_EMA_GAP_MAX
+        _ema_gap_max = BREAKOUT_EMA_GAP_MAX
+    except ImportError:
+        _ema_gap_max = 4.0
+    ema_gap_ok = ema_gap <= _ema_gap_max
 
     # F. [핵심 신규] 3연속 양봉 필수 — 지속 매수세 증거
-    #    candles[0]=현재봉, candles[1]=직전봉, candles[2]=2봉전
-    #    세 봉 모두 양봉(종가 > 시가)이어야 함
-    if len(candles) >= 3:
-        consec_bull = all(candles[i]['close'] > candles[i]['open'] for i in range(3))
+    #    ⭐ [희림 버그 수정] candles[0]은 현재 진행 중인 미완성봉
+    #    분봉이 막 열린 직후 잠깐 양봉처럼 보여도 완성되지 않은 봉이므로 제외
+    #    완성봉 3개(candles[1],[2],[3])로만 체크해야 신뢰성 확보
+    #    기존: range(3) → candles[0](미완성), [1], [2] → 새 분봉 시작 직후 오판
+    #    수정: range(1, 4) → candles[1], [2], [3] → 완성봉 3개만 사용
+    if len(candles) >= 4:
+        consec_bull = all(candles[i]['close'] > candles[i]['open'] for i in range(1, 4))
     else:
         consec_bull = False
 
@@ -622,7 +633,12 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
         if avg_before > 0 and c['volume'] / avg_before >= 3.0:
             surge_candle_age = i
             break
-    fresh_ok = surge_candle_age <= 10
+    try:
+        from config import BREAKOUT_FRESH_CANDLES_MAX
+        _fresh_max = BREAKOUT_FRESH_CANDLES_MAX
+    except ImportError:
+        _fresh_max = 7  # 기본 7봉
+    fresh_ok = surge_candle_age <= _fresh_max
 
     is_valid = (is_bull and vol_ok and price_ok and surge_ok and
                 ema_ok and ema_gap_ok and consec_bull and fresh_ok)
@@ -637,8 +653,9 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"거래량:{vol_ratio:.1f}배({c0['volume']:,}주) | "
                 f"5봉고점:{prev5_high}(돌파={price_ok}) | "
                 f"당일상승:{day_rise:.1f}% | "
-                f"3연속양봉:{consec_bull} | "
-                f"급등경과:{surge_candle_age}봉"
+                f"3연속양봉(완성봉1~3):{consec_bull} | "
+                f"급등경과:{surge_candle_age}봉(≤{_fresh_max}봉) | "
+                f"당일상승상한:{_surge_max:.0f}%"
             )
         else:
             logger.info(
@@ -649,8 +666,10 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"surge={surge_ok}({day_rise:.1f}%∈[5,15]%) "
                 f"ema={ema_ok}({c0['close']}>{(ema20 or 0):.0f}) "
                 f"ema_gap={ema_gap_ok}({ema_gap:.1f}%≤5%) "
-                f"3연속양봉={consec_bull} "
-                f"급등경과={fresh_ok}({surge_candle_age}봉≤10)"
+                f"3연속양봉(완성봉1~3)={consec_bull} "
+                f"급등경과={fresh_ok}({surge_candle_age}봉≤{_fresh_max}) "
+                f"당일상승={surge_ok}({day_rise:.1f}%∈[5,{_surge_max:.0f}]%) "
+                f"EMA이격={ema_gap_ok}({ema_gap:.1f}%≤{_ema_gap_max:.0f}%)"
             )
 
     return is_valid
@@ -729,16 +748,14 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
             logger.info(f"[PULLBACK_SKIP] {code} 데이터 부족(필요:35 현재:{len(candles)})")
         return False
 
-    # ── 진입 시각 하드컷 (모니터링 모드 시 비활성화) ────────────
-    # config.py: PULLBACK_TIME_CUT_ENABLED = False 로 전체 시간 허용
+    # ── 진입 시각 하드컷 ─────────────────────────────────────────
+    # config.PULLBACK_TIME_CUT_ENABLED = False  →  해제
+    # config.PULLBACK_TIME_CUT_STR = "HH:MM"   →  시각 변경
+    # main.py의 disable_hardcut() / enable_hardcut() 으로 런타임 토글 가능
     _now = _dt.now().time()
-    try:
-        from config import PULLBACK_TIME_CUT_ENABLED, PULLBACK_TIME_CUT
-        _cut_enabled = PULLBACK_TIME_CUT_ENABLED
-        _cut_time    = PULLBACK_TIME_CUT
-    except ImportError:
-        _cut_enabled = True
-        _cut_time    = time(11, 0)
+    import config as _cfg
+    _cut_enabled = getattr(_cfg, "PULLBACK_TIME_CUT_ENABLED", True)
+    _cut_time    = getattr(_cfg, "PULLBACK_TIME_CUT", time(11, 0))
     if _cut_enabled and _now > _cut_time:
         if logger:
             logger.info(

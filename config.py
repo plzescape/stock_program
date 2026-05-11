@@ -116,4 +116,38 @@ FORCE_LIQUIDATION_MIN  = 20
 # 당일 첫 COND_IN 이후 이 시간(초)이 경과한 종목은 BREAKOUT 진입 차단
 # 나노팀 케이스: 09:37 첫 급등 → 10:17(40분 후) 재급등 → 즉시 손절
 # → 20분(1,200초) 이상 경과 = 급등 에너지 소진 가능성
-BREAKOUT_FIRST_COND_TIMEOUT = 1200   # 20분 (조정 가능)
+BREAKOUT_FIRST_COND_TIMEOUT = 900    # 15분으로 단축 (기존 20분 → NEVER_ROSE 개선)
+# ===== BREAKOUT 강화 필터 (로그 분석 기반) =====
+# NEVER_ROSE 비율 75~78% 개선 목적
+# 급등 경과시간 상한 (봉 수) — 기존 10봉에서 7봉으로 단축
+BREAKOUT_FRESH_CANDLES_MAX = 7        # 급등봉 이후 7봉(7분) 이내만 허용
+
+# 당일 누적 상승 상한 (기존 15% → 12%): 이미 많이 오른 종목 차단 강화
+BREAKOUT_DAY_SURGE_MAX = 12.0         # 당일 상승 상한 (%)
+
+# EMA20 이격 상한 (기존 5% → 4%): 추격매수 차단 강화
+BREAKOUT_EMA_GAP_MAX = 4.0            # EMA20 대비 이격 상한 (%)
+
+# ===== PULLBACK 강화 필터 =====
+# 시각 하드컷
+# PULLBACK_TIME_CUT_ENABLED = False  →  하드컷 완전 해제 (시간 제한 없음)
+# PULLBACK_TIME_CUT_STR     = "HH:MM" 으로 시각 변경 가능 (기본 11:00)
+PULLBACK_TIME_CUT_ENABLED = False
+PULLBACK_TIME_CUT_STR = "11:00"
+
+# BREAKOUT 시각 하드컷
+# BREAKOUT_TIME_CUT_ENABLED = False  →  하드컷 완전 해제 (시간 제한 없음)
+# BREAKOUT_TIME_CUT_STR     = "HH:MM" 으로 시각 변경 가능 (기본 10:30)
+BREAKOUT_TIME_CUT_ENABLED = False
+BREAKOUT_TIME_CUT_STR = "10:30"
+
+# ── 위 설정을 strategy.py 에서 바로 import 해 쓸 수 있도록 time 객체로 변환 ──
+from datetime import time as _time
+
+def _parse_time(s: str) -> _time:
+    h, m = map(int, s.split(":"))
+    return _time(h, m)
+
+BREAKOUT_TIME_CUT = _parse_time(BREAKOUT_TIME_CUT_STR)
+PULLBACK_TIME_CUT = _parse_time(PULLBACK_TIME_CUT_STR)
+

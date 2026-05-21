@@ -1040,27 +1040,39 @@ class KiwoomAPI(QAxWidget):
         if _tick_now - self._last_zombie_check_ts >= _ZOMBIE_INTERVAL:
             self._last_zombie_check_ts = _tick_now
             for _zcode, _zpos in list(self.positions.items()):
-                if _zpos.remain_qty <= 0 or not _zpos.selling:
+                if _zpos.remain_qty <= 0:
                     continue
                 _z_elapsed = _tick_now - _zpos.last_sell_attempt_ts
-                if _z_elapsed >= _ZOMBIE_STUCK_SEC:
-                    self.log_system.warning(
-                        f"[ZOMBIE_DETECTED] {self.cn(_zcode)} "
-                        f"selling=True {_z_elapsed:.0f}초 경과 → 강제 리셋 후 재매도"
+                # ⭐ FIX [케이피엠테크 버그]: selling=False 이지만 _force_market_sell=True인
+                # "표류 포지션"도 ZOMBIE로 감지 (기존은 selling=True만 감지)
+                # SELL_STUCK 후 sl_ordered=True로 재발동 차단 → selling=False 상태로 수 시간 방치
+                _is_force_stuck = (
+                    not _zpos.selling
+                    and getattr(_zpos, "_force_market_sell", False)
+                    and _z_elapsed >= _ZOMBIE_STUCK_SEC
+                )
+                _is_selling_zombie = _zpos.selling and _z_elapsed >= _ZOMBIE_STUCK_SEC
+                if not (_is_force_stuck or _is_selling_zombie):
+                    continue
+                _zombie_type = "FORCE_STUCK" if _is_force_stuck else "SELLING_ZOMBIE"
+                self.log_system.warning(
+                    f"[ZOMBIE_DETECTED] {self.cn(_zcode)} "
+                    f"type={_zombie_type} {_z_elapsed:.0f}초 경과 → 강제 리셋 후 재매도"
+                )
+                self.pending_orders.pop(_zcode, None)
+                _zpos.selling    = False
+                _zpos.sl_ordered = False
+                _zpos._force_market_sell = False
+                _zpos.sell_reject_retries = 0
+                _z_qty = _zpos.remain_qty
+                ok = self.send_market_order("SELL", _zcode, _z_qty, "ZOMBIE_RECOVERY")
+                if ok:
+                    _zpos.selling = True
+                    _zpos.last_sell_attempt_ts = _tick_now
+                else:
+                    self.log_system.error(
+                        f"[ZOMBIE_RECOVERY_FAIL] {self.cn(_zcode)} 시장가 재매도 실패"
                     )
-                    self.pending_orders.pop(_zcode, None)
-                    _zpos.selling    = False
-                    _zpos.sl_ordered = False
-                    _zpos.sell_reject_retries = 0
-                    _z_qty = _zpos.remain_qty
-                    ok = self.send_market_order("SELL", _zcode, _z_qty, "ZOMBIE_RECOVERY")
-                    if ok:
-                        _zpos.selling = True
-                        _zpos.last_sell_attempt_ts = _tick_now
-                    else:
-                        self.log_system.error(
-                            f"[ZOMBIE_RECOVERY_FAIL] {self.cn(_zcode)} 시장가 재매도 실패"
-                        )
         # ── ZOMBIE 감지 끝 ─────────────────────────────────────────────────
 
 
@@ -1756,6 +1768,25 @@ class KiwoomAPI(QAxWidget):
                             )
                         )
                     pos.sell_reject_retries = 0  # ⭐ FIX: SELL_STUCK 후 재시도 카운터 리셋 (LS네트웍스 버그)
+
+                    # ⭐ FIX [케이피엠테크 버그]: STOP_LOSS 전량 미체결 SELL_STUCK 시
+                    # sl_ordered=True가 유지되면 _force_market_sell=True가 세팅돼도
+                    # STOP_LOSS_CANDLE_SKIP / STOP_LOSS_EMERGENCY_SKIP이 재진입을 영구 차단함
+                    # → sl_ordered 리셋 + 즉시 시장가 재시도로 해결
+                    # 주의: SELL_STUCK_PARTIAL(부분체결)은 거래소 주문이 살아있으므로 리셋 안 함
+                    #       여기는 전량 미체결(remain_qty == total_qty) 경로이므로 안전하게 리셋
+                    if _stuck_reason.startswith("STOP_LOSS") and getattr(pos, "_force_market_sell", False):
+                        pos.sl_ordered = False  # 거래소 주문 소실 → sl_ordered 리셋
+                        self.log_system.warning(
+                            f"[SELL_STUCK_SL_RESET] {self.cn(code)} "
+                            f"전량 미체결 STOP_LOSS STUCK → sl_ordered 리셋 후 즉시 시장가 재시도"
+                        )
+                        QTimer.singleShot(
+                            500,
+                            lambda c=code, q=pos.remain_qty: self._retry_sell_after_reject(
+                                c, q, "STOP_LOSS_RETRY"
+                            )
+                        )
                 self.ordering = bool(self.pending_orders)
 
         # ── stuck_partial_ts 타임아웃 감지 → 강제 시장가 재주문 ──────────
@@ -1780,9 +1811,13 @@ class KiwoomAPI(QAxWidget):
                 f"→ 시장가 강제 재주문"
             )
             pos.stuck_partial_ts = 0.0  # 타이머 리셋 (무한 반복 방지)
+            # ⭐ FIX: STUCK_PARTIAL_TIMEOUT 재주문 전 sl_ordered 리셋
+            # 거래소 주문이 소실된 경우이므로 sl_ordered=True를 유지하면 STOP_LOSS 재발동이 차단됨
+            pos.sl_ordered = False
             ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             if ok:
                 pos.selling = True
+                pos.sl_ordered = True  # 새 주문 발송 완료 후 재마킹
                 pos.last_sell_attempt_ts = pytime.time()
             else:
                 self.log_system.error(

@@ -4,7 +4,7 @@ IS_REAL = False
 ACCOUNT_NO = ""  # IS_REAL=True일 때만 사용 (예: "12345678")
 
 # ✅ 모의투자에서 사용할 계좌 (국내주식)
-MOCK_ACCOUNT_NO = "8120446011"
+MOCK_ACCOUNT_NO = "8127278511"
 
 # ===== 매매 수량 =====
 # BUY_MODE 옵션:
@@ -112,6 +112,17 @@ FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
 FORCE_LIQUIDATION_HOUR = 15
 FORCE_LIQUIDATION_MIN  = 20
 
+# ===== ATR 최소값 필터 =====
+# 진입 전 ATR이 이 값보다 작으면 스킵
+# ATR이 너무 작으면 TP1까지의 수익이 수수료(왕복 약 0.35%)에 못 미침
+# 예: 2,000원 × ATR=3.9원 → TP1(ATR×2=7.8원) 수익 0.39% ≒ 수수료와 거의 동일
+# 권장값: 매수금액 5,000,000원 기준 수수료 약 17,500원 / 매수수량으로 계산
+#   → 500만원, 1주당 1,000원 = 5,000주 → 17,500/5,000 = 3.5원 이상 필요
+#   → 여유분(슬리피지·스프레드) 포함해 10원 이상 권장
+ATR_MIN_VALUE = 10          # ATR 절대값 하한 (원). 미만이면 진입 스킵
+ATR_MIN_RATIO = 0.005       # ATR/현재가 비율 하한 (0.5%). 미만이면 진입 스킵
+                            # 둘 중 하나라도 미달이면 ENTRY_SKIP_ATR 로그 후 스킵
+
 # ===== BREAKOUT 에너지 소진 방지 =====
 # 당일 첫 COND_IN 이후 이 시간(초)이 경과한 종목은 BREAKOUT 진입 차단
 # 나노팀 케이스: 09:37 첫 급등 → 10:17(40분 후) 재급등 → 즉시 손절
@@ -129,25 +140,11 @@ BREAKOUT_DAY_SURGE_MAX = 12.0         # 당일 상승 상한 (%)
 BREAKOUT_EMA_GAP_MAX = 4.0            # EMA20 대비 이격 상한 (%)
 
 # ===== PULLBACK 강화 필터 =====
-# 시각 하드컷
-# PULLBACK_TIME_CUT_ENABLED = False  →  하드컷 완전 해제 (시간 제한 없음)
-# PULLBACK_TIME_CUT_STR     = "HH:MM" 으로 시각 변경 가능 (기본 11:00)
+# 시각 하드컷 — 기존 11:00 유지
 PULLBACK_TIME_CUT_ENABLED = False
-PULLBACK_TIME_CUT_STR = "11:00"
+PULLBACK_TIME_CUT_STR = "15:00"       # 참고용 (코드에서 직접 사용)
 
-# BREAKOUT 시각 하드컷
-# BREAKOUT_TIME_CUT_ENABLED = False  →  하드컷 완전 해제 (시간 제한 없음)
-# BREAKOUT_TIME_CUT_STR     = "HH:MM" 으로 시각 변경 가능 (기본 10:30)
+# BREAKOUT 시각 하드컷 — 기존 10:30 유지
 BREAKOUT_TIME_CUT_ENABLED = False
-BREAKOUT_TIME_CUT_STR = "10:30"
-
-# ── 위 설정을 strategy.py 에서 바로 import 해 쓸 수 있도록 time 객체로 변환 ──
-from datetime import time as _time
-
-def _parse_time(s: str) -> _time:
-    h, m = map(int, s.split(":"))
-    return _time(h, m)
-
-BREAKOUT_TIME_CUT = _parse_time(BREAKOUT_TIME_CUT_STR)
-PULLBACK_TIME_CUT = _parse_time(PULLBACK_TIME_CUT_STR)
+BREAKOUT_TIME_CUT_STR = "15:00"       # 참고용
 

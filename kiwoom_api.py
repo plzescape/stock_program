@@ -1196,8 +1196,10 @@ class KiwoomAPI(QAxWidget):
                         f"[STOP_LOSS_CANDLE] {self.cn(code)} 완성봉 ATR손절 "
                         f"종가:{completed_close} 손절기준:{sl_threshold} pnl={sl_rate:.4f}"
                     )
+                    # ⭐ 완성봉 종가가 이미 손절가 아래이면 지정가는 미체결 → 시장가 사용
+                    _sl_lmt = pos.atr_sl_price if completed_close >= pos.atr_sl_price else 0
                     ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS",
-                                                       sl_limit_price=pos.atr_sl_price)
+                                                       sl_limit_price=_sl_lmt)
                     if ok:
                         pos.last_sell_attempt_ts = now
                         pos.selling = True
@@ -1250,8 +1252,10 @@ class KiwoomAPI(QAxWidget):
                 f"현재가:{cur} pnl={pnl_rate:.4f} "
                 f"(안전망 -{EMERGENCY_SL_RATE*100:.1f}%)"
             )
-            ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS",
-                                               sl_limit_price=pos.atr_sl_price)
+            # ⭐ EMERGENCY 경로: 이미 ATR 손절가 이하로 하락한 상태 → 지정가 절대 금지
+            # 지정가 손절(sl_limit_price)은 현재가가 손절가 이상일 때만 의미 있음.
+            # EMERGENCY 발동 = 이미 그 아래 → 지정가는 영구 미체결 → SELL_STUCK 루프 유발
+            ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS")
             if ok:
                 pos.last_sell_attempt_ts = now
                 pos.selling    = True
@@ -1694,7 +1698,11 @@ class KiwoomAPI(QAxWidget):
 
         # ── SELL pending 타임아웃 처리 ──
         # SELL 주문이 체결 안 되고 남아있을 수 있으므로 마킹 후 재매도 허용
-        SELL_PENDING_TIMEOUT = 30  # 30초
+        try:
+            from config import SELL_PENDING_TIMEOUT_SEC
+            SELL_PENDING_TIMEOUT = SELL_PENDING_TIMEOUT_SEC
+        except ImportError:
+            SELL_PENDING_TIMEOUT = 15
         for code, pend in list(self.pending_orders.items()):
             if pend.get("side") != "SELL":
                 continue

@@ -963,6 +963,22 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
             )
         return False
 
+    # 당일 상승 상한 체크 (고점 추격 진입 차단)
+    try:
+        from config import FLAG_DAY_RISE_MAX
+        _flag_rise_max = FLAG_DAY_RISE_MAX
+    except ImportError:
+        _flag_rise_max = 20.0
+    _day_open = candles[-1]['open'] if candles else candles[0]['open']
+    _day_rise = (candles[0]['close'] - _day_open) / _day_open * 100 if _day_open > 0 else 0
+    if _day_rise > _flag_rise_max:
+        if logger:
+            logger.info(
+                f"[FLAG_CHECK] {code} "
+                f"당일상승 상한 초과({_day_rise:.1f}%>{_flag_rise_max:.0f}%) → 스킵"
+            )
+        return False
+
     # c0 = 확인봉(현재 스캔 봉), c1 = 재돌파봉
     c0 = candles[0]
     c1 = candles[1]
@@ -1010,10 +1026,15 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
         box_top = max(flag_highs)
 
         # ── 재돌파봉(c1) 조건 ────────────────────────────────────
+        try:
+            from config import FLAG_REBREAK_VOL_MIN
+            _rebreak_vol_min = FLAG_REBREAK_VOL_MIN
+        except ImportError:
+            _rebreak_vol_min = 3.0
         rebreak_ok = (
             c1['close'] > box_top        and
             c1['close'] > c1['open']     and
-            c1['volume'] >= avg_flag_vol * 2.0
+            c1['volume'] >= avg_flag_vol * _rebreak_vol_min
         )
         if not rebreak_ok:
             continue
@@ -1066,7 +1087,7 @@ def is_flag_entry(candles, logger=None, code=None) -> bool:
                 f"횡보:{flag_len}봉(범위비율{flag_range_ratio:.2f}, "
                 f"거래량수렴{vol_shrink:.2f}) | "
                 f"재돌파:{c1['close']}(박스상단{box_top}, "
-                f"거래량{c1['volume']/avg_flag_vol:.1f}배) | "
+                f"거래량{c1['volume']/avg_flag_vol:.1f}배≥{_rebreak_vol_min:.0f}배기준) | "
                 f"확인봉:{c0['close']}(재돌파대비{(c0['close']-c1['close'])/c1['close']*100:+.1f}%) | "
                 f"EMA20:{ema20:.0f}>EMA60:{ema60:.0f} | "
                 f"손절기준봉시가:{base['open']}"

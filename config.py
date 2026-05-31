@@ -106,6 +106,7 @@ MAX_CANCEL_RETRIES = 2
 MAX_REENTRY_RETRIES = 2   # 취소 후 재매수 횟수
 REENTRY_DELAY_SEC = 1     # 재매수 딜레이
 FORCE_ABANDON_TIMEOUT = 30  # 주문번호 없이 30초 경과 시 강제 포기
+SELL_PENDING_TIMEOUT_SEC = 15  # SELL 미체결 판정 타임아웃 (기존 30초 → 15초)
 
 # (TP 지정가 제거됨 - 모두 시장가 매도)
 # ===== 강제청산 시각 =====
@@ -133,11 +134,18 @@ BREAKOUT_FIRST_COND_TIMEOUT = 900    # 15분으로 단축 (기존 20분 → NEVE
 # 급등 경과시간 상한 (봉 수) — 기존 10봉에서 7봉으로 단축
 BREAKOUT_FRESH_CANDLES_MAX = 7        # 급등봉 이후 7봉(7분) 이내만 허용
 
-# 당일 누적 상승 상한 (기존 15% → 12%): 이미 많이 오른 종목 차단 강화
-BREAKOUT_DAY_SURGE_MAX = 12.0         # 당일 상승 상한 (%)
+# 당일 누적 상승 상한 (기존 15% → 12% → 8%): 이미 많이 오른 종목 차단 강화
+BREAKOUT_DAY_SURGE_MAX = 8.0          # 당일 상승 상한 (%)
 
-# EMA20 이격 상한 (기존 5% → 4%): 추격매수 차단 강화
-BREAKOUT_EMA_GAP_MAX = 4.0            # EMA20 대비 이격 상한 (%)
+# EMA20 이격 상한 (기존 5% → 4% → 3.5%): 추격매수 차단 강화
+BREAKOUT_EMA_GAP_MAX = 3.5            # EMA20 대비 이격 상한 (%)
+
+# ===== FLAG 강화 필터 (로그 분석 기반) =====
+# 재돌파봉 거래량 기준 (기존 횡보평균 2배 → 3배): 약한 돌파 차단
+FLAG_REBREAK_VOL_MIN = 3.0            # 재돌파봉 거래량 ≥ 횡보평균 × 이 배수
+
+# 당일 상승 상한 (기존 없음 → 20%): 고점 추격 진입 차단
+FLAG_DAY_RISE_MAX = 20.0              # 당일 상승 상한 (%)
 
 # ===== PULLBACK 강화 필터 =====
 # 시각 하드컷 — 기존 11:00 유지

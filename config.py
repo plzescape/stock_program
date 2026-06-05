@@ -113,6 +113,11 @@ SELL_PENDING_TIMEOUT_SEC = 15  # SELL 미체결 판정 타임아웃 (기존 30�
 FORCE_LIQUIDATION_HOUR = 15
 FORCE_LIQUIDATION_MIN  = 20
 
+# 신규 진입 하드컷: 강제청산 N분 전부터 모든 전략 진입 차단
+# 예: FORCE_LIQUIDATION=15:20, ENTRY_CUTOFF_MIN_BEFORE=15 → 15:05 이후 진입 차단
+# 장 마감 직전 진입은 손절 후 ZOMBIE 루프 + 장 마감 미청산 이월 원인이 됨
+ENTRY_CUTOFF_MIN_BEFORE = 15  # 강제청산 15분 전부터 신규 진입 차단
+
 # ===== ATR 최소값 필터 =====
 # 진입 전 ATR이 이 값보다 작으면 스킵
 # ATR이 너무 작으면 TP1까지의 수익이 수수료(왕복 약 0.35%)에 못 미침

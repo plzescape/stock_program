@@ -505,6 +505,26 @@ class KiwoomAPI(QAxWidget):
             elif is_entry_candidate_VER2(completed_candles, self.log_signal, code):
                 entry_type = "BREAKOUT"
 
+        # ── 장 마감 직전 진입 하드컷 ─────────────────────────────────────
+        # 조건 스캔 큐에 남아 있던 종목이 14:50 이후에도 처리되어
+        # 15:10~15:18 진입 → 체결 후 57초 만에 손절 → ZOMBIE 루프 → 이월 발생
+        # 강제청산(15:20) N분 전부터 모든 전략 신규 진입 차단
+        if entry_type:
+            try:
+                from config import FORCE_LIQUIDATION_HOUR, FORCE_LIQUIDATION_MIN, ENTRY_CUTOFF_MIN_BEFORE
+                _cutoff_total = FORCE_LIQUIDATION_HOUR * 60 + FORCE_LIQUIDATION_MIN - ENTRY_CUTOFF_MIN_BEFORE
+                _cutoff_t = time(_cutoff_total // 60, _cutoff_total % 60)
+            except ImportError:
+                _cutoff_t = time(15, 5)
+            _now_t = datetime.now().time()
+            if _now_t >= _cutoff_t:
+                self.log_signal.info(
+                    f"[ENTRY_TIME_CUT] {self.cn(code)} {entry_type} 진입 차단 "
+                    f"({_now_t.strftime('%H:%M')} ≥ {_cutoff_t.strftime('%H:%M')} 마감전컷)"
+                )
+                entry_type = None
+        # ─────────────────────────────────────────────────────────────────
+
         if entry_type and len(self.positions) < MAX_POSITIONS:
                 # ── [버그3 수정] ENTRY_CONFIRMED 중복 발동 방지 ──────────────
                 # 문제: COND_OUT 후에도 candidates에 남아있다가 다음 스캔에서
@@ -2750,11 +2770,13 @@ class KiwoomAPI(QAxWidget):
                                     sell_reason = pend.get("reason", "STOP_LOSS") if pend else "STOP_LOSS"
                                     self.log_system.warning(
                                         f"[SELL_REJECT_RETRY] {self.cn(code)} "
-                                        f"[800033] 매도가능수량 부족 → 1초 후 재시도 "
+                                        f"[800033] 매도가능수량 부족 → 4초 후 재시도 "
                                         f"qty={sell_qty} reason={sell_reason} ({retry_cnt}회차)"
                                     )
+                                    # ⭐ FIX: 1초→4초 (내부 RETRY_COOLDOWN=3초를 넘겨야 실제 재시도됨)
+                                    # 기존 1초 타이머는 쿨다운(3초)에 항상 막혀 SKIP → ZOMBIE 5분 대기만 남음
                                     QTimer.singleShot(
-                                        1000,
+                                        4000,
                                         lambda c=code, q=sell_qty, r=sell_reason: self._retry_sell_after_reject(c, q, r)
                                     )
                         self.ordering = bool(self.pending_orders)

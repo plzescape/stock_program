@@ -523,6 +523,18 @@ class KiwoomAPI(QAxWidget):
                     f"({_now_t.strftime('%H:%M')} ≥ {_cutoff_t.strftime('%H:%M')} 마감전컷)"
                 )
                 entry_type = None
+        # ── 매도 진행 중인 포지션 존재 시 신규 진입 차단 ──────────────────────────
+        # 기존 포지션이 selling=True(손절/TP/TIME_STOP 매도 진행 중)인 상태에서
+        # 신규 종목 매수 → 동시 2개 이상 매도 발생 → [800033] 경합으로 둘 다 지연
+        # (26-06-05: 지엔코 손절 중 인바이오젠 진입 → 800033 연쇄 → 14분 지연+411주 이월)
+        if entry_type:
+            _selling_codes = [c for c, p in self.positions.items() if p.selling]
+            if _selling_codes:
+                self.log_signal.info(
+                    f"[ENTRY_SELLING_BLOCK] {self.cn(code)} {entry_type} 진입 차단 "
+                    f"(매도진행중: {[self.cn(c) for c in _selling_codes]})"
+                )
+                entry_type = None
         # ─────────────────────────────────────────────────────────────────
 
         if entry_type and len(self.positions) < MAX_POSITIONS:
@@ -2817,7 +2829,11 @@ class KiwoomAPI(QAxWidget):
             )
             return
 
-        actual_qty = pos.remain_qty
+        # ⭐ FIX: qty 파라미터를 존중 (TP1 등 부분매도 재시도 시 전체 수량으로 교체 방지)
+        # 기존: pos.remain_qty로 무조건 교체 → TP1(273주) 재시도가 684주(전체)로 발송됨
+        #       → TP1 후 남아야 할 411주가 즉시 시장가로 팔려버려 포지션 이월 발생
+        # 수정: min(qty, remain_qty) → 호출자가 요청한 수량 이하로만 재시도
+        actual_qty = min(qty, pos.remain_qty) if qty > 0 else pos.remain_qty
 
         # ⭐ FIX: SELL_STUCK에서 _force_market_sell=True 설정된 경우 시장가로 강제 전환
         if getattr(pos, '_force_market_sell', False):

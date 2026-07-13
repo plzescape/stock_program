@@ -665,7 +665,7 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
                 f"price={price_ok}(5봉고={prev5_high}) "
                 f"surge={surge_ok}({day_rise:.1f}%∈[5,15]%) "
                 f"ema={ema_ok}({c0['close']}>{(ema20 or 0):.0f}) "
-                f"ema_gap={ema_gap_ok}({ema_gap:.1f}%≤5%) "
+                f"ema_gap={ema_gap_ok}({ema_gap:.1f}%≤{_ema_gap_max:.1f}%) "
                 f"3연속양봉(완성봉1~3)={consec_bull} "
                 f"급등경과={fresh_ok}({surge_candle_age}봉≤{_fresh_max}) "
                 f"당일상승={surge_ok}({day_rise:.1f}%∈[5,{_surge_max:.0f}]%) "
@@ -1159,3 +1159,21 @@ def is_entry_candidate_1min(candles, logger=None, code=None) -> bool:
 def is_entry_candidate(candles, logger=None, code=None) -> bool:
     """레거시 — 미사용"""
     return False
+
+
+def is_no_surge_stock(candles) -> bool:
+    """
+    999봉 감지: 최근 20봉에서 거래량 급등봉(평균 대비 3배 이상)이 하나도 없으면 True.
+    - 급등 에너지가 전혀 없는 종목 → 당일 재스캔 가치 없음 → traded_today에 추가할 것
+    - is_entry_candidate_VER2 내부의 surge_candle_age=999 로직과 동일한 기준 사용
+    """
+    if not candles or len(candles) < 6:
+        return False
+    for i in range(1, min(20, len(candles))):
+        c = candles[i]
+        avg_before = sum(
+            candles[j]['volume'] for j in range(i + 1, min(i + 6, len(candles)))
+        ) / 5
+        if avg_before > 0 and c['volume'] / avg_before >= 3.0:
+            return False  # 급등봉 존재 → 정상 종목
+    return True  # 급등봉 없음 = 999봉 종목

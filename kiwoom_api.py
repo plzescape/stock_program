@@ -26,7 +26,7 @@ from config import (
     MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP, MINI_TRAIL_GAP_OPEN
 )
 from logger_util import setup_logger
-from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data
+from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data, is_no_surge_stock
 
 
 @dataclass
@@ -502,8 +502,22 @@ class KiwoomAPI(QAxWidget):
                     f"첫COND_IN 경과={_elapsed:.0f}초 > {_br_timeout}초 → BREAKOUT 차단 "
                     f"(에너지 소진 가능성)"
                 )
+                # ⭐ FIX: traded_today 미추가 버그 (260710 무한루프)
+                # 기존: STALE_SKIP 후 traded_today 미추가 → 동일 종목이 COND_IN될 때마다
+                #        큐 재추가 → 스캔 → STALE_SKIP 무한반복 (260710: 태웅 등 8079건 발생)
+                # 수정: NO_SURGE_SKIP과 동일하게 traded_today에 추가하여 당일 재스캔 차단
+                self.traded_today.add(code)
             elif is_entry_candidate_VER2(completed_candles, self.log_signal, code):
                 entry_type = "BREAKOUT"
+            else:
+                # ⭐ FIX: 999봉 종목(급등봉 미발견) 당일거래완료 마킹
+                # 키스트론 케이스(260618): surge_candle_age=999 종목이 하루 수십~수백 회 큐 재편입
+                # 급등봉이 없는 종목은 당일 재스캔 가치 없음 → traded_today에 추가
+                if is_no_surge_stock(completed_candles):
+                    self.log_signal.info(
+                        f"[NO_SURGE_SKIP] {self.cn(code)} 20봉 내 급등봉 없음 → 당일거래완료"
+                    )
+                    self.traded_today.add(code)
 
         # ── 장 마감 직전 진입 하드컷 ─────────────────────────────────────
         # 조건 스캔 큐에 남아 있던 종목이 14:50 이후에도 처리되어
@@ -740,6 +754,31 @@ class KiwoomAPI(QAxWidget):
                     )
                     pend["reentry_retries"] = retries + 1
                     self.log_trade.info(f"[CANCEL_RETRY_BUY] {self.cn(code)} 재시도={retries + 1}회차")
+                else:
+                    # ⭐ FIX: 멕아이씨에스·마이크로투나노 버그
+                    # MAX_REENTRY_RETRIES 초과 시 traded_today 미마킹 → 오후에도 큐 재편입
+                    # 수정: 포기 즉시 당일거래완료로 마킹하여 동일 종목 재진입 차단
+                    self.log_trade.warning(
+                        f"[REENTRY_GIVEUP] {self.cn(code)} {retries}회 미체결 → 당일거래완료"
+                    )
+                    self.traded_today.add(code)
+                    # ⭐ FIX2: 엠디바이스 버그 — 취소 중 부분체결(1주 등) 레이스 컨디션
+                    # CANCEL_DONE 처리 시점에 이미 pos.remain_qty>0이면 포지션이 살아있음
+                    # buy_done=False 상태이므로 TP/MINI_TRAIL 비활성 → 수십 분 방치 위험
+                    # 수정: 즉시 시장가로 청산
+                    _partial_pos = self.positions.get(code)
+                    if _partial_pos and _partial_pos.remain_qty > 0 and not _partial_pos.buy_done:
+                        self.log_trade.warning(
+                            f"[REENTRY_GIVEUP_CLEANUP] {self.cn(code)} "
+                            f"포기 시점 부분체결 잔여={_partial_pos.remain_qty}주 → 즉시 시장가 청산"
+                        )
+                        QTimer.singleShot(
+                            500,
+                            lambda c=code, q=_partial_pos.remain_qty:
+                                self.send_market_order("SELL", c, q, "REENTRY_GIVEUP_CLEANUP")
+                        )
+                        if _partial_pos:
+                            _partial_pos.selling = True
             elif pend and pend.get("side") == "SELL" and pend.get("cancel_for_retry"):
                 # ⭐ FIX [800033 버그]: SELL_STUCK → 원주문 취소 완료 → 이제 시장가 재시도
                 # 기존: 취소 없이 시장가 추가 발사 → 거래소에 두 주문 공존 → [800033]
@@ -913,12 +952,17 @@ class KiwoomAPI(QAxWidget):
             pend = self.pending_orders.get(code)
             if pend and pend.get("side") == "SELL":
                 prev_filled = pend.get("filled_qty", 0)
+                order_qty   = pend.get("qty", 0)
                 if qty > prev_filled:
+                    # 누적값이 증가 → 누적으로 해석, 증분 계산
                     delta = qty - prev_filled
                     pend["filled_qty"] = qty
                 else:
-                    delta = qty
-                    pend["filled_qty"] = prev_filled + qty
+                    # ⭐ FIX: 파인엠텍 버그 - qty <= prev_filled일 때 증분으로 처리하면
+                    # 중복 이벤트(같은 누적값 2회 수신) 시 잔여 수량이 2배 차감됨
+                    # → remain_qty 초과 방지: delta = min(qty, remain_qty)
+                    delta = min(qty, pos.remain_qty)
+                    pend["filled_qty"] = min(prev_filled + delta, order_qty)
             else:
                 delta = qty
 
@@ -1050,6 +1094,9 @@ class KiwoomAPI(QAxWidget):
                     from discord_notify import notify_time_stop
                     notify_time_stop(code, stock_name, sold_qty, price, entry_p, sell_reason, atr=pos.atr_value)
                 elif "FORCE_LIQUIDATION" in sell_reason or "LEFTOVER_LIQUIDATION" in sell_reason:
+                    from discord_notify import notify_force_liquidation
+                    notify_force_liquidation(code, stock_name, sold_qty, entry_p)
+                elif "REENTRY_GIVEUP_CLEANUP" in sell_reason:
                     from discord_notify import notify_force_liquidation
                     notify_force_liquidation(code, stock_name, sold_qty, entry_p)
             except Exception as e:
@@ -1346,7 +1393,11 @@ class KiwoomAPI(QAxWidget):
                 _active_gap = MINI_TRAIL_GAP_OPEN if _now_t < _open_end else MINI_TRAIL_GAP
 
                 drop = pos.mini_trail_peak - pnl_rate
-                if drop >= _active_gap:
+                # ⭐ FIX: 삼일씨엔에스 버그 — MINI_TRAIL_STOP이 pnl=+0.15%에서 발동 → 수수료 포함 손실
+                # 원인: TRIGGER=GAP=1.5%이면 발동 최소 보장 pnl = TRIGGER-GAP = 0%
+                # 수정: pnl_rate < 수수료 구간(0.6%)이면 발동 억제 → ATR 손절선에 맡김
+                _min_exit_pnl = 0.006  # 왕복 수수료(~0.58%) 감안 최소 +0.6% 이상일 때만 발동
+                if drop >= _active_gap and pnl_rate >= _min_exit_pnl:
                     if not self.can_try_sell(pos):
                         return
                     self.log_trade.info(
@@ -1356,11 +1407,21 @@ class KiwoomAPI(QAxWidget):
                         f"하락={drop*100:.2f}% "
                         f"GAP={_active_gap*100:.1f}%({'장초반' if _now_t < _open_end else '일반'}) → 익절 청산"
                     )
+                elif drop >= _active_gap and pnl_rate < _min_exit_pnl:
+                    self.log_trade.info(
+                        f"[MINI_TRAIL_HOLD] {self.cn(code)} "
+                        f"GAP 충족({drop*100:.2f}%≥{_active_gap*100:.1f}%) 하지만 "
+                        f"pnl={pnl_rate*100:.2f}%<최소{_min_exit_pnl*100:.1f}% → 발동 억제 (ATR손절 대기)"
+                    )
                     ok = self.send_market_order("SELL", code, pos.remain_qty, "MINI_TRAIL_STOP")
                     if ok:
                         pos.last_sell_attempt_ts = now
-                        pos.selling  = True
-                        pos.time_stop_done = True  # 타임스탑 중복 방지
+                        pos.selling        = True
+                        pos.time_stop_done = True   # 타임스탑 중복 방지
+                        pos.tp1_done       = True   # ⭐ FIX: TP1 중복 발동 방지
+                        # MINI_TRAIL_STOP은 전량 매도 → TP1/TP2 모두 무의미
+                        # tp1_done=True로 세팅하지 않으면, selling이 잠깐 False로 리셋되는
+                        # 타이밍에 TP1이 추가 주문을 발송해 [800033] 이중 주문 발생 (일성건설 케이스)
                     return
 
         # =========================
@@ -1845,19 +1906,24 @@ class KiwoomAPI(QAxWidget):
                     #   time_stop_done=False 리셋 → 09:50 TIME_STOP 재발동 → [800033] 거절
                     # 수정: TIME_STOP 계열은 리셋 안 함. STOP_LOSS 계열만 리셋하여 재시도 허용.
                     _stuck_reason = pend.get("reason", "") if pend else getattr(pos, '_preserved_sell_reason', '')
-                    if "TIME_STOP" not in _stuck_reason and "VOL_TIME_STOP" not in _stuck_reason:
+                    if "TIME_STOP" not in _stuck_reason and "VOL_TIME_STOP" not in _stuck_reason and "MINI_TRAIL" not in _stuck_reason:
                         pos.time_stop_done = False  # STOP_LOSS 계열: 재시도 허용
                     else:
-                        # TIME_STOP 재시도: time_stop_done은 유지하되 selling만 해제
-                        # → TIME_STOP 로직 재발동 대신 _retry_sell_after_reject 경로로 재시도
+                        # TIME_STOP / MINI_TRAIL: 시장가 원주문이 표류 중이므로 재발동 차단
+                        # → time_stop_done 유지, 3초 후 _retry_sell_after_reject 경로로 재시도
+                        _retry_tag = (
+                            "TIME_STOP_RETRY"
+                            if ("TIME_STOP" in _stuck_reason or "VOL_TIME_STOP" in _stuck_reason)
+                            else "MINI_TRAIL_RETRY"
+                        )
                         self.log_system.info(
-                            f"[SELL_STUCK_TIMESTOP] {self.cn(code)} "
-                            f"TIME_STOP STUCK → time_stop_done 유지, 3초 후 강제 재시도"
+                            f"[SELL_STUCK_RETRY] {self.cn(code)} "
+                            f"{_stuck_reason} STUCK → 재발동 차단, 3초 후 강제 재시도"
                         )
                         QTimer.singleShot(
                             3000,
-                            lambda c=code, q=pos.remain_qty: self._retry_sell_after_reject(
-                                c, q, "TIME_STOP_RETRY"
+                            lambda c=code, q=pos.remain_qty, r=_retry_tag: self._retry_sell_after_reject(
+                                c, q, r
                             )
                         )
                     pos.sell_reject_retries = 0  # ⭐ FIX: SELL_STUCK 후 재시도 카운터 리셋 (LS네트웍스 버그)
@@ -2574,6 +2640,16 @@ class KiwoomAPI(QAxWidget):
                 return
             if code in self.candidates:
                 info = self.candidates[code]
+
+                # ⭐ FIX: Qt signal 이중 발생 방지 — 500ms 내 중복 COND_IN 이벤트 차단
+                _last_cond_in = info.get("last_cond_in_ts", 0)
+                if pytime.time() - _last_cond_in < 0.5:
+                    self.log_trade.debug(
+                        f"[COND_REENTRY_DEBOUNCE] {self.cn(code)} "
+                        f"이중발신 차단 ({(pytime.time()-_last_cond_in)*1000:.0f}ms 이내)"
+                    )
+                    return
+                info["last_cond_in_ts"] = pytime.time()
 
                 # =========================
                 # ⭐ 재편입 처리

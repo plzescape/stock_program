@@ -407,7 +407,7 @@ class KiwoomAPI(QAxWidget):
 
         self.current_scan_code = code
         self.tr_inflight = True
-        self.request_1min(code)
+        self.request_candle(code)
         
         # 타임아웃 타이머 관리
         if hasattr(self, "_tr_timeout_timer") and self._tr_timeout_timer.isActive():
@@ -430,15 +430,16 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # TR
     # ==================================================
-    def request_1min(self, code):
+    def request_candle(self, code):
+        from config import CANDLE_INTERVAL_MIN
         self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
-        self.dynamicCall("SetInputValue(QString, QString)", "틱범위", "1")
+        self.dynamicCall("SetInputValue(QString, QString)", "틱범위", str(CANDLE_INTERVAL_MIN))
         self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
         screen = f"{9000 + (self._screen_seq % 100)}"
         self._screen_seq += 1
-         
+
         self.dynamicCall("CommRqData(QString, QString, int, QString)",
-                         "RQ_1MIN", "OPT10080", 0, screen)
+                         "RQ_CANDLE", "OPT10080", 0, screen)
 
     def _on_receive_tr_data(self, screen_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
         # ── OPW00018 잔고조회 분기 (스캔 TR과 무관하게 처리) ──
@@ -449,14 +450,14 @@ class KiwoomAPI(QAxWidget):
         if not self.tr_inflight:
             return
         # print(rq_name, tr_code)
-        if tr_code != "OPT10080" or rq_name != "RQ_1MIN":
+        if tr_code != "OPT10080" or rq_name != "RQ_CANDLE":
             return
         
         if hasattr(self, "_tr_timeout_timer"):
             self._tr_timeout_timer.stop()
         
         code = self.current_scan_code
-        candles = self.parse_1min(code)
+        candles = self.parse_candle(code)
         
         self.tr_inflight = False
         self.current_scan_code = None
@@ -494,7 +495,8 @@ class KiwoomAPI(QAxWidget):
 
             if is_pullback_entry(completed_candles, self.log_signal, code):
                 entry_type = "PULLBACK"
-            elif is_flag_entry(completed_candles, self.log_signal, code):
+            elif is_flag_entry(completed_candles, self.log_signal, code,
+                               live_candle=candles[0] if candles else None):
                 entry_type = "FLAG"
             elif _breakout_stale:
                 self.log_signal.info(
@@ -635,11 +637,12 @@ class KiwoomAPI(QAxWidget):
                 if sig:
                     self._entry_signals[code] = sig
 
-                # ── ATR 계산 (14분봉 기준) ──
+                # ── ATR 계산 ──
+                from config import CANDLE_INTERVAL_MIN as _ATR_CIM
                 atr_val = self.calc_atr(completed_candles, ATR_PERIOD)
                 self.log_trade.info(
                     f"[ATR_CALC] {self.cn(code)} ATR={atr_val:.1f}원 "
-                    f"(14분봉 기준, SL배수={ATR_SL_MULT}, TP배수={ATR_TP_MULT})"
+                    f"({ATR_PERIOD}봉/{ATR_PERIOD * _ATR_CIM}분 기준, SL배수={ATR_SL_MULT}, TP배수={ATR_TP_MULT})"
                 )
 
                 # ── ATR 최소값 필터 ──
@@ -1212,17 +1215,19 @@ class KiwoomAPI(QAxWidget):
         # 분이 바뀌는 순간 직전 완성봉 종가로 ATR 손절 판단
         # ==================================================
         from datetime import datetime as _dt
-        cur_minute = _dt.now().minute
+        from config import CANDLE_INTERVAL_MIN as _CIM
+        _now = _dt.now()
+        cur_slot = (_now.hour * 60 + _now.minute) // _CIM
 
         if pos.sl_candle_minute == -1:
             # 첫 틱: 분봉 초기화
-            pos.sl_candle_minute = cur_minute
+            pos.sl_candle_minute = cur_slot
             pos.sl_candle_open   = cur
             pos.sl_candle_high   = cur
             pos.sl_candle_low    = cur
             pos.sl_candle_last   = cur
 
-        elif cur_minute != pos.sl_candle_minute:
+        elif cur_slot != pos.sl_candle_minute:
             # ── 분이 바뀜 → 직전 분봉 완성 ─────────────────
             completed_close = pos.sl_candle_last
             completed_open  = pos.sl_candle_open
@@ -1286,7 +1291,7 @@ class KiwoomAPI(QAxWidget):
                     else:
                         pos.selling = False
                     # 새 분봉 초기화 후 return
-                    pos.sl_candle_minute = cur_minute
+                    pos.sl_candle_minute = cur_slot
                     pos.sl_candle_open   = cur
                     pos.sl_candle_high   = cur
                     pos.sl_candle_low    = cur
@@ -1294,7 +1299,7 @@ class KiwoomAPI(QAxWidget):
                     return
 
             # 새 분봉 시작
-            pos.sl_candle_minute = cur_minute
+            pos.sl_candle_minute = cur_slot
             pos.sl_candle_open   = cur
             pos.sl_candle_high   = cur
             pos.sl_candle_low    = cur
@@ -2176,16 +2181,16 @@ class KiwoomAPI(QAxWidget):
         f"[REAL_REG] 등록종목수={len(self.positions)} 종목={list(self.positions.keys())}"
         )
 
-    # 2. 1분봉 파싱
-    def parse_1min(self, code):
+    # 2. 분봉 파싱
+    def parse_candle(self, code):
         """
-        opt10080 1분봉 데이터 파싱
+        opt10080 분봉 데이터 파싱 (CANDLE_INTERVAL_MIN 단위)
         - OHLCV 포함
         - 최소 30개 이상 확보 (VER2 전략 대응)
         - 최신봉 → 과거봉 순서 유지
         """
 
-        rqname = "RQ_1MIN"
+        rqname = "RQ_CANDLE"
         trcode = "OPT10080"
 
         candles = []
@@ -2195,7 +2200,7 @@ class KiwoomAPI(QAxWidget):
 
             if rows <= 0:
                 now_str = datetime.now().strftime('%H:%M:%S')
-                self.log_system.warning(f"[1MIN_PARSE_EMPTY] {self.cn(code)} - 현재시각: {now_str}")
+                self.log_system.warning(f"[CANDLE_PARSE_EMPTY] {self.cn(code)} - 현재시각: {now_str}")
                 return []
 
             # ✔ 최소 30개 확보 (여유 두고 60까지 가져와도 OK)
@@ -2274,7 +2279,7 @@ class KiwoomAPI(QAxWidget):
             # ✔ VER2는 25개 이상 필요
             if len(candles) < 30:
                 self.log_system.warning(
-                    f"[1MIN_PARSE_SHORT] {self.cn(code)} 캔들수={len(candles)}개 (30개 미만)"
+                    f"[CANDLE_PARSE_SHORT] {self.cn(code)} 캔들수={len(candles)}개 (30개 미만)"
                 )
                 return candles
 
@@ -2285,7 +2290,7 @@ class KiwoomAPI(QAxWidget):
             return candles
 
         except Exception as e:
-            self.log_system.error(f"[1MIN_PARSE_ERROR] {self.cn(code)} 파싱오류: {e}")
+            self.log_system.error(f"[CANDLE_PARSE_ERROR] {self.cn(code)} 파싱오류: {e}")
             return []
 
     # 3. 계좌번호 조회

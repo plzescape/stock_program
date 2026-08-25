@@ -1168,6 +1168,18 @@ def is_entry_candidate(candles, logger=None, code=None) -> bool:
     return False
 
 
+def get_surge_candle_close(candles) -> int:
+    """BREAKOUT 전략의 기준이 되는 급등봉 종가를 반환. 없으면 0."""
+    if not candles or len(candles) < 6:
+        return 0
+    for i in range(1, min(20, len(candles))):
+        c = candles[i]
+        avg_before = sum(candles[j]['volume'] for j in range(i + 1, min(i + 6, len(candles)))) / 5
+        if avg_before > 0 and c['volume'] / avg_before >= 3.0:
+            return int(c['close'])
+    return 0
+
+
 def is_no_surge_stock(candles) -> bool:
     """
     999봉 감지: 최근 20봉에서 거래량 급등봉(평균 대비 3배 이상)이 하나도 없으면 True.

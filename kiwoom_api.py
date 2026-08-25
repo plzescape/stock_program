@@ -26,7 +26,7 @@ from config import (
     MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP, MINI_TRAIL_GAP_OPEN
 )
 from logger_util import setup_logger
-from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data, is_no_surge_stock
+from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data, is_no_surge_stock, get_surge_candle_close
 
 
 @dataclass
@@ -660,6 +660,33 @@ class KiwoomAPI(QAxWidget):
                     info["state"] = "DONE"
                     self._finish_tr(delay=True)
                     return
+
+                # ── BREAKOUT 급등봉 이격 체크 (고점 추격 / 에너지소진 방지) ──
+                # 완성봉 데이터 → 주문 사이 1~3초 지연 동안 가격 급등 후 체결되는 케이스 방지
+                if entry_type == "BREAKOUT":
+                    _surge_close = get_surge_candle_close(completed_candles)
+                    if _surge_close > 0 and cur_price > 0:
+                        _ratio = cur_price / _surge_close
+                        if _ratio > 1.02:
+                            self.log_signal.info(
+                                f"[PUMP_SKIP] {self.cn(code)} 고점 추격 차단 "
+                                f"현재가={cur_price} 급등봉종가={_surge_close} "
+                                f"이격=+{(_ratio-1)*100:.1f}% (>+2%)"
+                            )
+                            self.traded_today.add(code)
+                            info["state"] = "DONE"
+                            self._finish_tr(delay=True)
+                            return
+                        if _ratio < 0.98:
+                            self.log_signal.info(
+                                f"[ENERGY_SPENT_SKIP] {self.cn(code)} 에너지소진 차단 "
+                                f"현재가={cur_price} 급등봉종가={_surge_close} "
+                                f"이격={(_ratio-1)*100:.1f}% (<-2%)"
+                            )
+                            self.traded_today.add(code)
+                            info["state"] = "DONE"
+                            self._finish_tr(delay=True)
+                            return
 
                 self.send_market_order("BUY", code, buy_qty, "ENTRY")
                 # 예산 추적용
@@ -1358,8 +1385,10 @@ class KiwoomAPI(QAxWidget):
                     f"[STOP_LOSS] {self.cn(code)} 실시간 ATR손절 "
                     f"현재가:{cur} 손절기준:{sl_threshold} pnl={pnl_rate:.4f}"
                 )
+                # 현재가가 이미 SL 아래이면 지정가는 미체결 → 시장가 사용
+                _rt_sl_lmt = pos.atr_sl_price if cur >= pos.atr_sl_price else 0
                 ok = self.send_market_order("SELL", code, pos.remain_qty, "STOP_LOSS",
-                                                   sl_limit_price=pos.atr_sl_price)
+                                                   sl_limit_price=_rt_sl_lmt)
                 if ok:
                     pos.last_sell_attempt_ts = now
                     pos.selling = True

@@ -31,6 +31,11 @@ if not exist "%REPORT_FOLDER%" (
 :: ===== 4. 리포트 생성 =====
 "C:\Users\user\AppData\Local\Programs\Python\Python314\python.exe" generate_report.py logs\trade.log "%REPORT_NAME%"
 
+:: ===== 4-1. 차트 분석 HTML 생성 =====
+echo 종목별 차트 분석 중...
+"C:\Users\user\AppData\Local\Programs\Python\Python314\python.exe" analyze_trades.py logs "%REPORT_FOLDER%"
+echo 차트 분석 완료
+
 :: ===== 5. 리포트 이동 =====
 move "%REPORT_NAME%" "%REPORT_FOLDER%\%REPORT_NAME%"
 

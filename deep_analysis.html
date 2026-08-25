@@ -1,0 +1,120 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>통합 손실 원인 분석 — 08-14, 08-18, 08-19, 08-21, 08-24, 08-25</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#f0f2f5;--card:#fff;--text:#2c3e50;--muted:#636e72;--border:#dde2e8;--head:#1a2332}
+@media(prefers-color-scheme:dark){:root{--bg:#12151c;--card:#1e2330;--text:#c8d0de;--muted:#7a8599;--border:#252c3a;--head:#0d1117}}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);padding:20px;max-width:1060px;margin:0 auto}
+h1{font-size:1.35rem;font-weight:700;margin-bottom:2px}
+h2{font-size:1.05rem;font-weight:700;margin:22px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--border)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.stat{text-align:center;padding:10px 6px}
+.stat .val{font-size:1.7rem;font-weight:700}
+.stat .lbl{font-size:.73rem;color:var(--muted);margin-top:3px}
+.pos{color:#27ae60}.neg{color:#e74c3c}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{background:var(--border);padding:6px 9px;text-align:left;font-size:.78rem}
+td{padding:5px 9px;border-bottom:1px solid var(--border)}
+tr:last-child td{border:none}
+code{background:var(--border);padding:1px 5px;border-radius:3px;font-size:.82rem;font-family:monospace}
+.tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:.72rem;font-weight:700;margin-left:4px}
+</style>
+<h1>🔬 통합 손실 원인 분석</h1>
+<p style="color:var(--muted);font-size:.8rem;margin:3px 0 14px">분석 기간: 08-14 / 08-18 / 08-19 / 08-21 / 08-24 / 08-25 &nbsp;|&nbsp; 총 3건 완료 거래</p>
+
+<div class="card grid4">
+  <div class="stat">
+    <div class="val pos">+71,046</div>
+    <div class="lbl">총 손익 (원)</div>
+  </div>
+  <div class="stat">
+    <div class="val">3건</div>
+    <div class="lbl">완료 거래</div>
+  </div>
+  <div class="stat">
+    <div class="val">67%</div>
+    <div class="lbl">승률</div>
+  </div>
+  <div class="stat">
+    <div class="val neg">1건</div>
+    <div class="lbl">손실 거래</div>
+  </div>
+</div>
+
+<h2>⚠️ 발견된 구조적 문제점</h2>
+
+<div style="border-left:4px solid #3498db;background:var(--card);border-radius:0 6px 6px 0;
+            padding:14px 16px;margin:10px 0">
+  <div style="font-weight:700;font-size:.95rem;margin-bottom:8px">🔵 [전략 균형] BREAKOUT 편중 — 전체 3건 중 BREAKOUT 3건 (100%)</div>
+  <div style="font-size:.85rem;line-height:1.7;color:var(--text)"><b>현상:</b> FLAG 0건, PULLBACK 0건으로 BREAKOUT이 압도적으로 많음.<br>
+BREAKOUT은 급등 직후 진입 → 슬리피지·타이밍 실패 리스크가 높음.<br>
+<b>원인:</b> 조건검색식이 <code>CHUSAE_INDICATE</code> 위주 — BREAKOUT 종목만 유입.<br>
+FLAG/PULLBACK 조건식(<code>급등주_눌림목_검색식</code>, <code>상승_깃발_패턴</code>)이 실제로
+충분한 종목을 잡아오지 못하거나, 필터가 너무 엄격해 진입 자체가 안 됨.<br>
+<b>수정 방향:</b> FLAG/PULLBACK 조건식 기준 완화 또는 검색 주기(<code>CONDITION_INTERVAL_MIN</code>)
+단축. 로그에서 FLAG_CHECK, PULLBACK_CHECK 통과율 통계를 뽑아 어느 조건이 병목인지 확인.</div>
+</div>
+<div style="border-left:4px solid #3498db;background:var(--card);border-radius:0 6px 6px 0;
+            padding:14px 16px;margin:10px 0">
+  <div style="font-weight:700;font-size:.95rem;margin-bottom:8px">🔵 [실행] 매수 슬리피지 평균 +0.09% — 진입가보다 높게 체결</div>
+  <div style="font-size:.85rem;line-height:1.7;color:var(--text)"><b>현상:</b> 요청 현재가 대비 실제 체결가가 평균 0.09% 높음.<br>
+시장가 주문 특성상 호가 점프 시 의도보다 비싸게 체결됨.<br>
+<b>원인:</b> <code>ORDER_TRY → BUY_FILL_NEW</code> 사이 약 0.1~2초 동안 가격 상승.<br>
+급등 중인 종목일수록 슬리피지 심화 → 진입 후 즉시 기대 수익이 줄어듦.<br>
+<b>수정 방향:</b> ATR 계산 기반 TP 설정 시 슬리피지 버퍼를 포함하거나,
+TP1_RATIO를 올려 첫 익절 시 충분한 수익 확보 후 나머지를 트레일링으로 운용.</div>
+</div>
+
+<div class="grid2">
+  <div>
+    <h2>전략별 성과</h2>
+    <div class="card">
+    <table><tr><th>전략</th><th>건수</th><th>수익</th><th>손실</th><th>승률</th><th>손익합</th></tr>
+    <tr><td>돌파</td><td>3</td><td style="color:#27ae60">2</td><td style="color:#e74c3c">1</td><td>67%</td><td class="pos">+71,046원</td></tr>
+</table>
+    </div>
+  </div>
+  <div>
+    <h2>청산 사유별 성과</h2>
+    <div class="card">
+    <table><tr><th>사유</th><th>건수</th><th>손익합</th><th>건당 평균</th></tr>
+    <tr><td>시간손절</td><td>1</td><td class="neg">-13,251원</td><td class="neg">-13,251원</td></tr>
+<tr><td>본절보호</td><td>1</td><td class="pos">+38,901원</td><td class="pos">+38,901원</td></tr>
+<tr><td>ATR손절</td><td>1</td><td class="pos">+45,396원</td><td class="pos">+45,396원</td></tr>
+</table>
+    </div>
+  </div>
+</div>
+
+<h2>⏰ 시간대별 거래 분포 (🟢수익 🔴손실)</h2>
+<div class="card"><div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:.8rem"><span style="width:30px;text-align:right">9시</span><div style="width:0px;height:14px;background:#27ae60;border-radius:2px"></div><div style="width:0px;height:14px;background:#e74c3c;border-radius:2px"></div><span style="color:var(--muted)">수익0 손실0</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:.8rem"><span style="width:30px;text-align:right">10시</span><div style="width:0px;height:14px;background:#27ae60;border-radius:2px"></div><div style="width:0px;height:14px;background:#e74c3c;border-radius:2px"></div><span style="color:var(--muted)">수익0 손실0</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:.8rem"><span style="width:30px;text-align:right">11시</span><div style="width:80px;height:14px;background:#27ae60;border-radius:2px"></div><div style="width:80px;height:14px;background:#e74c3c;border-radius:2px"></div><span style="color:var(--muted)">수익1 손실1</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:.8rem"><span style="width:30px;text-align:right">12시</span><div style="width:0px;height:14px;background:#27ae60;border-radius:2px"></div><div style="width:0px;height:14px;background:#e74c3c;border-radius:2px"></div><span style="color:var(--muted)">수익0 손실0</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:.8rem"><span style="width:30px;text-align:right">13시</span><div style="width:80px;height:14px;background:#27ae60;border-radius:2px"></div><div style="width:0px;height:14px;background:#e74c3c;border-radius:2px"></div><span style="color:var(--muted)">수익1 손실0</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:.8rem"><span style="width:30px;text-align:right">14시</span><div style="width:0px;height:14px;background:#27ae60;border-radius:2px"></div><div style="width:0px;height:14px;background:#e74c3c;border-radius:2px"></div><span style="color:var(--muted)">수익0 손실0</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:.8rem"><span style="width:30px;text-align:right">15시</span><div style="width:0px;height:14px;background:#27ae60;border-radius:2px"></div><div style="width:0px;height:14px;background:#e74c3c;border-radius:2px"></div><span style="color:var(--muted)">수익0 손실0</span></div>
+</div>
+
+<h2>⏳ 손절 재시도 지연 거래 상세</h2>
+<div class="card">
+<p style='color:var(--muted);font-size:.85rem'>손절 재시도 2회 이상 거래 없음</p>
+</div>
+
+<h2>🎯 TP1 근접 미달 거래 상세</h2>
+<div class="card">
+<p style='color:var(--muted);font-size:.85rem'>TP 근접 미달 거래 없음</p>
+</div>
+
+<h2>📋 전체 거래 목록</h2>
+<div class="card" style="overflow-x:auto">
+<table><tr><th>날짜</th><th>종목</th><th>전략</th><th>진입</th><th>보유</th><th>손익%</th><th>손익원</th><th>청산 사유</th></tr>
+<tr><td>2026-08-14</td><td>아진엑스텍</td><td>돌파</td><td>11:53</td><td>5분</td><td class="pos">+0.79%</td><td class="pos">+38,901원</td><td>본절보호</td></tr>
+<tr><td>2026-08-18</td><td>지니틱스</td><td>돌파</td><td>13:19</td><td>16분</td><td class="pos">+0.92%</td><td class="pos">+45,396원</td><td>ATR손절</td></tr>
+<tr><td>2026-08-24</td><td>지투지바이오</td><td>돌파</td><td>11:28</td><td>18분</td><td class="neg">-0.26%</td><td class="neg">-13,251원</td><td>시간손절</td></tr>
+</table>
+</div>

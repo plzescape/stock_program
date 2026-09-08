@@ -4,7 +4,7 @@ IS_REAL = False
 ACCOUNT_NO = ""  # IS_REAL=True일 때만 사용 (예: "12345678")
 
 # ✅ 모의투자에서 사용할 계좌 (국내주식)
-MOCK_ACCOUNT_NO = "8127278511"
+MOCK_ACCOUNT_NO = "8134106911"
 
 # ===== 매매 수량 =====
 # BUY_MODE 옵션:

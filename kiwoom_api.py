@@ -458,7 +458,21 @@ class KiwoomAPI(QAxWidget):
         
         code = self.current_scan_code
         candles = self.parse_candle(code)
-        
+
+        # ── 백테스트용 분봉 적재 ──────────────────────────────────────
+        # 이미 받은 데이터를 저장만 한다. TR 추가 요청 없음 → 키움 제한 무영향.
+        # 어떤 실패도 매매를 막지 않도록 전부 삼킨다.
+        try:
+            from config import RECORD_CANDLES
+            if RECORD_CANDLES and candles:
+                import candle_recorder
+                from config import CANDLE_INTERVAL_MIN as _rec_cim
+                candle_recorder.record(code, self.get_stock_name(code),
+                                       candles, _rec_cim)
+        except Exception:
+            pass
+        # ─────────────────────────────────────────────────────────────
+
         self.tr_inflight = False
         self.current_scan_code = None
 
@@ -2293,6 +2307,13 @@ class KiwoomAPI(QAxWidget):
                     )
                 )
 
+                # 체결시간(YYYYMMDDHHMMSS) — 백테스트 데이터 적재용.
+                # 전략 로직은 OHLCV만 사용하므로 필드 추가는 영향 없음.
+                ts_raw = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "체결시간"
+                ).strip()
+
                 # 시가 또는 종가가 0이면 데이터 오류 → 스킵
                 if open_ == 0 or close == 0:
                     continue
@@ -2303,6 +2324,7 @@ class KiwoomAPI(QAxWidget):
                     "low": low,
                     "close": close,
                     "volume": volume,
+                    "time": ts_raw,
                 })
 
             # ✔ VER2는 25개 이상 필요

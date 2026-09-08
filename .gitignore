@@ -6,3 +6,7 @@ Report_260303/
 *.xlsx
 
 *.log
+
+candle_data/*/*.json
+Report*/*.html
+Report*/*/*.html

@@ -581,10 +581,17 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
     # A. 양봉
     is_bull = body > 0
 
-    # B. 거래량 급증: 직전 5봉 평균 대비 5배+ AND ≥ 3000주
+    # B. 거래량 급증: 직전 5봉 평균 대비 N배+ AND ≥ 최소주수
+    # 기본값은 기존 하드코딩과 동일(5.0배 / 3000주) → 동작 변화 없음.
+    # config 로 뺀 이유: 이 조건이 BREAKOUT 최대 병목(통과율 5.5%)이라
+    #                   backtest.py 로 완화 효과를 측정할 수 있어야 함.
+    try:
+        from config import BREAKOUT_VOL_RATIO_MIN as _vr, BREAKOUT_VOL_MIN_QTY as _vq
+    except ImportError:
+        _vr, _vq = 5.0, 3000
     avg_vol5  = sum(c['volume'] for c in candles[1:6]) / 5 if len(candles) >= 6 else 0
     vol_ratio = c0['volume'] / avg_vol5 if avg_vol5 > 0 else 0
-    vol_ok    = vol_ratio >= 5.0 and c0['volume'] >= 3000
+    vol_ok    = vol_ratio >= _vr and c0['volume'] >= _vq
 
     # C. 5봉 신고가 돌파
     prev5_high = max(c['high'] for c in candles[1:6]) if len(candles) >= 6 else 0

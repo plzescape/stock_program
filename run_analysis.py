@@ -116,6 +116,7 @@ def step_backtest():
 
     days = len({d for d, _, _, _ in ds})
     print(f"  데이터: {days}일 / 종목-일 {len(ds)}건")
+    print(f"  유니버스: {backtest.universe_desc()}")
     trades, skips = backtest.run_backtest(ds)
     backtest.print_report(trades, skips, '백테스트 결과')
     return trades, ds

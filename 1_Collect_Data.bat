@@ -10,18 +10,15 @@ setlocal
 ::     동시에 돌리면 자동매매의 스캔/손절 주문이 밀립니다.
 :: ============================================================
 
-set PY32=C:\Users\user\AppData\Local\Programs\Python\Python311-32\python.exe
+cd /d "%~dp0"
+
+set PY32=%~dp0.venv\Scripts\python.exe
 if not exist "%PY32%" (
-    set PY32=C:\Users\user\AppData\Local\Programs\Python\Python314-32\python.exe
-)
-if not exist "%PY32%" (
-    echo [오류] 32비트 파이썬을 찾을 수 없습니다.
+    echo [오류] 32비트 가상환경 .venv 를 찾을 수 없습니다.
     echo        키움 OCX는 32비트에서만 동작합니다.
     pause
     exit /b 1
 )
-
-cd /d "%~dp0"
 
 echo ============================================================
 echo   분봉 데이터 수집

@@ -90,6 +90,28 @@ SCAN_MAX_CODES = 30        # 조건검색 결과 중 최대 몇 종목만 스캔
 SCAN_TR_DELAY_MS = 700     # 종목별 TR 요청 간 최소 딜레이(밀리초)
 SCAN_CODE_COOLDOWN_SEC = 30  # 같은 종목 재스캔 방지 쿨타임(초)
 
+# ===== 백테스트: 조건검색 유니버스 근사 =====
+# 실전은 조건검색식(CONDITION_NAMES)에 걸린 종목만 매매한다.
+# 백테스트는 candle_data/ 안의 모든 종목을 보므로, 그냥 두면
+# 실전이 평생 볼 일 없는 종목의 거래까지 통계에 섞인다.
+# (1_Collect_Data.bat 의 [1] 코스닥 200종목 수집이 특히 그렇다.)
+#
+# 아래 값으로 "조건검색식이 잡았을 법한 상태"를 봉 단위로 근사해서
+# 백테스트 유니버스를 실전과 맞춘다.
+#
+# ⚠️ 기본값은 '급등주' 계열 조건식의 통상적인 기준을 옮겨 놓은 것이다.
+#    HTS 조건검색 창에 실제로 설정한 수치로 바꿔야 백테스트가 실전과 일치한다.
+#    조건식 자체를 못 옮기겠으면 BT_COND_FILTER_ENABLED=False 로 끄되,
+#    그때 나오는 기댓값은 실전보다 낙관적일 수 있음을 감안할 것.
+BT_COND_FILTER_ENABLED = True          # False = 예전처럼 전 종목 대상
+BT_COND_DAY_RISE_MIN   = 3.0           # 당일 시가 대비 누적 등락률 하한 (%)
+BT_COND_VOL_RATIO_MIN  = 3.0           # 직전 5봉 평균 대비 거래량 배수 하한
+BT_COND_TURNOVER_MIN   = 300000000     # 당일 누적 거래대금 하한 (원, 3억)
+BT_COND_HOLD_BARS      = 20            # 편입 후 후보로 유지되는 봉 수
+BT_COND_DELAY_BARS     = 0             # 편입~스캔 도달 지연(봉)
+                                       #   0 = 즉시 (실시간 조건검색 기준)
+                                       #   1 = CONDITION_INTERVAL_MIN 라운드로빈 지연 근사
+
 # ===== 매수/매도 포지션 최대 개수 =====
 MAX_POSITIONS = 10
 

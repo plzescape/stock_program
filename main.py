@@ -1,4 +1,5 @@
 import sys
+import qt_bootstrap  # noqa: F401  (PyQt5 보다 먼저 - 한글 경로 대응)
 from PyQt5.QtWidgets import QApplication
 from kiwoom_api import KiwoomAPI
 from config import IS_REAL

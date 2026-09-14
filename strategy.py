@@ -520,7 +520,8 @@ def get_breakout_position_size(entry_price: float,
 # 전략 1: BREAKOUT (돌파 진입) VER5 — 모멘텀 필터 추가
 # ==================================================
 
-def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bool:
+def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False,
+                            now=None) -> bool:
     """
     급등 모멘텀 진입 전략 (BREAKOUT) VER8
 
@@ -562,7 +563,10 @@ def is_entry_candidate_VER2(candles, logger=None, code=None, strict=False) -> bo
     # config.BREAKOUT_TIME_CUT_ENABLED = False  →  해제
     # config.BREAKOUT_TIME_CUT_STR = "HH:MM"   →  시각 변경
     # main.py의 disable_hardcut() / enable_hardcut() 으로 런타임 토글 가능
-    _now = _dt.now().time()
+    # now=None 이면 실시간(벽시계) 기준.
+    # backtest.py 는 판정 대상 봉의 시각을 넘겨주므로,
+    # 백테스트 결과가 '언제 돌렸는가'에 좌우되지 않는다.
+    _now = now if now is not None else _dt.now().time()
     import config as _cfg
     _cut_enabled = getattr(_cfg, "BREAKOUT_TIME_CUT_ENABLED", True)
     _cut_time    = getattr(_cfg, "BREAKOUT_TIME_CUT", time(10, 30))
@@ -714,7 +718,7 @@ def get_entry_signal_data(candles) -> dict | None:
 # 전략 2: PULLBACK (눌림목 반등 + 오더블록 통합) VER5
 # ==================================================
 
-def is_pullback_entry(candles, logger=None, code=None) -> bool:
+def is_pullback_entry(candles, logger=None, code=None, now=None) -> bool:
     """
     눌림목 진입 전략 VER8 — RSI/MACD 제거 + 실질 조건으로 재설계
 
@@ -759,7 +763,10 @@ def is_pullback_entry(candles, logger=None, code=None) -> bool:
     # config.PULLBACK_TIME_CUT_ENABLED = False  →  해제
     # config.PULLBACK_TIME_CUT_STR = "HH:MM"   →  시각 변경
     # main.py의 disable_hardcut() / enable_hardcut() 으로 런타임 토글 가능
-    _now = _dt.now().time()
+    # now=None 이면 실시간(벽시계) 기준.
+    # backtest.py 는 판정 대상 봉의 시각을 넘겨주므로,
+    # 백테스트 결과가 '언제 돌렸는가'에 좌우되지 않는다.
+    _now = now if now is not None else _dt.now().time()
     import config as _cfg
     _cut_enabled = getattr(_cfg, "PULLBACK_TIME_CUT_ENABLED", True)
     _cut_time    = getattr(_cfg, "PULLBACK_TIME_CUT", time(11, 0))

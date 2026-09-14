@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, time
+import qt_bootstrap  # noqa: F401  (PyQt5 보다 먼저 - 한글 경로 대응)
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
 from collections import deque

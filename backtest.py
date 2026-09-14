@@ -14,6 +14,7 @@ Usage:
     python backtest.py --sweep sl                # ATR_SL_MULT 스윕
     python backtest.py --sweep tp1ratio          # TP1_RATIO 스윕
     python backtest.py --html backtest.html      # HTML 리포트 생성
+    python backtest.py --no-cond-filter          # 조건검색 필터 없이 (비교용)
 
 데이터 형식 (collect_candles.py 가 생성):
     candle_data/YYYY-MM-DD/<code>.json
@@ -22,7 +23,7 @@ Usage:
 """
 
 import os, sys, json, argparse, statistics
-from datetime import datetime
+from datetime import datetime, time as dtime
 from collections import defaultdict
 
 import config
@@ -91,6 +92,69 @@ def bar_minute(bar):
         return -1
 
 
+def bar_clock(bar):
+    """캔들 t('0905' 또는 '090500') → datetime.time (실패 시 None)"""
+    t = str(bar.get('t', '')).zfill(4)
+    try:
+        return dtime(int(t[:2]), int(t[2:4]))
+    except ValueError:
+        return None
+
+
+# ─── 조건검색 유니버스 근사 ──────────────────────────────────────────────────
+def condition_universe(bars):
+    """
+    조건검색식 편입 상태를 봉 단위로 근사한다.
+
+    실전(kiwoom_api.py)에서 종목은 조건검색식에 걸려 _on_receive_tr_condition
+    으로 들어와야 candidates 에 등록되고, 그때부터 스캔/진입 대상이 된다.
+    백테스트는 candle_data/ 의 모든 종목을 보므로 같은 게이트를 씌워야
+    "백테스트는 되는데 실전은 안 되는" 괴리가 줄어든다.
+
+    조건은 config.BT_COND_* 로 조정한다 (HTS 조건검색식 수치와 맞출 것).
+    한 번 편입되면 BT_COND_HOLD_BARS 동안 후보 상태를 유지한다.
+
+    반환: in_uni[i] == True 면 bar i 가 마감된 시점에 조건검색 후보 상태.
+    """
+    n = len(bars)
+    if not getattr(config, 'BT_COND_FILTER_ENABLED', True):
+        return [True] * n
+
+    rise_min = getattr(config, 'BT_COND_DAY_RISE_MIN', 3.0)
+    vr_min   = getattr(config, 'BT_COND_VOL_RATIO_MIN', 3.0)
+    to_min   = getattr(config, 'BT_COND_TURNOVER_MIN', 0)
+    hold     = getattr(config, 'BT_COND_HOLD_BARS', 20)
+    delay    = getattr(config, 'BT_COND_DELAY_BARS', 0)
+
+    in_uni   = [False] * n
+    day_open = bars[0]['o'] if bars else 0
+    turnover = 0.0
+
+    for i, b in enumerate(bars):
+        turnover += b['c'] * b['v']
+        if i < 6:
+            continue
+        avg_vol5  = sum(x['v'] for x in bars[i - 5:i]) / 5
+        vol_ratio = b['v'] / avg_vol5 if avg_vol5 > 0 else 0
+        day_rise  = (b['c'] - day_open) / day_open * 100 if day_open > 0 else 0
+
+        if day_rise >= rise_min and vol_ratio >= vr_min and turnover >= to_min:
+            lo = i + delay
+            for j in range(lo, min(lo + hold + 1, n)):
+                in_uni[j] = True
+    return in_uni
+
+
+def universe_desc():
+    """현재 조건검색 근사 설정을 한 줄로 요약"""
+    if not getattr(config, 'BT_COND_FILTER_ENABLED', True):
+        return "조건검색 필터 OFF - candle_data 전 종목 (실전 유니버스와 불일치)"
+    return (f"조건검색 근사 ON - 등락률≥{config.BT_COND_DAY_RISE_MIN}% "
+            f"거래량≥{config.BT_COND_VOL_RATIO_MIN}배 "
+            f"거래대금≥{config.BT_COND_TURNOVER_MIN/1e8:.1f}억 "
+            f"유지{config.BT_COND_HOLD_BARS}봉 지연{config.BT_COND_DELAY_BARS}봉")
+
+
 # ─── 진입 판정 ───────────────────────────────────────────────────────────────
 def check_entry(bars, i):
     """
@@ -110,11 +174,18 @@ def check_entry(bars, i):
         live = {'open': nb['o'], 'high': nb['o'], 'low': nb['o'],
                 'close': nb['o'], 'volume': 0}
 
-    if is_pullback_entry(completed, None, None):
+    # 진입 시각 하드컷(BREAKOUT 10:30 / PULLBACK 11:00)의 기준 시각.
+    # 라이브는 벽시계를 보지만, 백테스트에서 벽시계를 쓰면 "백테스트를
+    # 언제 돌렸는가"에 따라 결과가 달라진다 (10:30 이후 실행 시 BREAKOUT 전멸).
+    # 실제로 체결될 봉(i+1)의 시각을 넘겨 재현성을 확보한다.
+    act_bar = bars[i + 1] if i + 1 < len(bars) else bars[i]
+    now = bar_clock(act_bar)
+
+    if is_pullback_entry(completed, None, None, now=now):
         return 'PULLBACK'
     if is_flag_entry(completed, None, None, live_candle=live):
         return 'FLAG'
-    if is_entry_candidate_VER2(completed, None, None):
+    if is_entry_candidate_VER2(completed, None, None, now=now):
         return 'BREAKOUT'
     return None
 
@@ -288,11 +359,21 @@ def run_backtest(dataset, pessimistic=True, verbose=False):
     skips  = defaultdict(int)
 
     for date, code, name, bars in dataset:
+        # 라이브는 조건검색식에 걸린 종목만 스캔한다. 같은 게이트를 씌운다.
+        in_uni = condition_universe(bars)
+
         i = WARMUP_BARS
         traded = False          # traded_today: 종목당 1회 (라이브와 동일)
         while i < len(bars) - 2 and not traded:
             etype = check_entry(bars, i)
             if not etype:
+                i += 1
+                continue
+
+            # 신호는 떴지만 그 시점에 조건검색 후보가 아니었다면
+            # 라이브는 이 종목을 아예 보지 못한다 -> 거래 성립 불가.
+            if not in_uni[i]:
+                skips['COND_OUT'] += 1
                 i += 1
                 continue
 
@@ -364,15 +445,28 @@ def metrics(trades):
     }
 
 
+def print_skips(skips, pad='  '):
+    """차단 집계 출력. 조건검색 유니버스 차단은 성격이 달라 분리한다."""
+    cond_out = skips.get('COND_OUT', 0)
+    others   = {k: v for k, v in skips.items() if k != 'COND_OUT'}
+    if cond_out:
+        print(f"\n{pad}-- 조건검색 유니버스 차단 --")
+        print(f"{pad}COND_OUT       {cond_out:>5}건  "
+              f"<- 신호는 떴으나 조건검색에 없던 종목")
+        print(f"{pad}               (실전에서는 애초에 보이지 않는 종목)")
+    if others:
+        print(f"\n{pad}-- 사전필터 차단 --")
+        for k, v in sorted(others.items(), key=lambda x: -x[1]):
+            print(f"{pad}{k:<14} {v:>5}건")
+
+
 def print_report(trades, skips, title='BACKTEST'):
     m = metrics(trades)
     print(f"\n{'='*66}\n  {title}\n{'='*66}")
     if m['n'] == 0:
         print("  거래 없음 - 필터가 모든 신호를 차단했거나 데이터 부족")
         if skips:
-            print("\n  사전필터 차단:")
-            for k, v in sorted(skips.items(), key=lambda x: -x[1]):
-                print(f"    {k:<14} {v:>5}건")
+            print_skips(skips, '    ')
         return
 
     print(f"  거래수        {m['n']:>8}")
@@ -406,9 +500,7 @@ def print_report(trades, skips, title='BACKTEST'):
         print(f"  {r:<14} {len(ts):>5} {len(ts)/m['n']*100:>6.1f}% {avg:>+9.2f}%")
 
     if skips:
-        print(f"\n  ── 사전필터 차단 ──")
-        for k, v in sorted(skips.items(), key=lambda x: -x[1]):
-            print(f"  {k:<14} {v:>5}건")
+        print_skips(skips)
 
 
 # ─── 파라미터 스윕 ───────────────────────────────────────────────────────────
@@ -431,6 +523,7 @@ def run_sweep(dataset, key, pessimistic=True):
     original = getattr(config, attr)
 
     print(f"\n{'='*66}\n  파라미터 스윕: {attr}\n{'='*66}")
+    print(f"  유니버스: {universe_desc()}")
     print(f"  {attr:>16} {'거래':>6} {'승률':>8} {'기댓값':>10} {'PF':>8} {'MDD':>9}")
     print(f"  {'-'*62}")
     best = None
@@ -516,7 +609,13 @@ def main():
                     help='한 봉 내 익절을 손절보다 먼저 평가 (낙관적)')
     ap.add_argument('--verbose', action='store_true', help='개별 거래 출력')
     ap.add_argument('--csv', help='거래 내역 CSV 저장 경로')
+    ap.add_argument('--no-cond-filter', action='store_true',
+                    help='조건검색 유니버스 필터 해제 (candle_data 전 종목 대상). '
+                         '실전 유니버스와 어긋나므로 비교용으로만 사용')
     args = ap.parse_args()
+
+    if args.no_cond_filter:
+        config.BT_COND_FILTER_ENABLED = False
 
     if args.selftest:
         sys.exit(0 if selftest() else 1)
@@ -543,6 +642,7 @@ def main():
     print(f"[설정] 봉={config.CANDLE_INTERVAL_MIN}분  "
           f"SL×{config.ATR_SL_MULT}  TP×{config.ATR_TP_MULT}  "
           f"TP1={config.TP1_RATIO}")
+    print(f"[유니버스] {universe_desc()}")
     cost = (FEE_BUY_PCT + FEE_SELL_PCT + TAX_SELL_PCT + SLIPPAGE_PCT) * 100
     print(f"[비용] 왕복 {cost:.3f}% (수수료+거래세+슬리피지)")
 

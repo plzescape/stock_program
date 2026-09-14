@@ -25,6 +25,7 @@ import os, sys, json, time, argparse
 from datetime import datetime
 from collections import defaultdict
 
+import qt_bootstrap  # noqa: F401  (PyQt5 보다 먼저 - 한글 경로 대응)
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QEventLoop, QTimer

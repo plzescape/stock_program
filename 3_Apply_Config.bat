@@ -9,10 +9,10 @@ setlocal
 ::  기존 config.py 는 config.py.bak 으로 백업됩니다.
 :: ============================================================
 
-set PY=C:\Users\user\AppData\Local\Programs\Python\Python314\python.exe
-if not exist "%PY%" set PY=python
-
 cd /d "%~dp0"
+
+set PY=%~dp0.venv\Scripts\python.exe
+if not exist "%PY%" set PY=python
 
 echo ============================================================
 echo   config.py 에 권장값을 반영합니다

@@ -37,6 +37,10 @@ P = {
     'CHEJAN_BUY': re.compile(TS + r'.*\[CHEJAN\] \+매수 .+?\((\w+)\) price=(\d+) qty=(\d+)'),
     'CHEJAN_SEL': re.compile(TS + r'.*\[CHEJAN\] -매도 .+?\((\w+)\) price=(\d+) qty=(\d+)'),
     'SELL_DONE':  re.compile(TS + r'.*\[SELL_DONE\] .+?\((\w+)\)'),
+    # 전일 미청산 잔고를 장 시작 직후 청산하는 건. 당일 매수 체결이 없으므로
+    # 이 로그를 진입으로 삼아야 엑셀 리포트와 목록이 맞는다.
+    'LEFTOVER':   re.compile(TS + r'.*\[LEFTOVER_SELL\] (.+?)\((\w+)\) 전일잔고 '
+                                  r'qty=(\d+) entry=(\d+) entry_ts=([\d\-]+ [\d:]+)'),
 }
 
 EXIT_LABELS = {
@@ -49,10 +53,12 @@ EXIT_LABELS = {
     'TP2_FILL':   ('T2', '🟢 TP2 익절',  '#16a085'),
     'TP1_FILL':   ('T1', '🔵 TP1 익절',  '#2980b9'),
     'FORCE_LIQ':  ('FL', '⚪ 강제청산',  '#7f8c8d'),
+    'LEFTOVER_LIQ':('LQ', '⚪ 전일잔고 청산', '#7f8c8d'),
     'INCOMPLETE': ('?',  '❓ 미완료',    '#95a5a6'),
 }
 
-STRATEGY_KO = {'BREAKOUT': '돌파', 'PULLBACK': '눌림', 'FLAG': '깃발'}
+STRATEGY_KO = {'BREAKOUT': '돌파', 'PULLBACK': '눌림', 'FLAG': '깃발',
+               'LEFTOVER': '전일잔고'}
 
 
 # ─── 파싱 ────────────────────────────────────────────────────────────────────
@@ -85,8 +91,28 @@ def _apply_atr_fallback(t):
 
 
 def parse_trades(path):
-    active = {}   # code → trade dict
+    """
+    반환: (done, unfilled)
+      done    : 실제 매수 체결이 있었던 거래
+      unfilled: 진입 계산까지 갔지만 체결이 없던 신호
+                (PUMP_SKIP·주문거절 등. 그 사유는 signal.log 에 있어 여기서는 안 보인다)
+
+    체결 없는 신호로 거래를 만들면 엑셀 리포트에는 없는 종목이
+    차트 목록에만 나타나고, 값이 전부 0인 빈 페이지가 생긴다.
+    """
+    pending = {}  # code → trade dict (ENTRY_QTY 까지만 진행, 체결 대기)
+    active = {}   # code → trade dict (매수 체결 확인됨)
     done   = []
+
+    def promote(code, ts=None, name=None):
+        """첫 매수 체결에서 pending → active 로 승격"""
+        if code in active:
+            return active[code]
+        t = pending.pop(code, None)
+        if t is None:
+            t = new_trade(ts or '', name or code, code, 0, '?')
+        active[code] = t
+        return t
 
     def new_trade(ts, name, code, cur_price, strategy):
         return {
@@ -106,33 +132,51 @@ def parse_trades(path):
             m = P['ENTRY_QTY'].search(line)
             if m:
                 ts, name, code, cp, strat = m.groups()
+                if code not in active and code not in pending:
+                    pending[code] = new_trade(ts, name, code, int(cp), strat)
+                continue
+
+            m = P['LEFTOVER'].search(line)
+            if m:
+                ts, name, code, qty, entry, prev_ts = m.groups()
                 if code not in active:
-                    active[code] = new_trade(ts, name, code, int(cp), strat)
+                    t = new_trade(ts, name, code, int(entry), 'LEFTOVER')
+                    t['entry_price'] = int(entry)
+                    t['qty'] = int(qty)
+                    # 청산 사유는 실제 청산 로그(TIME_STOP 등)를 우선한다.
+                    # 엑셀 리포트와 같은 사유가 찍히도록, 없을 때만 LEFTOVER_LIQ.
+                    t['leftover'] = True
+                    t['prev_entry_ts'] = prev_ts
+                    t['events'].append({'t': ts, 'k': 'LEFTOVER',
+                                        'label': f'전일 잔고 {qty}주 청산 시작 (매수 {prev_ts})'})
+                    active[code] = t
+                    pending.pop(code, None)
                 continue
 
             m = P['ATR_CALC'].search(line)
             if m:
                 ts, code, atr = m.groups()
-                if code in active:
-                    active[code]['atr'] = float(atr)
+                t = active.get(code) or pending.get(code)
+                if t:
+                    t['atr'] = float(atr)
                     mm = P['ATR_MULTS'].search(line)
                     if mm:
-                        active[code]['atr_sl_mult'] = float(mm.group(1))
-                        active[code]['atr_tp_mult'] = float(mm.group(2))
+                        t['atr_sl_mult'] = float(mm.group(1))
+                        t['atr_tp_mult'] = float(mm.group(2))
                 continue
 
             m = P['BUY_FILL1'].search(line)
             if m:
                 ts, code, entry, qty = m.groups()
-                if code in active:
-                    active[code]['entry_price'] = int(entry)
-                    active[code]['qty'] = int(qty)
+                t = promote(code, ts)
+                t['entry_price'] = int(entry)
+                t['qty'] = int(qty)
                 continue
 
             m = P['CHEJAN_BUY'].search(line)
             if m:
                 ts, code, price, qty = m.groups()
-                if code in active: active[code]['buy_fills'].append((ts, int(price), int(qty)))
+                promote(code, ts)['buy_fills'].append((ts, int(price), int(qty)))
                 continue
 
             m = P['TP_TARGET'].search(line)
@@ -223,7 +267,7 @@ def parse_trades(path):
                     t = active.pop(code)
                     t['exit_time'] = ts
                     if not t['exit_reason']:
-                        t['exit_reason'] = 'UNKNOWN'
+                        t['exit_reason'] = 'LEFTOVER_LIQ' if t.get('leftover') else 'UNKNOWN'
                     ap, _ = avg_fill(t['sell_fills'])
                     abp, _ = avg_fill(t['buy_fills'])
                     t['avg_sell'] = ap
@@ -245,7 +289,7 @@ def parse_trades(path):
         _apply_atr_fallback(t)
         done.append(t)
 
-    return done
+    return done, list(pending.values())
 
 
 # ─── 손실 원인 분석 ──────────────────────────────────────────────────────────
@@ -327,6 +371,8 @@ def diagnose(t):
         'FORCE_LIQ':   '15:20 장 마감 강제청산',
         'TP1_FILL':    'TP1 분할 매도 후 미청산 잔여 보유 중 청산',
         'TP2_FILL':    'TP2 목표 달성 후 잔여 분 트레일링/청산',
+        'LEFTOVER_LIQ': '전일 미청산 잔고를 장 시작 직후 시장가 청산 '
+                        '(당일 진입 신호와 무관, 손익은 전날 매수가 기준)',
     }.get(reason, '')
     if reason_note:
         diags.append(('info', f'청산 사유: {reason_note}'))
@@ -720,6 +766,38 @@ tr:hover td{{background:rgba(52,73,94,.05)}}
 
 
 # ─── 메인 ────────────────────────────────────────────────────────────────────
+SKIP_TAGS = ('PUMP_SKIP', 'ENERGY_SPENT_SKIP', 'NO_SURGE_SKIP', 'BREAKOUT_STALE_SKIP',
+             'ENTRY_SKIP_ATR', 'ENTRY_SKIP_BUDGET', 'ENTRY_SKIP_PRICE', 'ENTRY_CUTOFF',
+             'ORDER_REJECT', 'ORDER_FAIL', 'BUY_BLOCK', 'BUY_BLOCK_PENDING',
+             'CLOSE_ORDER_BLOCK', 'REJECT_CLEANUP')
+
+
+def _lookup_skip_reasons(log_folder, codes):
+    """체결 없이 끝난 종목의 차단 사유를 로그에서 찾는다 (차단 로그는 signal/system 에 남는다)."""
+    want = set(codes)
+    found = {}
+    if not want:
+        return found
+    for fn in ('signal.log', 'trade.log', 'system.log'):
+        path = os.path.join(log_folder, fn)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    if not any(c in line for c in want):
+                        continue
+                    for tag in SKIP_TAGS:
+                        if f'[{tag}]' in line:
+                            for c in want:
+                                if c in line:
+                                    found[c] = tag
+                            break
+        except Exception:
+            pass
+    return found
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python analyze_trades.py <log_folder> [output_folder]")
@@ -746,8 +824,16 @@ def main():
                 break
 
     print(f"[분석] {trade_log} 파싱 중...")
-    trades = parse_trades(trade_log)
-    print(f"[분석] 거래 {len(trades)}건 발견")
+    trades, unfilled = parse_trades(trade_log)
+    print(f"[분석] 매수 체결된 거래 {len(trades)}건 발견")
+
+    if unfilled:
+        # 진입 계산까지 갔지만 체결이 없던 신호. 차단 사유는 signal.log 에 남는다.
+        reasons = _lookup_skip_reasons(log_folder, [t['code'] for t in unfilled])
+        print(f"[분석] 체결 없이 끝난 진입 시도 {len(unfilled)}건 - 차트/집계에서 제외")
+        for t in sorted(unfilled, key=lambda x: x['entry_time']):
+            print(f"    {t['entry_time']} {t['name']}({t['code']}) "
+                  f"{t['strategy']} - {reasons.get(t['code'], '사유 미확인')}")
 
     if not trades:
         print("[분석] 완료된 거래 없음.")

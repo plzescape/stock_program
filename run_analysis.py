@@ -112,25 +112,31 @@ def step_backtest():
         else:
             print("  config.py 의 RECORD_CANDLES 가 False 입니다.")
             print("  True 로 바꾸면 main.py 실행 중 자동 적재됩니다.")
-        return None, None
+        return None, None, None
 
     days = len({d for d, _, _, _ in ds})
     print(f"  데이터: {days}일 / 종목-일 {len(ds)}건")
     print(f"  유니버스: {backtest.universe_desc()}")
-    trades, skips = backtest.run_backtest(ds)
+    print(f"  비용    : {backtest.cost_desc()}")
+    entries = backtest.find_entries(ds)
+    trades, skips = backtest.run_backtest(ds, entries=entries)
     backtest.print_report(trades, skips, '백테스트 결과')
-    return trades, ds
+    return trades, ds, entries
 
 
 # ─── 3단계: 파라미터 권장 ────────────────────────────────────────────────────
-def sweep_one(ds, key):
-    """스윕 실행 후 (현재값, 최적값, 결과표) 반환"""
+def sweep_one(ds, key, entries=None):
+    """
+    스윕 실행 후 (현재값, 최적값, 결과표) 반환.
+    청산 파라미터는 진입 신호를 바꾸지 않으므로 entries(진입 탐색 결과)를 재사용한다.
+    """
     attr, values = backtest.SWEEPS[key]
     original = getattr(config, attr)
+    cached = entries if key in backtest.EXIT_SWEEP_KEYS else None
     rows = []
     for v in values:
         setattr(config, attr, v)
-        tr, _ = backtest.run_backtest(ds)
+        tr, _ = backtest.run_backtest(ds, entries=cached)
         m = backtest.metrics(tr)
         rows.append((v, m))
     setattr(config, attr, original)
@@ -162,7 +168,8 @@ def is_robust(rows, best_val):
     return any(emap[n] >= best_e * 0.5 for n in neigh) if best_e > 0 else False
 
 
-def step_recommend(ds, trades):
+def step_recommend(ds, trades, entries=None):
+    """반환: (권장목록, 전략손실여부)"""
     hr('3단계: 파라미터 권장')
     n = len(trades) if trades else 0
 
@@ -171,16 +178,19 @@ def step_recommend(ds, trades):
         print(f"  최소 {MIN_TRADES_FOR_HINT}건, 신뢰하려면 {MIN_TRADES_FOR_APPLY}건 이상 필요합니다.")
         print(f"\n  지금 필요한 건 파라미터 튜닝이 아니라 데이터입니다.")
         print(f"  collect_candles.py 로 더 많은 날짜/종목을 모으세요.")
-        return []
+        return [], False
 
     recs = []
-    print(f"  {'파라미터':<18} {'현재':>8} {'권장':>8} {'기댓값개선':>12} {'안정성':>10}")
-    print(f"  {'-'*66}")
+    best_anywhere = None          # 모든 스윕을 통틀어 가장 좋은 기댓값
+    print(f"  {'파라미터':<18} {'현재':>8} {'권장':>8} {'기댓값개선':>12} {'최고기댓값':>11} {'안정성':>8}")
+    print(f"  {'-'*72}")
     for key in backtest.SWEEPS:
-        attr, cur, best, rows = sweep_one(ds, key)
+        attr, cur, best, rows = sweep_one(ds, key, entries)
         if not best:
             continue
         best_val, best_m = best
+        if best_anywhere is None or best_m['expectancy'] > best_anywhere:
+            best_anywhere = best_m['expectancy']
         cur_m = next((m for v, m in rows if v == cur), None)
         cur_e = cur_m['expectancy'] if cur_m and cur_m['n'] else None
         if cur_e is None:
@@ -190,17 +200,27 @@ def step_recommend(ds, trades):
         tag = '안정' if robust else '불안정'
         mark = '' if best_val == cur else ('  <<' if robust and delta > 0.05 else '')
         print(f"  {attr:<18} {cur:>8} {best_val:>8} "
-              f"{delta:>+11.3f}% {tag:>10}{mark}")
+              f"{delta:>+11.3f}% {best_m['expectancy']:>+10.3f}% {tag:>8}{mark}")
         if best_val != cur and robust and delta > 0.05:
             recs.append((attr, cur, best_val, delta))
 
-    if not recs:
+    base = backtest.metrics(trades)
+    losing = best_anywhere is not None and best_anywhere <= 0
+    if losing:
+        # is_robust 는 최고 기댓값이 0 이하면 권장을 막는다. 그 경우를
+        # "현재 설정이 적절하다"로 읽으면 안 된다.
+        print(f"\n  [!] 시험한 모든 파라미터 값이 손실입니다 (최고 기댓값 {best_anywhere:+.3f}%).")
+        print(f"      파라미터를 어떻게 바꿔도 흑자가 되지 않습니다. 현재 설정이 좋다는 뜻이 아닙니다.")
+        if base.get('gross_expectancy', 0) <= 0:
+            print(f"      비용을 빼기 전 기댓값도 {base['gross_expectancy']:+.3f}% -> 진입 신호 자체에 우위가 없습니다.")
+        print(f"      -> 진입 전략을 재설계해야 합니다. config.py 반영은 하지 않습니다.")
+    elif not recs:
         print(f"\n  -> 현재 설정을 바꿀 근거가 없습니다. (개선폭이 작거나 불안정)")
     else:
         print(f"\n  -> 변경 권장 {len(recs)}건:")
         for attr, cur, new, d in recs:
             print(f"     {attr}: {cur} -> {new}  (기댓값 {d:+.3f}%p)")
-    return recs
+    return recs, losing
 
 
 # ─── config.py 반영 ──────────────────────────────────────────────────────────
@@ -242,11 +262,11 @@ def main():
     print("="*72)
 
     step_filters()
-    trades, ds = step_backtest()
+    trades, ds, entries = step_backtest()
 
-    recs = []
+    recs, losing = [], False
     if ds:
-        recs = step_recommend(ds, trades)
+        recs, losing = step_recommend(ds, trades, entries)
 
     if apply:
         apply_to_config(recs, len(trades) if trades else 0)
@@ -263,6 +283,9 @@ def main():
     elif len(trades) < MIN_TRADES_FOR_HINT:
         print(f"  현재 단계: 표본 부족 (거래 {len(trades)}건)")
         print(f"  다음 작업: collect_candles.py 로 데이터 추가 수집")
+    elif losing:
+        print(f"  현재 단계: 전략 손실 - 파라미터 조정으로 해결 불가")
+        print(f"  다음 작업: 진입 전략 재설계 (3_Apply_Config 로 바꿀 것이 없음)")
     elif not recs:
         print(f"  현재 단계: 파라미터는 현 상태 유지가 타당")
         print(f"  다음 작업: 전략 로직 자체 또는 진입 필터 재검토")

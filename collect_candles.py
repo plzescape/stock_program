@@ -194,6 +194,36 @@ def glob_days(out_root):
             if os.path.isdir(os.path.join(out_root, d))]
 
 
+def coverage(out_root, min_span=40, min_ratio=0.95):
+    """
+    종목별 수집 상태를 파일 이름만으로 판정한다 (JSON 은 열지 않음).
+
+    반환: (complete, present)
+      present : 파일이 하루라도 있는 종목
+      complete: 매일치가 갖춰진 종목. [첫 날짜, 마지막 날짜] 구간의 거래일 중
+                파일 보유율 ≥ min_ratio 이고 구간이 min_span 거래일 이상.
+
+    실전 녹화(candle_recorder)는 조건검색에 걸린 날에만 파일을 만든다.
+    "파일이 있다"로 건너뛰면 녹화로 며칠치만 있는 급등주가 영원히
+    일괄수집되지 않으므로 complete 기준으로 건너뛴다.
+    """
+    dates = sorted(os.path.basename(d) for d in glob_days(out_root))
+    didx = {d: k for k, d in enumerate(dates)}
+    by_code = defaultdict(set)
+    for d in dates:
+        for fn in os.listdir(os.path.join(out_root, d)):
+            if fn.endswith('.json'):
+                by_code[fn[:-5]].add(d)
+
+    complete = set()
+    for code, ds in by_code.items():
+        lo, hi = didx[min(ds)], didx[max(ds)]
+        span = hi - lo + 1
+        if span >= min_span and len(ds) / span >= min_ratio:
+            complete.add(code)
+    return complete, set(by_code)
+
+
 def save_by_day(code, name, rows, out_root=OUT_ROOT, keep_days=None):
     """캔들(최신→과거)을 날짜별로 분리해 저장. 반환: 저장된 날짜 수"""
     by_day = defaultdict(list)
@@ -222,6 +252,78 @@ def save_by_day(code, name, rows, out_root=OUT_ROOT, keep_days=None):
     return saved
 
 
+def _ask(prompt, choices):
+    """
+    한 글자 선택. 콘솔에서는 배치의 choice 처럼 키 하나만 누르면 넘어간다.
+    (Enter 를 기다리게 하면 창이 멈춘 것처럼 보인다)
+    파이프로 입력이 들어오는 경우에는 한 줄씩 읽는다.
+    """
+    getch = None
+    try:
+        if sys.stdin.isatty():
+            import msvcrt
+            getch = msvcrt.getwch
+    except Exception:
+        getch = None
+
+    while True:
+        print(prompt, end='', flush=True)
+        if getch:
+            ch = getch()
+            if ch == '\x03':
+                raise KeyboardInterrupt
+            ans = ch.strip().upper()
+            print(ans)
+        else:
+            line = sys.stdin.readline()
+            if not line:
+                return None
+            ans = line.strip().upper()
+        if ans in choices:
+            return ans
+        print(f"  {'/'.join(choices)} 중에서 고르세요.")
+
+
+def run_menu(args):
+    """1_Collect_Data.bat 의 대화형 메뉴. 취소하면 False."""
+    line = "=" * 60
+    print(f"{line}\n  분봉 데이터 수집\n{line}\n")
+    print("  [확인] main.py 가 종료되어 있습니까?")
+    print("         키움은 PC당 세션 1개만 허용하고 TR 제한도 계좌 단위라,")
+    print("         실행 중이면 자동매매의 스캔/손절 주문이 밀립니다.\n")
+    if _ask("  main.py 를 종료했습니다. 계속할까요 [Y/N]: ", ('Y', 'N')) != 'Y':
+        return False
+
+    complete, present = coverage(args.out)
+    print(f"\n{line}\n  수집 범위 선택\n{line}")
+    print(f"  현재: 매일치 완료 {len(complete)}종목 / 녹화로 일부만 {len(present - complete)}종목\n")
+    print("  [1] 확장 수집 - 매일치가 없는 코스닥 종목을 추가로 받음  [권장]")
+    print("      실전 녹화로 며칠치만 있는 급등주를 먼저 채우고, 그다음 새 종목.")
+    print("      완료된 종목은 건너뛰므로 여러 번 돌리면 계속 늘어납니다.")
+    print("      중간에 끊겨도 다시 [1]을 고르면 이어서 받습니다.\n")
+    print("  [2] 빠른 수집 - 조건검색식 종목만, 약 20분")
+    print("      오늘 급등주만. 종목이 적어 표본은 부족합니다.\n")
+    print("  [3] 다시 받기 - 코스닥 앞쪽부터 지정 개수, 기존 파일 덮어씀")
+    print("      데이터가 망가졌을 때만 사용하세요.\n")
+    sel = _ask("  선택 [1/2/3]: ", ('1', '2', '3'))
+    if sel is None:
+        return False
+
+    if sel == '2':
+        args.market = None
+        print("\n[빠른 수집] 조건검색식 종목")
+    else:
+        args.market = 'kosdaq'
+        args.pages = 12
+        args.skip_existing = (sel == '1')
+        args.ask_limit = True
+        print(f"\n[{'확장 수집' if sel == '1' else '다시 받기'}] 코스닥 / 종목당 12페이지 = 약 83영업일")
+        if sel == '3':
+            print("  * 기존 파일을 덮어씁니다.")
+    print("  * 중간에 끊어도 그때까지 모은 건 저장됩니다.\n")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description='백테스트용 분봉 수집기')
     ap.add_argument('--codes', help='쉼표구분 종목코드 (예: 405100,318160)')
@@ -234,9 +336,44 @@ def main():
     ap.add_argument('--pages', type=int, default=MAX_PAGES,
                     help=f'종목당 연속조회 페이지 (기본 {MAX_PAGES}, 1페이지=약 7영업일)')
     ap.add_argument('--skip-existing', action='store_true',
-                    help='이미 수집된 종목은 건너뜀 (중단 후 이어받기)')
+                    help='매일치가 갖춰진 종목은 건너뜀 (확장 수집 / 중단 후 이어받기). '
+                         '녹화로 며칠치만 있는 종목을 먼저, 그다음 새 종목 순서로 받는다')
+    ap.add_argument('--ask-limit', action='store_true',
+                    help='로그인 전에 이번에 받을 종목 수를 물어본다')
+    ap.add_argument('--menu', action='store_true',
+                    help='대화형 메뉴 (1_Collect_Data.bat 용)')
     args = ap.parse_args()
 
+    if args.menu:
+        # 한글 안내/입력을 배치 파일에 두면 UTF-8 배치의 cmd 버그로
+        # 줄이 중간부터 명령으로 실행된다. 메뉴는 파이썬에서 처리한다.
+        if not run_menu(args):
+            print("\n취소했습니다.")
+            return
+
+    if args.ask_limit:
+        # 배치 파일의 set /p 는 UTF-8 한글 줄과 섞이면 cmd 가 줄을 잘못 읽는다.
+        # 입력은 파이썬에서 받는다.
+        default = args.limit or 200
+        per_stock_sec = args.pages * TR_DELAY_SEC + 2
+        while True:
+            try:
+                raw = input(f"  이번에 받을 종목 수 (숫자 입력 후 Enter, 그냥 Enter 면 {default}) "
+                            f"[코스닥 전체 약 1600, 시간당 약 {int(3600 // per_stock_sec)}종목]: ").strip()
+            except EOFError:
+                raw = ''
+            if not raw:
+                args.limit = default
+                break
+            if raw.isdigit() and int(raw) > 0:
+                args.limit = int(raw)
+                break
+            print("  [오류] 1 이상의 숫자만 입력하세요.")
+        print(f"  → {args.limit}종목, 최대 약 {args.limit * per_stock_sec / 3600:.1f}시간 "
+              f"(데이터가 짧은 종목은 더 빨리 끝남)\n")
+
+    print("[로그인] 키움 접속 중... 자동로그인이 켜져 있으면 창 없이 바로 접속됩니다.",
+          flush=True)
     app = QApplication(sys.argv)
     col = CandleCollector()
     col.login()
@@ -272,16 +409,18 @@ def main():
         print(f"[수집] 조건검색식 {len(CONDITION_NAMES)}개 → 중복제거 {len(codes)}종목")
 
     if args.skip_existing:
-        have = set()
-        for d in glob_days(args.out):
-            have |= {os.path.splitext(f)[0] for f in os.listdir(d)
-                     if f.endswith('.json')}
+        complete, present = coverage(args.out)
         before = len(codes)
-        codes = [c for c in codes if c not in have]
-        print(f"[수집] 기존 {len(have)}종목 제외 -> {before} -> {len(codes)}종목")
+        # 조건검색에 실제로 걸렸던 급등주(녹화로 일부만 있음)가 검증에 가장 중요하므로 먼저 받는다
+        partial = [c for c in codes if c in present and c not in complete]
+        new = [c for c in codes if c not in present]
+        codes = partial + new
+        print(f"[수집] 대상 {before}종목 중 매일치 완료 {before - len(codes)}종목 제외 "
+              f"→ 남은 {len(codes)}종목 (녹화로 일부만 있음 {len(partial)} + 새 종목 {len(new)})")
 
     if args.limit:
         codes = codes[:args.limit]
+        print(f"[수집] 이번 실행 {len(codes)}종목")
 
     if not codes:
         print("[수집] 대상 종목 없음")
@@ -315,7 +454,10 @@ def main():
         time.sleep(TR_DELAY_SEC)
 
     print(f"\n[완료] 종목-일 {total_days}건 저장 → {args.out}/")
-    print(f"[다음] python backtest.py --data {args.out}")
+    if args.skip_existing:
+        complete, present = coverage(args.out)
+        print(f"[현황] 매일치 완료 {len(complete)}종목 / 녹화로 일부만 {len(present - complete)}종목")
+    print("[다음] 2_Run_Analysis.bat 또는 4_Entry_Research.bat 을 실행하세요")
 
 
 if __name__ == '__main__':

@@ -196,6 +196,16 @@ class KiwoomAPI(QAxWidget):
         # code -> { vol_ratio, trend, breakout, candle_strength }
         self._entry_signals: dict[str, dict] = {}
 
+        # ===== 장 마감 정리 상태 (force_liquidation_all) =====
+        # closing=True 동안은 사유가 CLOSE_ 로 시작하는 정리 주문만 허용
+        self.closing = False
+        self._close_phase = None          # "CANCEL" → "VERIFY" → "DONE"
+        self._close_started_ts = 0.0
+        self._close_waiting = None        # (tr_code, seq) 응답 대기 중인 TR
+        self._close_wait_seq = 0
+        self._close_failed: set[str] = set()         # 정리 매도 3회 실패 종목
+        self._close_resting_sells: set[str] = set()  # 재확인 시 체결 대기 중인 정리 매도
+
     # ==================================================
     # Login / condition
     # ==================================================
@@ -361,6 +371,9 @@ class KiwoomAPI(QAxWidget):
     # Scan control
     # ==================================================
     def _scan_next(self):
+        if self.closing:
+            self._scan_running = False    # 장 마감 정리 중 → 스캔 중단
+            return
         active_slots = len(self.positions) + self._count_pending_buys()
         if active_slots >= MAX_POSITIONS:
             self._scan_running = False
@@ -443,6 +456,14 @@ class KiwoomAPI(QAxWidget):
                          "RQ_CANDLE", "OPT10080", 0, screen)
 
     def _on_receive_tr_data(self, screen_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
+        # ── 장 마감 정리 TR 분기 (스캔 TR과 무관하게 처리) ──
+        if rq_name == "RQ_CLOSE_ORDERS" and str(tr_code).upper() == "OPT10075":
+            self._on_close_open_orders_tr(rq_name, tr_code, prev_next)
+            return
+        if rq_name == "RQ_CLOSE_HOLDINGS" and str(tr_code).upper() == "OPW00018":
+            self._on_close_holdings_tr(rq_name, tr_code, prev_next)
+            return
+
         # ── OPW00018 잔고조회 분기 (스캔 TR과 무관하게 처리) ──
         if rq_name == "RQ_HOLDINGS" and tr_code == "OPW00018":
             self._on_receive_holdings_tr(rq_name, tr_code)
@@ -774,6 +795,20 @@ class KiwoomAPI(QAxWidget):
 
         # ⭐ CANCEL_DONE 처리는 qty=0이어도 실행해야 함 (취소 chejan은 체결수량=0)
         if "취소" in order_gubun or "취소" in status:
+            # 장 마감 정리 중의 취소는 재매수/재매도를 걸지 않는다.
+            # (아래 일반 경로는 BUY 취소 시 _reentry_buy 를 예약함)
+            # 정리 매도(CLOSE_)의 pending 은 체결 추적용이므로 남긴다.
+            if self.closing:
+                pend = self.pending_orders.get(code)
+                if pend and not str(pend.get("reason", "")).startswith("CLOSE_"):
+                    self.pending_orders.pop(code, None)
+                self.ordering = bool(self.pending_orders)
+                self.last_order_ts = None
+                self.log_trade.info(
+                    f"[CLOSE_CANCEL_DONE] {self.cn(code)} 구분={order_gubun.strip()} 상태={status}"
+                )
+                return
+
             pend = self.pending_orders.get(code)
             if pend and pend.get("side") == "BUY":
                 retries = pend.get("reentry_retries", 0)
@@ -1196,7 +1231,8 @@ class KiwoomAPI(QAxWidget):
         if not hasattr(self, '_last_zombie_check_ts'):
             self._last_zombie_check_ts = 0.0
         _tick_now = pytime.time()
-        if _tick_now - self._last_zombie_check_ts >= _ZOMBIE_INTERVAL:
+        # 장 마감 정리 중에는 정리 로직이 매도를 전담 (pending 을 지우면 체결 추적이 깨짐)
+        if not self.closing and _tick_now - self._last_zombie_check_ts >= _ZOMBIE_INTERVAL:
             self._last_zombie_check_ts = _tick_now
             for _zcode, _zpos in list(self.positions.items()):
                 if _zpos.remain_qty <= 0:
@@ -2069,7 +2105,17 @@ class KiwoomAPI(QAxWidget):
                 f"[ORDER_ABORT] 방향={side} {self.cn(code)} 수량={qty} 사유={reason}"
             )            
             return False
-        
+
+        # 장 마감 정리 중에는 정리 주문(CLOSE_)만 허용.
+        # 실시간 손절/좀비복구/재시도 타이머가 끼어들면 매도가능수량 부족([800033])이나
+        # 중복 매도가 난다.
+        if self.closing and not str(reason).startswith("CLOSE_"):
+            self.log_trade.warning(
+                f"[CLOSE_ORDER_BLOCK] 방향={side} {self.cn(code)} 수량={qty} "
+                f"사유={reason} - 장 마감 정리 중"
+            )
+            return False
+
         now = pytime.time()
 
         # ⭐ SELL 주문 시 보유수량 체크 (중복 매도 방어)
@@ -3077,85 +3123,451 @@ class KiwoomAPI(QAxWidget):
                 )
 
     # ==================================================
-    # 14:50 강제 전량 청산
-    # ==================================================                    
+    # 장 마감 정리 (강제청산 시각에 main.py 가 호출)
+    # ==================================================
     def force_liquidation_all(self):
         """
-        14:50 강제 전량 청산
+        장 마감 정리. 프로그램 메모리가 아니라 증권사 기준으로 정리한다.
 
-        ⭐ FIX LS네트웍스 버그:
-          기존: pos.selling=True이면 스킵 → SELL_STUCK 후 selling이 True로 남은
-                좀비 포지션이 강제청산에서도 제외되어 미청산으로 하루 마감
-          수정: selling=True여도 last_sell_attempt_ts 기준으로 일정 시간(30초) 이상
-                경과했으면 강제청산 대상에 포함. selling 강제 리셋 후 재시도.
+        [배경: KRX 애프터마켓 팝업 / 잔고 이월]
+          정규장 미체결 주문이 남은 채 애프터마켓으로 넘어가면 키움이
+          "[KRX 애프터마켓 주문 안내]" 팝업을 띄운다. 기존 강제청산은
+          프로그램이 기억하는 포지션에만 매도를 내서 아래가 남았다.
+            - FORCE_ABANDON / CANCEL_ZOMBIE 가 pending 만 지우고,
+              증권사에는 살아 있는 주문
+            - 그 주문이 뒤늦게 체결돼 생긴, 프로그램이 모르는 잔고 (CHEJAN_SKIP)
+            - 연속 매도가 0.2초 스로틀에 걸려 실패 → 포지션을 목록에서 삭제
+          260910 DMS 125주가 다음 날로 이월된 사례.
+
+        [순서]
+          1) closing=True → 사유가 CLOSE_ 로 시작하는 정리 주문만 허용, 스캔 중단
+          2) OPT10075 미체결 전량 조회 → 매수/매도 모두 취소
+          3) OPW00018 실제 잔고 조회 → 메모리 포지션 대조 → 매매가능수량 전량 시장가 매도
+          4) 정규장 종료 전 재확인 (CLOSE_VERIFY_*):
+               미체결 매수는 취소, 정리 매도는 동시호가 체결 대기로 두고,
+               남은 매매가능수량은 재매도
         """
-        self.log_system.warning("[FORCE_LIQUIDATION_START] 강제청산 시작")
-        FORCE_SELLING_TIMEOUT = 60.0  # selling=True여도 60초 경과 시 강제 재시도
+        if self.closing:
+            self.log_system.info("[CLOSE_SKIP] 이미 장 마감 정리 진행 중")
+            return
+        if not is_market_time():
+            self.log_system.warning("[CLOSE_SKIP] 정규장 시간 외 - 정리 주문 불가")
+            return
 
-        for code, pos in list(self.positions.items()):
+        self.closing = True
+        self._close_started_ts = pytime.time()
+        self._close_failed = set()
+        self._scan_running = False
+        self.scan_queue.clear()
 
-            if pos.remain_qty <= 0:
-                continue
+        self.log_system.warning(
+            f"[FORCE_LIQUIDATION_START] 장 마감 정리 시작 "
+            f"포지션={len(self.positions)} pending={len(self.pending_orders)}"
+        )
+        self._close_query_open_orders("CANCEL")
 
-            now_ts = pytime.time()
+    # ── 정리용 TR 요청 (재시도 + 응답 타임아웃) ─────────────────────────
+    def _close_request_tr(self, rq_name, tr_code, inputs, screen, attempt=1):
+        for key, val in inputs:
+            self.dynamicCall("SetInputValue(QString, QString)", key, val)
+        ret = self.dynamicCall("CommRqData(QString, QString, int, QString)",
+                               rq_name, tr_code, 0, screen)
 
-            # ⭐ selling=True인 좀비 포지션 처리
-            if pos.selling:
-                elapsed = now_ts - pos.last_sell_attempt_ts
-                if elapsed < FORCE_SELLING_TIMEOUT:
-                    # 아직 진행 중인 정상 매도 주문 → 기다림
-                    self.log_system.info(
-                        f"[FORCE_LIQUIDATION_WAIT] {self.cn(code)} "
-                        f"매도진행중 {elapsed:.0f}초 경과 → 스킵"
-                    )
-                    continue
-                else:
-                    # selling=True지만 30초 이상 경과 = 좀비 포지션
-                    self.log_system.warning(
-                        f"[FORCE_LIQUIDATION_ZOMBIE] {self.cn(code)} "
-                        f"selling=True 이나 {elapsed:.0f}초 경과 → 강제 리셋 후 재시도"
-                    )
-                    pos.selling = False
-                    pos.sl_ordered = False  # ⭐ [버그2] 강제청산 허용을 위해 sl_ordered 리셋
-                    self.pending_orders.pop(code, None)  # 스택된 pending 제거
+        if ret == 0:
+            self._close_wait_seq += 1
+            seq = self._close_wait_seq
+            self._close_waiting = (tr_code, seq)
+            self.log_system.info(
+                f"[CLOSE_TR] {tr_code} 요청 phase={self._close_phase}"
+            )
+            QTimer.singleShot(5000, lambda: self._close_tr_timeout(tr_code, seq))
+            return
 
-            self.log_trade.warning(
-                f"[FORCE_SELL] {self.cn(code)} qty={pos.remain_qty}"
+        if attempt < 3:
+            self.log_system.warning(
+                f"[CLOSE_TR_RETRY] {tr_code} ret={ret} {attempt}회차 → 1초 후 재요청"
+            )
+            QTimer.singleShot(
+                1000,
+                lambda: self._close_request_tr(rq_name, tr_code, inputs, screen, attempt + 1)
+            )
+            return
+
+        self.log_system.error(f"[CLOSE_TR_FAIL] {tr_code} ret={ret} 3회 실패")
+        self._close_tr_fallback(tr_code)
+
+    def _close_tr_timeout(self, tr_code, seq):
+        if self._close_waiting != (tr_code, seq):
+            return                         # 이미 응답 받음
+        self._close_waiting = None
+        self.log_system.error(f"[CLOSE_TR_TIMEOUT] {tr_code} 5초 내 응답 없음")
+        self._close_tr_fallback(tr_code)
+
+    def _close_tr_fallback(self, tr_code):
+        """조회가 안 되면 멈추지 말고 다음 단계로 진행한다."""
+        if str(tr_code).upper() == "OPT10075":
+            # 미체결 조회 실패 → 취소는 못 해도 잔고 기준 매도는 시도
+            self._close_resting_sells = set()
+            self._close_query_holdings()
+        elif self._close_phase == "CANCEL":
+            # 잔고 조회 실패 → 메모리 포지션 기준으로라도 매도
+            self.log_system.error("[CLOSE_FALLBACK] 잔고 조회 실패 → 메모리 포지션 기준 매도")
+            sells = [(c, p.remain_qty) for c, p in self.positions.items() if p.remain_qty > 0]
+            self._close_send_sells(sells)
+        elif self._close_phase == "VERIFY":
+            # 이미 한 번 매도를 냈으므로 메모리 기준 재매도는 중복 위험 → 재확인 종료
+            self.log_system.error("[CLOSE_FALLBACK] 재확인 잔고 조회 실패 → 재매도 생략")
+            self._close_finish()
+        else:
+            self._close_phase = "DONE"
+            self.log_system.error(
+                "[CLOSE_REPORT_FAIL] 최종 잔고 조회 실패 - HTS 에서 잔고를 직접 확인하세요"
             )
 
-            # ── 디스코드 강제청산 알림 ──
+    # ── 1) 미체결 조회 → 취소 ───────────────────────────────────────────
+    def _close_query_open_orders(self, phase):
+        self._close_phase = phase
+        self._close_request_tr(
+            "RQ_CLOSE_ORDERS", "OPT10075",
+            [
+                ("계좌번호", self.get_account()),
+                ("전체종목구분", "0"),     # 0: 전체
+                ("매매구분", "0"),         # 0: 전체
+                ("종목코드", ""),
+                ("체결구분", "1"),         # 1: 미체결
+            ],
+            "9510",
+        )
+
+    def _on_close_open_orders_tr(self, rq_name, tr_code, prev_next):
+        self._close_waiting = None
+        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name)
+
+        orders = []
+        for i in range(rows):
+            def _g(field, idx=i):
+                return str(self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, rq_name, idx, field
+                )).strip()
+
             try:
-                from discord_notify import notify_force_liquidation
-                notify_force_liquidation(
-                    code=code,
-                    name=self.get_stock_name(code),
-                    qty=pos.remain_qty,
-                    entry_price=pos.entry_price
-                )
-            except Exception as e:
-                import traceback
-                self.log_system.error(
-                    f"[DISCORD_FAIL] 강제청산알림: {e}\n{traceback.format_exc()}"
-                )
+                remain = int(_g("미체결수량").replace(",", "") or 0)
+            except ValueError:
+                continue
+            gubun    = _g("주문구분")
+            order_no = _g("주문번호")
+            code     = _g("종목코드").replace("A", "").strip()
 
+            if remain <= 0 or not order_no or not code or "취소" in gubun:
+                continue
+            if "매수" in gubun:
+                side = "BUY"
+            elif "매도" in gubun:
+                side = "SELL"
+            else:
+                continue
+            orders.append({"code": code, "order_no": order_no, "side": side,
+                           "qty": remain, "gubun": gubun})
 
-            # 시장가 전량 매도
-            ok = self.send_market_order(
-                "SELL",
-                code,
-                pos.remain_qty,
-                "FORCE_LIQUIDATION"
+        if str(prev_next) == "2":
+            self.log_system.warning(
+                "[CLOSE_ORDERS_MORE] 미체결이 한 페이지를 넘음 - 나머지는 재확인 단계에서 처리"
             )
 
-            if ok:
-                pos.selling = True
-            else:
-                # ⭐ FIX 덕양에너젠/액스비스 버그: ret=-300 등 강제청산 실패 시
-                # 특수코드(5자리 00010 등)나 종목 이상으로 주문 거절될 수 있음
-                # → positions에서 직접 제거하여 좀비 포지션 방지
-                self.log_system.error(
-                    f"[FORCE_LIQUIDATION_FAIL] {self.cn(code)} 강제청산 주문 실패 "
-                    f"→ 포지션 강제 제거 (실제 잔고 확인 필요)"
+        self.log_system.warning(
+            f"[CLOSE_ORDERS] phase={self._close_phase} 미체결 {len(orders)}건 "
+            f"{[(self.cn(o['code']), o['side'], o['qty']) for o in orders]}"
+        )
+
+        if self._close_phase == "CANCEL":
+            targets = orders
+            self._close_resting_sells = set()
+        else:
+            # 재확인 단계의 매도 미체결 = 정리 매도(동시호가 체결 대기). 취소하지 않는다.
+            targets = [o for o in orders if o["side"] == "BUY"]
+            waiting = [o for o in orders if o["side"] == "SELL"]
+            self._close_resting_sells = {o["code"] for o in waiting}
+            if waiting:
+                self.log_system.info(
+                    f"[CLOSE_VERIFY_SELL_WAIT] 매도 {len(waiting)}건 체결 대기 "
+                    f"{[(self.cn(o['code']), o['qty']) for o in waiting]}"
+                )
+
+        self._close_send_cancels(targets)
+
+    def _close_send_cancels(self, orders, idx=0):
+        from config import CLOSE_ORDER_GAP_MS, CLOSE_CANCEL_SETTLE_SEC
+
+        if idx >= len(orders):
+            # 취소 통보(Chejan)가 들어올 시간을 준 뒤 잔고 조회
+            settle_ms = CLOSE_CANCEL_SETTLE_SEC * 1000 if orders else 0
+            QTimer.singleShot(settle_ms, self._close_query_holdings)
+            return
+
+        o = orders[idx]
+        ret = self.dynamicCall(
+            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+            [
+                "CLOSE_CANCEL",
+                self._next_order_screen("93"),
+                self.get_account(),
+                3 if o["side"] == "BUY" else 4,   # 3: 매수취소 / 4: 매도취소
+                o["code"],
+                o["qty"],                           # 미체결수량 전량
+                0,
+                "00",
+                o["order_no"],
+            ]
+        )
+        if ret == 0:
+            self.log_trade.warning(
+                f"[CLOSE_CANCEL_SEND] {self.cn(o['code'])} {o['gubun']} "
+                f"원주문번호={o['order_no']} 미체결={o['qty']}주"
+            )
+        else:
+            self.log_trade.error(
+                f"[CLOSE_CANCEL_FAIL] {self.cn(o['code'])} {o['gubun']} "
+                f"원주문번호={o['order_no']} ret={ret}"
+            )
+
+        QTimer.singleShot(CLOSE_ORDER_GAP_MS,
+                          lambda: self._close_send_cancels(orders, idx + 1))
+
+    # ── 2) 실제 잔고 조회 → 대조 → 매도 ────────────────────────────────
+    def _close_query_holdings(self):
+        self._close_request_tr(
+            "RQ_CLOSE_HOLDINGS", "OPW00018",
+            [
+                ("계좌번호", self.get_account()),
+                ("비밀번호", ""),
+                ("비밀번호입력매체구분", "00"),
+                ("조회구분", "1"),
+            ],
+            "9511",
+        )
+
+    def _on_close_holdings_tr(self, rq_name, tr_code, prev_next):
+        self._close_waiting = None
+        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name)
+
+        def _int(s):
+            try:
+                return int(str(s).replace(",", "").strip() or 0)
+            except ValueError:
+                return 0
+
+        holdings = {}
+        for i in range(rows):
+            def _g(field, idx=i):
+                return str(self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, rq_name, idx, field
+                )).strip()
+
+            code = _g("종목번호").replace("A", "").strip()
+            hold = _int(_g("보유수량"))
+            if not code or hold <= 0:
+                continue
+            holdings[code] = {
+                "hold": hold,
+                "sellable": _int(_g("매매가능수량")),
+                "price": _int(_g("매입가")),
+            }
+
+        if str(prev_next) == "2":
+            self.log_system.warning(
+                "[CLOSE_HOLDINGS_MORE] 잔고가 한 페이지를 넘음 - 나머지는 재확인 단계에서 처리"
+            )
+
+        self.log_system.warning(
+            f"[CLOSE_HOLDINGS] phase={self._close_phase} 실제잔고 {len(holdings)}종목 "
+            f"{[(self.cn(c), h['hold'], h['sellable']) for c, h in holdings.items()]}"
+        )
+
+        # 증권사에 없는 포지션 = 이미 청산됨 → 메모리 정리
+        for code in list(self.positions):
+            if code not in holdings:
+                self.log_system.warning(
+                    f"[CLOSE_RECONCILE_GONE] {self.cn(code)} 실제 잔고 없음 → 포지션 제거"
                 )
                 self.positions.pop(code, None)
                 self.pending_orders.pop(code, None)
+
+        # 정규장 종료 후 최종 보고: 주문은 못 내므로 결과만 남긴다
+        if self._close_phase == "REPORT":
+            self._close_phase = "DONE"
+            if not holdings:
+                self.log_system.warning("[CLOSE_REPORT_OK] 정규장 종료 후 실제 잔고 없음 - 이월 없음")
+                return
+            msg = (f"정규장 종료 후에도 실제 잔고 {len(holdings)}종목이 남았습니다 "
+                   f"{[(self.cn(c), h['hold']) for c, h in holdings.items()]}. "
+                   f"다음 거래일 09:00 전일잔고 청산 대상입니다.")
+            self.log_system.error(f"[CLOSE_REPORT_LEFTOVER] {msg}")
+            try:
+                from discord_notify import notify_system
+                notify_system(msg, level="CRITICAL")
+            except Exception as e:
+                self.log_system.error(f"[DISCORD_FAIL] 장마감잔고알림: {e}")
+            return
+
+        sells = []
+        for code, h in holdings.items():
+            pos = self.positions.get(code)
+            if pos is None:
+                # 프로그램이 모르던 잔고 (뒤늦은 체결, 수동 주문, 재시작 등)
+                pos = PositionState(
+                    code=code, entry_price=h["price"], highest_price=h["price"],
+                    total_qty=h["hold"], remain_qty=h["hold"],
+                    ordering=False, selling=False,
+                )
+                pos.buy_done = True
+                pos.entry_ts = pytime.time()
+                pos.last_sell_attempt_ts = pytime.time()
+                self.positions[code] = pos
+                self.log_system.warning(
+                    f"[CLOSE_RECONCILE_UNKNOWN] {self.cn(code)} 프로그램이 모르던 잔고 "
+                    f"{h['hold']}주 → 정리 대상 추가"
+                )
+            elif pos.remain_qty != h["hold"]:
+                self.log_system.warning(
+                    f"[CLOSE_RECONCILE_QTY] {self.cn(code)} "
+                    f"메모리={pos.remain_qty}주 → 실제={h['hold']}주로 보정"
+                )
+                pos.remain_qty = h["hold"]
+                pos.total_qty = max(pos.total_qty, h["hold"])
+
+            if h["sellable"] > 0:
+                sells.append((code, h["sellable"]))
+            elif code in self._close_resting_sells:
+                self.log_system.info(
+                    f"[CLOSE_SELL_WAIT] {self.cn(code)} 매매가능수량 0 "
+                    f"(보유 {h['hold']}주는 걸려 있는 매도 주문의 체결 대기)"
+                )
+            else:
+                # 걸린 매도가 없는데 매매가능 0 = 취소 반영 지연이거나 필드 누락.
+                # 보유수량으로 낸다. 아직 잠겨 있으면 [800033] 재시도 경로가 처리한다.
+                self.log_system.warning(
+                    f"[CLOSE_SELLABLE_ZERO] {self.cn(code)} 매매가능 0, 걸린 매도 없음 "
+                    f"→ 보유수량 {h['hold']}주로 매도"
+                )
+                sells.append((code, h["hold"]))
+
+        self._close_send_sells(sells)
+
+    def _close_send_sells(self, sells, idx=0, attempt=1):
+        from config import CLOSE_ORDER_GAP_MS
+
+        if idx >= len(sells):
+            self._close_after_sells()
+            return
+
+        code, qty = sells[idx]
+        pos = self.positions.get(code)
+        reason = ("CLOSE_FORCE_LIQUIDATION" if self._close_phase == "CANCEL"
+                  else "CLOSE_FORCE_LIQUIDATION_RETRY")
+
+        ok = False
+        if pos and pos.remain_qty > 0:
+            # 이전 주문은 1)에서 취소했으므로 상태를 비우고 새로 낸다
+            pos.selling = False
+            pos.sl_ordered = False
+            prev = self.pending_orders.get(code)
+            if prev and not str(prev.get("reason", "")).startswith("CLOSE_"):
+                self.pending_orders.pop(code, None)
+            ok = self.send_market_order("SELL", code, qty, reason)
+
+        if ok:
+            self._close_failed.discard(code)
+            pos.selling = True
+            pos.sl_ordered = True
+            pos.last_sell_attempt_ts = pytime.time()
+            self.log_trade.warning(
+                f"[FORCE_LIQUIDATION] {self.cn(code)} qty={qty} phase={self._close_phase}"
+            )
+            if self._close_phase == "CANCEL":
+                try:
+                    from discord_notify import notify_force_liquidation
+                    notify_force_liquidation(
+                        code=code, name=self.get_stock_name(code),
+                        qty=qty, entry_price=pos.entry_price,
+                    )
+                except Exception as e:
+                    import traceback
+                    self.log_system.error(
+                        f"[DISCORD_FAIL] 강제청산알림: {e}\n{traceback.format_exc()}"
+                    )
+        elif pos and attempt < 3:
+            self.log_system.warning(
+                f"[CLOSE_SELL_RETRY] {self.cn(code)} 매도 실패 {attempt}회차 → 1초 후 재시도"
+            )
+            QTimer.singleShot(1000, lambda: self._close_send_sells(sells, idx, attempt + 1))
+            return
+        elif pos:
+            # 기존 코드는 여기서 포지션을 지워 이월을 숨겼다. 남겨두고 재확인에서 다시 판다.
+            self._close_failed.add(code)
+            self.log_system.error(
+                f"[CLOSE_SELL_FAIL] {self.cn(code)} 매도 3회 실패 - 포지션 유지, 재확인 단계에서 재시도"
+            )
+
+        QTimer.singleShot(CLOSE_ORDER_GAP_MS,
+                          lambda: self._close_send_sells(sells, idx + 1))
+
+    # ── 3) 재확인 예약 / 종료 ─────────────────────────────────────────
+    def _close_after_sells(self):
+        if self._close_phase != "CANCEL":
+            self._close_finish()
+            return
+
+        from config import CLOSE_VERIFY_DELAY_SEC, CLOSE_VERIFY_LATEST
+
+        now = datetime.now()
+        hh, mm = map(int, CLOSE_VERIFY_LATEST.split(":"))
+        latest = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        target = datetime.fromtimestamp(self._close_started_ts + CLOSE_VERIFY_DELAY_SEC)
+        target = min(target, latest)
+
+        if now >= latest:
+            self.log_system.warning(
+                f"[CLOSE_VERIFY_SKIP] 이미 {CLOSE_VERIFY_LATEST} 이후 - 재확인 생략"
+            )
+            self._close_finish()
+            return
+
+        delay_ms = max(30_000, int((target - now).total_seconds() * 1000))
+        fire_at = datetime.fromtimestamp(now.timestamp() + delay_ms / 1000)
+        self.log_system.info(f"[CLOSE_VERIFY_SCHEDULED] {fire_at:%H:%M:%S} 재확인")
+        QTimer.singleShot(delay_ms, lambda: self._close_query_open_orders("VERIFY"))
+
+    def _close_finish(self):
+        """재확인 단계 종료. 매도 실패만 경보하고, 체결 대기는 정규장 종료 후 보고로 넘긴다."""
+        from config import CLOSE_REPORT_AT
+
+        waiting = [c for c, p in self.positions.items()
+                   if p.remain_qty > 0 and c not in self._close_failed]
+        if self._close_failed:
+            msg = (f"장 마감 정리 매도 실패 {len(self._close_failed)}종목 "
+                   f"{[self.cn(c) for c in self._close_failed]} - HTS 에서 직접 확인하세요")
+            self.log_system.error(f"[CLOSE_SELL_FAIL_SUMMARY] {msg}")
+            try:
+                from discord_notify import notify_system
+                notify_system(msg, level="CRITICAL")
+            except Exception as e:
+                self.log_system.error(f"[DISCORD_FAIL] 장마감정리알림: {e}")
+        self.log_system.warning(
+            f"[CLOSE_VERIFY_DONE] 체결 대기 {len(waiting)}종목 "
+            f"{[self.cn(c) for c in waiting]} 매도실패 {len(self._close_failed)}종목"
+        )
+
+        # 동시호가 체결(정규장 종료) 이후 실제 잔고로 최종 보고
+        now = datetime.now()
+        hh, mm = map(int, CLOSE_REPORT_AT.split(":"))
+        report_at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        delay_ms = max(0, int((report_at - now).total_seconds() * 1000))
+        self._close_phase = "REPORT_WAIT"
+        self.log_system.info(f"[CLOSE_REPORT_SCHEDULED] {max(now, report_at):%H:%M:%S} 최종 잔고 보고")
+
+        def _report():
+            self._close_phase = "REPORT"
+            self._close_query_holdings()
+        QTimer.singleShot(delay_ms, _report)

@@ -67,7 +67,7 @@ CONDITION_INTERVAL_MIN = 5  # 조건검색 갱신 주기(분)
 
 # ===== 조건검색식 =====
 # CONDITION_NAME: 단일 fallback (CONDITION_NAMES가 비어 있을 때 사용)
-CONDITION_NAME = "분봉급등주"
+CONDITION_NAME = "CHUSAE_INDICATE"
 
 # CONDITION_NAMES: 라운드로빈으로 순환할 조건검색식 목록
 # - 매 주기(CONDITION_INTERVAL_MIN)마다 목록에서 하나씩 순서대로 호출
@@ -109,6 +109,9 @@ BT_COND_VOL_RATIO_MIN  = 3.0           # 직전 5봉 평균 대비 거래량 배
 BT_COND_TURNOVER_MIN   = 300000000     # 당일 누적 거래대금 하한 (원, 3억)
 BT_COND_HOLD_BARS      = 20            # 편입 후 후보로 유지되는 봉 수
 BT_COND_DELAY_BARS     = 0             # 편입~스캔 도달 지연(봉)
+BT_PREPEND_PREV_DAY    = True          # 전날 봉을 앞에 붙여 09:00부터 판정 (라이브 OPT10080 과 동일)
+                                       #   False 면 하루치만 → 09:00~10:45 진입이 백테스트에서 빠짐
+BT_COST_PROFILE        = "real"        # "real" = 실계좌 수수료+거래세 / "mock" = 키움 모의투자 수수료(왕복 약 0.9%)
                                        #   0 = 즉시 (실시간 조건검색 기준)
                                        #   1 = CONDITION_INTERVAL_MIN 라운드로빈 지연 근사
 
@@ -144,6 +147,19 @@ SELL_PENDING_TIMEOUT_SEC = 15  # SELL 미체결 판정 타임아웃 (기존 30�
 # ===== 강제청산 시각 =====
 FORCE_LIQUIDATION_HOUR = 15
 FORCE_LIQUIDATION_MIN  = 20
+
+# ===== 장 마감 정리 (강제청산 시각에 실행) =====
+# 프로그램 메모리가 아니라 증권사 기준으로 정리한다.
+#   1) 미체결 주문 전량 취소 (OPT10075)
+#   2) 실제 잔고 조회 후 매매가능수량 전량 시장가 매도 (OPW00018)
+#   3) 정규장 종료 전 재확인: 미체결 매수 취소, 남은 매매가능수량 재매도
+# 정규장 미체결이 남으면 애프터마켓 전환 시 키움이
+# "[KRX 애프터마켓 주문 안내]" 팝업을 띄우고, 잔고는 다음 날로 이월된다.
+CLOSE_CANCEL_SETTLE_SEC = 4        # 취소 발송 후 잔고 조회까지 대기 (취소 통보 수신 여유)
+CLOSE_ORDER_GAP_MS      = 300      # 취소/매도 주문 간격 (초당 5회 제한, SELL 스로틀 0.2초)
+CLOSE_VERIFY_DELAY_SEC  = 360      # 정리 시작 후 재확인까지 대기 (15:20 시작이면 15:26)
+CLOSE_VERIFY_LATEST     = "15:28"  # 재확인은 늦어도 이 시각까지 (15:30 정규장 종료 전)
+CLOSE_REPORT_AT         = "15:31"  # 동시호가 체결 후 실제 잔고 최종 보고 (남으면 디스코드 경보)
 
 # 신규 진입 하드컷: 강제청산 N분 전부터 모든 전략 진입 차단
 # 예: FORCE_LIQUIDATION=15:20, ENTRY_CUTOFF_MIN_BEFORE=15 → 15:05 이후 진입 차단

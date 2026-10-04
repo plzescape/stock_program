@@ -352,63 +352,142 @@ def simulate_exit(bars, entry_idx, entry_price, atr, pessimistic=True):
     return close_out(bars[-1]['c'], 'EOD', len(bars) - 1)
 
 
+# ─── 거래 비용 프로필 ────────────────────────────────────────────────────────
+MOCK_FEE_ROUND_TRIP_PCT = 0.901   # 키움 모의투자 (매수+매도 금액 × 0.4505%, generate_report 기준)
+
+
+def cost_pct():
+    """
+    왕복 비용(%) = 수수료 + 세금 + 매도측 슬리피지.
+    매수측 슬리피지는 체결가(entry×(1+SLIPPAGE))에 이미 반영된다.
+    config.BT_COST_PROFILE: "real" = 실계좌 / "mock" = 키움 모의투자 수수료
+    """
+    if getattr(config, 'BT_COST_PROFILE', 'real') == 'mock':
+        return MOCK_FEE_ROUND_TRIP_PCT + SLIPPAGE_PCT * 100
+    return (FEE_BUY_PCT + FEE_SELL_PCT + TAX_SELL_PCT + SLIPPAGE_PCT) * 100
+
+
 # ─── 백테스트 실행 ───────────────────────────────────────────────────────────
-def run_backtest(dataset, pessimistic=True, verbose=False):
-    """dataset: [(date, code, name, bars)] → (trades, skip_counts)"""
-    trades = []
-    skips  = defaultdict(int)
+def prev_day_index(dataset):
+    """
+    (date, code) → 직전 거래일의 같은 종목 봉(마지막 WINDOW_BARS 개).
+
+    라이브의 OPT10080 은 날짜 경계 없이 최근 봉을 이어서 준다. 그래서 09:03 에도
+    전날 봉을 포함한 지표로 진입 판정을 한다. 하루치 파일만 보면 첫 WARMUP_BARS
+    (35봉 = 09:00~10:45)를 버리게 되어, 가장 변동이 큰 오전장이 백테스트에서
+    통째로 빠진다.
+    """
+    dates = sorted({d for d, _, _, _ in dataset})
+    prev_of = {d: dates[k - 1] for k, d in enumerate(dates) if k}
+    have = {(d, c): bars for d, c, _, bars in dataset}
+    out = {}
+    for d, c, _, _ in dataset:
+        p = prev_of.get(d)
+        if p and (p, c) in have:
+            out[(d, c)] = have[(p, c)][-WINDOW_BARS:]
+    return out
+
+
+def cost_desc():
+    prof = getattr(config, 'BT_COST_PROFILE', 'real')
+    label = '키움 모의투자 수수료' if prof == 'mock' else '실계좌 수수료+거래세'
+    return f"왕복 {cost_pct():.3f}% ({label}+슬리피지)  진입마감 " \
+           f"{entry_cutoff_minute()//60:02d}:{entry_cutoff_minute()%60:02d}  " \
+           f"전날봉연결 {'ON' if getattr(config, 'BT_PREPEND_PREV_DAY', True) else 'OFF'}"
+
+
+def entry_cutoff_minute():
+    """라이브와 같은 신규 진입 마감 시각(분). 강제청산 N분 전부터 진입 차단."""
+    return (config.FORCE_LIQUIDATION_HOUR * 60 + config.FORCE_LIQUIDATION_MIN
+            - getattr(config, 'ENTRY_CUTOFF_MIN_BEFORE', 0))
+
+
+def find_entries(dataset):
+    """
+    진입 시점만 찾는다. 청산 파라미터(TP/SL/TP1비율/트레일/본절)와 무관하므로
+    청산 파라미터 스윕에서는 한 번 구한 결과를 재사용한다 (run_analysis.py).
+
+    반환: (entries, skip_counts)
+      entries: [{date, code, name, bars, idx, strategy, entry_price, atr}]
+               bars 는 전날 봉을 앞에 붙인 배열, idx 는 신호봉 위치
+    """
+    entries = []
+    skips = defaultdict(int)
+    prev = prev_day_index(dataset) if getattr(config, 'BT_PREPEND_PREV_DAY', True) else {}
+    cutoff = entry_cutoff_minute()
 
     for date, code, name, bars in dataset:
+        pb = prev.get((date, code), [])
+        full = pb + bars if pb else bars
+        off = len(pb)
+
         # 라이브는 조건검색식에 걸린 종목만 스캔한다. 같은 게이트를 씌운다.
+        # (게이트를 먼저 보면 전략 계산을 건너뛸 수 있어 훨씬 빠르다)
         in_uni = condition_universe(bars)
 
-        i = WARMUP_BARS
-        traded = False          # traded_today: 종목당 1회 (라이브와 동일)
-        while i < len(bars) - 2 and not traded:
-            etype = check_entry(bars, i)
+        i = max(WARMUP_BARS, off)
+        while i < len(full) - 2:
+            if not in_uni[i - off]:
+                i += 1
+                continue
+            if bar_minute(full[i + 1]) >= cutoff:
+                break           # 신규 진입 마감 (차단 사유가 아니라 하루의 끝)
+
+            etype = check_entry(full, i)
             if not etype:
                 i += 1
                 continue
 
-            # 신호는 떴지만 그 시점에 조건검색 후보가 아니었다면
-            # 라이브는 이 종목을 아예 보지 못한다 -> 거래 성립 불가.
-            if not in_uni[i]:
-                skips['COND_OUT'] += 1
-                i += 1
-                continue
-
-            entry_price = bars[i + 1]['o']
+            entry_price = full[i + 1]['o']
             if entry_price <= 0:
                 i += 1
                 continue
 
-            ok, why = passes_pre_entry_filters(bars, i, etype, entry_price)
+            ok, why = passes_pre_entry_filters(full, i, etype, entry_price)
             if not ok:
                 skips[why] += 1
                 i += 1
                 continue
 
-            completed = to_strategy_candles(bars, i)
-            atr = calc_atr(completed, config.ATR_PERIOD)
-
-            fill = entry_price * (1 + SLIPPAGE_PCT)
-            r = simulate_exit(bars, i + 1, fill, atr, pessimistic)
-
-            cost_pct = (FEE_BUY_PCT + FEE_SELL_PCT + TAX_SELL_PCT
-                        + SLIPPAGE_PCT) * 100
-            net = r['gross_pct'] - cost_pct
-
-            trades.append({
-                'date': date, 'code': code, 'name': name, 'strategy': etype,
-                'entry_time': bars[i + 1].get('t', ''), 'entry_price': fill,
-                'atr': atr, 'net_pct': net, **r,
+            atr = calc_atr(to_strategy_candles(full, i), config.ATR_PERIOD)
+            entries.append({
+                'date': date, 'code': code, 'name': name, 'bars': full,
+                'idx': i, 'strategy': etype, 'entry_price': entry_price, 'atr': atr,
             })
-            traded = True
-            if verbose:
-                print(f"  {date} {name}({code}) {etype} "
-                      f"{net:+.2f}% [{r['exit_reason']}]")
-        # while
-    return trades, skips
+            break               # traded_today: 종목당 1회 (라이브와 동일)
+    return entries, skips
+
+
+def simulate_entries(entries, pessimistic=True, verbose=False):
+    """find_entries 결과에 현재 청산 설정을 적용해 거래 목록을 만든다."""
+    trades = []
+    cost = cost_pct()
+    for e in entries:
+        bars, i = e['bars'], e['idx']
+        fill = e['entry_price'] * (1 + SLIPPAGE_PCT)
+        r = simulate_exit(bars, i + 1, fill, e['atr'], pessimistic)
+        net = r['gross_pct'] - cost
+        trades.append({
+            'date': e['date'], 'code': e['code'], 'name': e['name'],
+            'strategy': e['strategy'], 'entry_time': bars[i + 1].get('t', ''),
+            'entry_price': fill, 'atr': e['atr'], 'net_pct': net, **r,
+        })
+        if verbose:
+            print(f"  {e['date']} {e['name']}({e['code']}) {e['strategy']} "
+                  f"{net:+.2f}% [{r['exit_reason']}]")
+    return trades
+
+
+def run_backtest(dataset, pessimistic=True, verbose=False, entries=None):
+    """
+    dataset: [(date, code, name, bars)] → (trades, skip_counts)
+    entries: find_entries() 결과를 넘기면 진입 탐색을 건너뛴다.
+    """
+    if entries is None:
+        entries, skips = find_entries(dataset)
+    else:
+        entries, skips = entries
+    return simulate_entries(entries, pessimistic, verbose), skips
 
 
 # ─── 성과 지표 ───────────────────────────────────────────────────────────────
@@ -436,6 +515,8 @@ def metrics(trades):
         'avg_win': statistics.mean(wins) if wins else 0,
         'avg_loss': statistics.mean(loss) if loss else 0,
         'expectancy': statistics.mean(pnl),
+        # 수수료/세금/슬리피지를 빼기 전 가격 손익. 이게 0 이하면 진입에 우위가 없다.
+        'gross_expectancy': statistics.mean([t['gross_pct'] for t in trades]),
         'total': sum(pnl),
         'pf': pf,
         'mdd': mdd,
@@ -472,6 +553,7 @@ def print_report(trades, skips, title='BACKTEST'):
     print(f"  거래수        {m['n']:>8}")
     print(f"  승률          {m['win_rate']:>7.1f}%")
     print(f"  기댓값        {m['expectancy']:>+7.3f}%   <- 거래당 평균 (비용 차감 후)")
+    print(f"  세전 기댓값   {m['gross_expectancy']:>+7.3f}%   <- 비용 차감 전. 0 이하면 진입에 우위 없음")
     print(f"  누적손익      {m['total']:>+7.2f}%")
     print(f"  평균수익      {m['avg_win']:>+7.2f}%")
     print(f"  평균손실      {m['avg_loss']:>+7.2f}%")
@@ -514,6 +596,9 @@ SWEEPS = {
     'daysurge': ('BREAKOUT_DAY_SURGE_MAX', [10.0, 15.0, 20.0, 25.0]),
 }
 
+# 진입 신호에 영향을 주지 않는 청산 파라미터. 진입 탐색 결과를 재사용할 수 있다.
+EXIT_SWEEP_KEYS = {'tp', 'sl', 'tp1ratio', 'trail', 'safe'}
+
 
 def run_sweep(dataset, key, pessimistic=True):
     if key not in SWEEPS:
@@ -521,6 +606,7 @@ def run_sweep(dataset, key, pessimistic=True):
         return
     attr, values = SWEEPS[key]
     original = getattr(config, attr)
+    cached = find_entries(dataset) if key in EXIT_SWEEP_KEYS else None
 
     print(f"\n{'='*66}\n  파라미터 스윕: {attr}\n{'='*66}")
     print(f"  유니버스: {universe_desc()}")
@@ -529,7 +615,7 @@ def run_sweep(dataset, key, pessimistic=True):
     best = None
     for v in values:
         setattr(config, attr, v)
-        trades, _ = run_backtest(dataset, pessimistic)
+        trades, _ = run_backtest(dataset, pessimistic, entries=cached)
         m = metrics(trades)
         if m['n'] == 0:
             print(f"  {v:>16} {0:>6}  {'-':>7} {'-':>9} {'-':>7} {'-':>8}")
@@ -612,10 +698,14 @@ def main():
     ap.add_argument('--no-cond-filter', action='store_true',
                     help='조건검색 유니버스 필터 해제 (candle_data 전 종목 대상). '
                          '실전 유니버스와 어긋나므로 비교용으로만 사용')
+    ap.add_argument('--cost', choices=['real', 'mock'],
+                    help='비용 프로필 (기본: config.BT_COST_PROFILE). mock = 키움 모의투자 수수료')
     args = ap.parse_args()
 
     if args.no_cond_filter:
         config.BT_COND_FILTER_ENABLED = False
+    if args.cost:
+        config.BT_COST_PROFILE = args.cost
 
     if args.selftest:
         sys.exit(0 if selftest() else 1)
@@ -643,8 +733,7 @@ def main():
           f"SL×{config.ATR_SL_MULT}  TP×{config.ATR_TP_MULT}  "
           f"TP1={config.TP1_RATIO}")
     print(f"[유니버스] {universe_desc()}")
-    cost = (FEE_BUY_PCT + FEE_SELL_PCT + TAX_SELL_PCT + SLIPPAGE_PCT) * 100
-    print(f"[비용] 왕복 {cost:.3f}% (수수료+거래세+슬리피지)")
+    print(f"[비용] {cost_desc()}")
 
     pess = not args.optimistic
     if not pess:

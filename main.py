@@ -163,6 +163,10 @@ def schedule_zombie_watchdog(api):
     
     def _watchdog():
         import time as pytime
+        # 장 마감 정리 중에는 정리 로직이 매도를 전담한다.
+        # 여기서 pending 을 지우면 정리 매도의 체결 추적이 깨진다.
+        if getattr(api, "closing", False):
+            return
         ZOMBIE_SEC = 300
         now_ts = pytime.time()
         for code, pos in list(api.positions.items()):

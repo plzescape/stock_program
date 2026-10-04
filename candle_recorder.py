@@ -43,6 +43,21 @@ _dirty = set()       # 저장이 필요한 (date, code)
 _names = {}          # code -> name
 
 
+def _load_existing(day, code):
+    """기존 파일의 봉을 {t: bar} 로 읽는다. 없거나 깨졌으면 빈 dict."""
+    try:
+        path = os.path.join(OUT_ROOT, day, f"{code}.json")
+        if not os.path.exists(path):
+            return {}
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+        if d.get('name') and code not in _names:
+            _names[code] = d['name']
+        return {str(b['t']): b for b in d.get('candles', []) if 't' in b}
+    except Exception:
+        return {}
+
+
 def record(code, name, candles, interval_min):
     """
     candles: parse_candle 결과 (최신->과거, 'time' 키 필요)
@@ -60,7 +75,11 @@ def record(code, name, candles, interval_min):
                     continue
                 day = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
                 key = (day, code)
-                bars = _cache.setdefault(key, {})
+                if key not in _cache:
+                    # 프로그램을 다시 켜면 캐시가 비어 있다. 디스크 파일을 먼저 읽어
+                    # 합치지 않으면, 일괄수집한 하루치 파일을 지금 받은 60봉으로 덮어쓴다.
+                    _cache[key] = _load_existing(day, code)
+                bars = _cache[key]
                 hm = ts[8:12]
                 bar = {'t': hm, 'o': c['open'], 'h': c['high'],
                        'l': c['low'], 'c': c['close'], 'v': c['volume']}

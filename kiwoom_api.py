@@ -66,6 +66,10 @@ class PositionState:
     )
     peak_avg_vol: float = 0.0     # 진입~TP1 구간 최고 평균거래량
     tp1_done_ts: float = 0.0      # TP1 체결 시각 (보호시간용)
+    tp1_order_ts: float = 0.0     # TP1 주문 전송 시각
+                                  #   체결 전에는 tp1_done_ts 가 0이라 경과시간이
+                                  #   999초로 계산돼 본절보호 유예가 통째로 무시됐다
+                                  #   (261021 푸른로보틱스: TP1 주문 9초 뒤 전량 청산)
     tp2_done_ts: float = 0.0      # TP2 체결 시각 (트레일링 구간 보호용)
     entry_type: str = ""          # 진입 전략 타입 (BREAKOUT/PULLBACK/FLAG)
     flag_stop_price: int = 0      # FLAG 전용 손절가 (기준봉 시가, 0이면 미사용)
@@ -724,7 +728,8 @@ class KiwoomAPI(QAxWidget):
                             self._finish_tr(delay=True)
                             return
 
-                self.send_market_order("BUY", code, buy_qty, "ENTRY")
+                self.send_market_order("BUY", code, buy_qty, "ENTRY",
+                                       cur_price=cur_price)
                 # 예산 추적용
                 if code in self.pending_orders:
                     self.pending_orders[code]["est_amount"] = est_amount
@@ -933,21 +938,37 @@ class KiwoomAPI(QAxWidget):
 
             # --------------------------------------------------
             # ✅ 체결수량 처리(중요):
-            #  - 키움 Chejan FID 911 값이 "이번 체결수량"이 아니라
-            #    "누적 체결수량"으로 들어오는 케이스가 있어 remain_qty가 초과될 수 있음.
-            #  - remain_qty가 total_qty를 넘어가면 초과 매도(SELL qty>보유) 시도가 발생해
-            #    매도 체결이 전혀 안 오는 현상이 생김.
-            #  - 아래 로직은 두 케이스(증분/누적)를 모두 안전하게 처리함.
+            #  키움 Chejan FID 911 은 "그 주문의 누적 체결수량"이다.
+            #  매도 경로처럼 pending_orders['filled_qty'] 로 주문별 누적을 추적해
+            #  증분을 구한다.
+            #
+            #  [261021 푸른로보틱스] 기존 코드는 누적합이 주문수량을 넘기 전까지
+            #  증분으로 더해서, 누적 252/300/301 을 853주 체결로 오인했다.
+            #  그 결과 평균매수가를 5,930원으로 인식(실제 5,913원, +0.27%)했고
+            #  손절·익절·본절선이 전부 그 값 기준으로 잡혔다.
+            #  22거래 중 13건에서 최대 0.55% 어긋나 있었다.
             # --------------------------------------------------
-            if pos.remain_qty + qty <= pos.total_qty:
-                # 일반적인 "증분 체결수량" 케이스
-                delta_buy = qty
-                pos.remain_qty += qty
+            prev_filled = int(pend.get("filled_qty", 0))
+            if qty > prev_filled:
+                # 정상: 누적값이 증가 → 증분만 반영
+                delta_buy = qty - prev_filled
+                pend["filled_qty"] = qty
+            elif qty == prev_filled:
+                # 같은 누적값 재통보(중복 이벤트) → 반영하지 않음
+                delta_buy = 0
             else:
-                # "누적 체결수량" 또는 중복 이벤트 가능성 → 누적로 해석해 보정
-                # (현재 remain과 qty 중 큰 값을 누적 체결로 보고 total_qty로 캡)
-                delta_buy = min(pos.total_qty, max(pos.remain_qty, qty)) - pos.remain_qty
-                pos.remain_qty = min(pos.total_qty, max(pos.remain_qty, qty))
+                # 누적이 줄어들 수는 없다. 분할주문/재주문으로 카운터가 리셋된
+                # 경우로 보고 이번 값을 증분으로 취급하되 주문수량을 넘지 않게 캡.
+                delta_buy = min(qty, max(0, pos.total_qty - pos.remain_qty))
+                pend["filled_qty"] = prev_filled + delta_buy
+                self.log_system.warning(
+                    f"[CHEJAN_QTY_RESET] {self.cn(code)} 누적체결 감소 "
+                    f"{prev_filled}→{qty} 증분={delta_buy}"
+                )
+
+            # 주문수량 초과 금지
+            delta_buy = max(0, min(delta_buy, pos.total_qty - pos.remain_qty))
+            pos.remain_qty += delta_buy
 
             # ⭐ 가중평균 매수가 누적 (분할체결 정확한 손익 계산용)
             if delta_buy > 0:
@@ -971,6 +992,34 @@ class KiwoomAPI(QAxWidget):
                 pos.entry_ts = pytime.time()
                 pos.buy_done = True
                 self.log_trade.info(f"[BUY_DONE] {self.cn(code)} 잔여={pos.remain_qty}/{pos.total_qty}주 체결완료")
+
+                # ⭐ 목표/손절 기준가 보정 (260916 제이티)
+                # 손절·익절을 첫 체결가로 잡아두면, 분할체결로 평균단가가 벌어졌을 때
+                # 실제 매입가 기준으로는 손절이 더 가까워지고 익절은 더 멀어진다.
+                # (제이티: 첫체결 5,140 / 평균 5,112 → 0.55% 어긋남)
+                if pos.atr_value > 0 and pos.avg_buy_price > 0:
+                    _base = int(round(pos.avg_buy_price))
+                    _gap = (abs(_base - pos.entry_price) / pos.entry_price
+                            if pos.entry_price else 0)
+                    if _gap >= 0.001:          # 0.1% 이상 어긋날 때만 재설정
+                        _raw_sl = int(_base - pos.atr_value * ATR_SL_MULT)
+                        pos.atr_sl_price = self.adjust_tick_size(
+                            min(max(1, _raw_sl), _base - self.min_tick(_base))
+                        )
+                        pos.atr_tp1_price = self.adjust_tick_size(
+                            int(_base + pos.atr_value * ATR_TP_MULT)
+                        )
+                        if not pos.tp1_done:
+                            pos.atr_tp2_price = pos.atr_tp1_price
+                        pos.atr_safe_price = self.adjust_tick_size(
+                            max(_base, int(_base - pos.atr_value * ATR_SAFE_MULT))
+                        )
+                        self.log_trade.info(
+                            f"[TP_TARGET_REBASE] {self.cn(code)} "
+                            f"첫체결={pos.entry_price} 평균={_base} ({_gap*100:+.2f}%) "
+                            f"→ 손절={pos.atr_sl_price} TP1={pos.atr_tp1_price} "
+                            f"본절={pos.atr_safe_price}"
+                        )
                 
             # =========================
             # TP 목표가 설정 (ATR 기반 - 실시간 데이터에서 트리거)
@@ -1535,6 +1584,7 @@ class KiwoomAPI(QAxWidget):
                 pos.selling  = True
                 pos.tp1_done = True   # ⭐ FIX: 주문 전송 즉시 플래그 세팅 → 중복 발동 방지
                                       # 체결 확인은 CHEJAN에서 filled_qty로 추적
+                pos.tp1_order_ts = now   # 체결 전 유예 계산 기준
             return
 
         # =========================
@@ -1577,8 +1627,14 @@ class KiwoomAPI(QAxWidget):
             # 오늘 분석: 본절보호 9건 중 8건이 TP1→본절 30~434초, 평균 손실 -36,219원
             # 짧은 유예(30초)로는 진입 직후 정상 조정도 모두 청산됨
             # 120초 유예로 TP2 달성 기회 확보
-            _tp1_elapsed = now - pos.tp1_done_ts if pos.tp1_done_ts else 999
-            if _tp1_elapsed < 120:
+            # ⭐ FIX [261021 푸른로보틱스]: 체결 전에는 tp1_done_ts 가 0이라
+            # 999초로 계산돼 유예가 무시됐다. 주문 전송 시각을 기준으로 삼는다.
+            _tp1_ref = pos.tp1_done_ts or pos.tp1_order_ts
+            _tp1_elapsed = (now - _tp1_ref) if _tp1_ref else 0
+            if code in self.pending_orders:
+                # TP1 매도 주문이 아직 떠 있다 → 여기서 또 팔면 보유수량을 넘는다
+                pass
+            elif _tp1_elapsed < 120:
                 pass  # 유예 중 — 발동 보류
             elif self.can_try_sell(pos):
                 self.log_trade.info(
@@ -1629,7 +1685,7 @@ class KiwoomAPI(QAxWidget):
         in_tp1_protect = (
             pos.tp1_done
             and not pos.tp2_done
-            and (now - pos.tp1_done_ts) < TP1_PROTECT_SEC
+            and (now - (pos.tp1_done_ts or pos.tp1_order_ts or now)) < TP1_PROTECT_SEC
         )
         in_tp2_protect = (
             pos.tp2_done
@@ -2080,7 +2136,8 @@ class KiwoomAPI(QAxWidget):
 
         self.log_trade.info(f"[REENTRY_BUY] {self.cn(code)} 재시도={retry_cnt}회차")
 
-        ok = self.send_market_order("BUY", code, qty, f"{reason}_RETRY{retry_cnt}")
+        ok = self.send_market_order("BUY", code, qty, f"{reason}_RETRY{retry_cnt}",
+                                    cur_price=orig_price)
 
         if ok and code in self.pending_orders:
             self.pending_orders[code]["reentry_retries"] = retry_cnt
@@ -2176,8 +2233,25 @@ class KiwoomAPI(QAxWidget):
         # SELL 시장가: 항상 시장가 (TP/Trail 등 빠른 청산)
         # SELL 지정가: STOP_LOSS 시 atr_sl_price 지정가 → 슬리피지 방어
         if side == "BUY":
-            _cur = self.pending_orders.get(code, {}).get("cur_price", 0)
-            if _cur > 0 and _cur < 2000:
+            # ⭐ 진입 슬리피지 상한: 신호가 × (1+ENTRY_MAX_SLIP) 지정가
+            # 기존에는 pending_orders[code] 에서 cur_price 를 읽었는데, 신규 진입
+            # 시점에는 그 항목이 아직 없어서(주문 성공 후 생성) 항상 시장가로 나갔다.
+            # 호출부에서 넘긴 cur_price 를 먼저 본다.
+            try:
+                from config import ENTRY_MAX_SLIP as _max_slip
+            except ImportError:
+                _max_slip = 0.0
+            _cur = int(kwargs.get("cur_price", 0) or
+                       self.pending_orders.get(code, {}).get("cur_price", 0) or 0)
+            if _cur > 0 and _max_slip > 0:
+                _lmt_p  = self.adjust_tick_size(int(_cur * (1 + _max_slip)))
+                _lmt_p  = max(_lmt_p, _cur + self.min_tick(_cur))   # 최소 1틱 여유
+                _ord_tp = "00"                # 지정가
+                self.log_trade.info(
+                    f"[ORDER_LIMIT_CAP] {self.cn(code)} 신호가={_cur} "
+                    f"지정가={_lmt_p}원 (슬리피지 상한 {_max_slip*100:.2f}%)"
+                )
+            elif _cur > 0 and _cur < 2000:
                 _tick   = self.min_tick(_cur)
                 _lmt_p  = _cur + _tick        # 현재가 + 1호가
                 _ord_tp = "00"                # 지정가

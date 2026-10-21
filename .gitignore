@@ -1,5 +1,4 @@
 
-Report_260303/
 
 *.pyc
 
@@ -8,5 +7,9 @@ Report_260303/
 *.log
 
 candle_data/*/*.json
-Report*/*.html
-Report*/*/*.html
+
+# 일별 리포트 (reports/Report_YYMMDD/)
+reports/*/*.html
+reports/*/*.xlsx
+reports/*/*.log
+reports/index.html

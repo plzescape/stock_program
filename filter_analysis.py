@@ -152,7 +152,8 @@ def main():
         logs = [os.path.join(t, 'signal.log') for t in targets]
         logs = [p for p in logs if os.path.exists(p)]
     else:
-        logs = sorted(glob.glob('Report_*/signal.log'))
+        import report_paths
+        logs = report_paths.report_files('signal.log')
         if os.path.exists('logs/signal.log') and os.path.getsize('logs/signal.log') > 0:
             logs.append('logs/signal.log')
 

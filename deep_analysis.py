@@ -62,6 +62,7 @@ def avg_fill(fills):
     return (total_amt / total_qty if total_qty else 0), total_qty
 
 def parse_date(folder_name):
+    folder_name = os.path.basename(os.path.normpath(folder_name))
     m = re.search(r'Report_(\d{2})(\d{2})(\d{2})', folder_name)
     if m:
         yy, mm, dd = m.groups()
@@ -717,22 +718,19 @@ def main():
     base = os.path.dirname(os.path.abspath(__file__))
     out  = sys.argv[1] if len(sys.argv) >= 2 else os.path.join(base, 'deep_analysis.html')
 
-    # Report_* 폴더 자동 수집
-    folders = sorted(
-        d for d in os.listdir(base)
-        if d.startswith('Report_') and os.path.isdir(os.path.join(base, d))
-        and os.path.exists(os.path.join(base, d, 'trade.log'))
-    )
+    # 리포트 폴더 자동 수집 (reports/Report_* + 예전 위치)
+    import report_paths
+    folders = report_paths.report_dirs(base, require='trade.log')
     if not folders:
-        print("[ERROR] Report_* 폴더에 trade.log 가 없습니다.")
+        print(f"[ERROR] {report_paths.REPORT_ROOT}/ 아래 리포트 폴더에 trade.log 가 없습니다.")
         sys.exit(1)
 
     all_trades  = []
     date_labels = []
     for folder in folders:
-        path = os.path.join(base, folder, 'trade.log')
+        path = os.path.join(folder, 'trade.log')
         date_label = parse_date(folder)
-        print(f"  읽는 중: {folder}/trade.log", flush=True)
+        print(f"  읽는 중: {os.path.basename(folder)}/trade.log", flush=True)
         trades = parse_log(path, date_label)
         all_trades.extend(trades)
         done = [t for t in trades if t['exit_reason'] != 'INCOMPLETE']

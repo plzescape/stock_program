@@ -24,6 +24,7 @@ except Exception:
 
 import config
 import backtest
+import report_paths
 import filter_analysis as fa
 
 MIN_TRADES_FOR_APPLY = 100   # 이 미만이면 config 반영 거부
@@ -39,7 +40,7 @@ def hr(title=''):
 
 # ─── 1단계: 필터 병목 ────────────────────────────────────────────────────────
 def step_filters():
-    logs = sorted(glob.glob('Report_*/signal.log'))
+    logs = report_paths.report_files('signal.log')
     if os.path.exists('logs/signal.log') and os.path.getsize('logs/signal.log') > 0:
         logs.append('logs/signal.log')
     if not logs:

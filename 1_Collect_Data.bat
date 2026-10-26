@@ -13,16 +13,16 @@ rem ============================================================
 
 cd /d "%~dp0"
 
-set "PY32=%~dp0.venv\Scripts\python.exe"
-if not exist "%PY32%" goto :novenv
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" goto :novenv
 
-"%PY32%" collect_candles.py --menu
+"%PY%" -X utf8 collect_candles.py --menu
 echo.
 pause
 exit /b 0
 
 :novenv
 echo [ERROR] .venv\Scripts\python.exe not found.
-echo         Kiwoom OpenAPI OCX needs the 32-bit Python virtual env.
+echo         Create the venv and run: pip install -r requirements.txt
 pause
 exit /b 1

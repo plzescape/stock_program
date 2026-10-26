@@ -1,6 +1,6 @@
 import sys
-import qt_bootstrap  # noqa: F401  (PyQt5 보다 먼저 - 한글 경로 대응)
-from PyQt5.QtWidgets import QApplication
+# REST 전환 후 GUI/OCX 가 없으므로 QCoreApplication(이벤트 루프·타이머)만 쓴다
+from PyQt5.QtCore import QCoreApplication
 from kiwoom_api import KiwoomAPI
 from config import IS_REAL
 from PyQt5.QtCore import QTimer
@@ -71,12 +71,12 @@ def enable_hardcut(strategy: str = "ALL", cut_time: str = None) -> None:
 #===== 계좌 테스트 =====
 def test_account(api: KiwoomAPI):
     print("===== 계좌 테스트 =====")
-    raw = api.dynamicCall("GetLoginInfo(QString)", "ACCNO")
-    accounts = [a.strip() for a in raw.split(";") if a.strip()]
-    print("전체 계좌:", accounts)
+    # REST 는 앱키 = 계좌. 서버 주소로 실전/모의를 확인한다.
+    print("접속 서버:", api.rest.base_url)
+    print("웹소켓:", "로그인됨" if api.ws.logged_in else "미접속(재접속 중)")
 
     selected = api.get_account()
-    print("선택된 계좌:", selected)
+    print("설정 계좌(표시용):", selected)
 
     if IS_REAL:
         print("⚠️ 실전 모드")
@@ -120,11 +120,11 @@ def enable_auto_trade(api: KiwoomAPI):
 #===== ⭐ BUG-3: 전일 미청산 잔고 처리 =====
 def recover_and_liquidate_leftover(api: KiwoomAPI):
     """
-    1) OPW00018 잔고조회 TR로 실제 보유 잔고를 positions에 복구
+    1) kt00018 잔고조회 TR로 실제 보유 잔고를 positions에 복구
     2) 조회 완료 콜백으로 liquidate_leftover_positions() 자동 호출
        → 전일 잔고(entry_ts < 오늘 09:00)를 즉시 시장가 청산
     """
-    print("🔍 전일 미청산 잔고 조회 중 (OPW00018)...")
+    print("🔍 전일 미청산 잔고 조회 중 (kt00018)...")
     api.load_holdings_from_api(
         on_done=api.liquidate_leftover_positions
     )
@@ -200,11 +200,16 @@ def schedule_zombie_watchdog(api):
 
 #===== 메인 함수 =====        
 def main():
-    app = QApplication(sys.argv)
-    api = KiwoomAPI()
-
-    # 1) 로그인
-    api.login()
+    app = QCoreApplication(sys.argv)
+    try:
+        api = KiwoomAPI()
+        # 1) 로그인 (접근토큰 발급 + 웹소켓 접속)
+        api.login()
+    except Exception as e:
+        print(f"❌ 키움 REST 로그인 실패: {e}")
+        print("   - kiwoom_keys.json 앱키/시크릿키 (모의/실전 구분) 확인")
+        print("   - openapi.kiwoom.com 에 이 PC 공인 IP 가 등록되어 있는지 확인")
+        sys.exit(1)
 
     # 🔍 계좌 테스트 (월요일 아침에 꼭 한 번 실행)
     test_account(api)
@@ -220,7 +225,7 @@ def main():
         print("🟢 장전 self-check 통과")
 
     # ⭐ BUG-3: 전일 미청산 잔고 자동 청산
-    # - OPW00018 TR로 실제 보유 잔고 조회 → positions 복구 → 전일 잔고 즉시 청산
+    # - kt00018 TR로 실제 보유 잔고 조회 → positions 복구 → 전일 잔고 즉시 청산
     # - 장 시작 전(08:00~08:59) 실행하면 조회만 하고, 장 시작 후(09:00~) 청산 발동
     # - 장 시작 직후 바로 청산되도록 09:00 + 5초 시점에 호출
     now = datetime.now()
@@ -241,7 +246,11 @@ def main():
     # =========================
     schedule_force_liquidation(api)
 
-    sys.exit(app.exec_())
+    try:
+        code = app.exec_()
+    finally:
+        api.ws.stop()
+    sys.exit(code)
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,18 @@ ACCOUNT_NO = ""  # IS_REAL=True일 때만 사용 (예: "12345678")
 # ✅ 모의투자에서 사용할 계좌 (국내주식)
 MOCK_ACCOUNT_NO = "8134106911"
 
+# ===== 키움 REST API =====
+# 앱키/시크릿키는 여기 적지 않는다 (깃에 올라감).
+#   kiwoom_keys.json (kiwoom_keys.example.json 복사) 또는
+#   환경변수 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY 로 설정.
+# REST 는 앱키가 계좌에 묶여 있어서 계좌번호는 표시/점검용으로만 쓴다.
+# openapi.kiwoom.com 에서 이 PC 의 공인 IP 를 등록해야 호출된다.
+KIWOOM_EXCHANGE   = "KRX"   # 주문/잔고 거래소 구분 (모의투자는 KRX 만 지원)
+REST_RATE_PER_SEC = 1.0     # TR(api-id)별 초당 호출 수. 키움 실측 약 1회/초 (429 나면 낮출 것)
+REST_RATE_BURST   = 2       # TR별 순간 최대 연속 호출 수
+REST_TIMEOUT_SEC  = 5.0     # REST 응답 대기 (초)
+WS_SILENCE_RECONNECT_SEC = 180  # 웹소켓이 이 시간 동안 아무것도 안 보내면 재접속
+
 # ===== 매매 수량 =====
 # BUY_MODE 옵션:
 #   "AMOUNT"   → MAX_BUY_AMOUNT 이내로 수량 자동 계산 (1주 > MAX_BUY_AMOUNT이면 스킵)
@@ -76,8 +88,8 @@ CONDITION_NAME = "CHUSAE_INDICATE"
 #   "급등주_주도주"        → BREAKOUT (주도주 돌파)
 #   "급등주_눌림목_검색식"  → PULLBACK (눌림 반등)
 #   "상승_깃발_패턴"       → FLAG     (횡보 수렴 재돌파)
-# - 키움 API 제약: 스크린 하나에 조건식 하나만 실시간 등록 가능
-#   → 조건식 4개를 스크린 9001~9004에 각각 고정 매핑
+# - REST: 웹소켓 CNSRREQ(search_type=1)로 조건식별 실시간 등록.
+#   조건식 이름은 HTS 에 저장된 이름과 정확히 같아야 한다 (seq 는 자동 매핑)
 CONDITION_NAMES = [
     "분봉급등주",
     "CHUSAE_INDICATE",

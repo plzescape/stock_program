@@ -1,12 +1,20 @@
-실행 순서 (모의투자 권장)
-1) 키움 OpenAPI+ 설치/로그인 가능 상태 확인
-2) Python 3.11 32bit + PyQt5 설치
-3) 조건검색식(예: '단타_거래대금_500억')을 HTS에서 만들어둔 뒤,
-   config.py의 CONDITION_NAME/INDEX를 맞춘다
-4) main.py 실행 (08:50에 켜도 됨)
-   - 09:00 이후 조건검색이 수행되고,
-     조건검색 결과 종목을 OPT10080(3분봉)으로 순차 스캔하여 진입 신호가 뜨면 시장가 매수(SendOrder)
-   - 체결은 OnReceiveChejanData로 확정하며, 체결 후 실시간 감시로 손절/익절/트레일링 수행
+실행 순서 (모의투자 권장) — 키움 REST API 버전
+1) openapi.kiwoom.com 에서 REST API 사용 신청
+   - 모의투자 / 실전투자 앱키(appkey)·시크릿키(secretkey)를 각각 발급
+   - 이 PC 의 공인 IP 를 허용 IP 로 등록 (등록 안 하면 토큰 발급부터 거절됨)
+2) kiwoom_keys.example.json 을 kiwoom_keys.json 으로 복사하고 키 입력
+   (kiwoom_keys.json 은 .gitignore 대상 — 절대 커밋하지 말 것)
+   또는 환경변수 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY 사용
+3) Python 3.11+ (32/64비트 무관) 가상환경에서: pip install -r requirements.txt
+   - OCX(OpenAPI+ 설치, 32비트 파이썬, 로그인 창)는 더 이상 필요 없음
+4) 조건검색식을 HTS(영웅문)에서 만들어 저장한 뒤,
+   config.py 의 CONDITION_NAMES 에 같은 이름을 적는다 (seq 는 자동 매핑)
+5) main.py 실행 (08:50에 켜도 됨)
+   - 접근토큰(au10001) 발급 → 웹소켓 접속(주문체결 00 등록) → 조건식 목록(CNSRLST)
+   - 09:00 이후 조건검색(CNSRREQ, 실시간)이 수행되고,
+     조건검색 결과 종목을 ka10080(3분봉)으로 순차 스캔하여 진입 신호가 뜨면 매수(kt10000)
+   - 체결은 웹소켓 주문체결(00)로 확정하며, 체결 후 주식체결(0B) 실시간 감시로 손절/익절/트레일링 수행
+   - 웹소켓이 끊기면 자동 재접속 + 실시간/조건검색 재등록 (system.log 의 WS_* 로그)
 
 로그
 - logs/system.log : 시스템/메시지/리셋
@@ -21,3 +29,6 @@
 주의
 - 모의에서 충분히 검증 후 실계좌로 전환하세요.
 - TR 요청이 많으면 제한에 걸릴 수 있어 SCAN_MAX_CODES / SCAN_TR_DELAY_MS 조정 가능.
+- REST 호출 제한에 걸리면(system.log 의 REST_RATE_LIMIT) config.py 의
+  REST_RATE_PER_SEC 를 낮추거나 SCAN_TR_DELAY_MS 를 늘린다.
+- 모의투자 서버(mockapi.kiwoom.com)는 KRX 만 지원한다.

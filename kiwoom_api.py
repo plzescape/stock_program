@@ -1,18 +1,24 @@
-# 키움 OpenAPI+ 자동매매 엔진
+# 키움 REST API 자동매매 엔진
 # - 다중 포지션 (최대 MAX_POSITIONS)
 # - PositionState 기반 관리
 # - 스캔 안전 재개/중단
 # - 포지션별 손절 / 익절 / 트레일링
+#
+# [통신] kiwoom_rest.py (REST + 웹소켓). OCX 는 쓰지 않는다.
+# [스레드] 웹소켓 수신·REST 조회는 별도 스레드에서 돌고, 결과는 전부
+#          _MainThreadBridge 로 Qt 메인 스레드에 넘겨 처리한다.
+#          → 매매 상태(positions / pending_orders)는 OCX 시절처럼
+#            한 스레드에서만 바뀌므로 락이 필요 없다.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, time
-import qt_bootstrap  # noqa: F401  (PyQt5 보다 먼저 - 한글 경로 대응)
-from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import QEventLoop, QTimer
+from PyQt5.QtCore import QEventLoop, QObject, QTimer, Qt, pyqtSignal
 from collections import deque
 import time as pytime
+import traceback
 
 from config import (
     IS_REAL, ACCOUNT_NO, MAX_REENTRY_RETRIES, QTY, MAX_BUY_AMOUNT, BUY_MODE, REENTRY_DELAY_SEC,
@@ -24,7 +30,12 @@ from config import (
     TIME_STOP_SEC, TIME_STOP_MAX_LOSS, SELL_COOLDOWN_SEC, VOL_AVG_MIN, VOL_CHECK_TICKS,
     MAX_POSITIONS, TOTAL_BUDGET,
     BUY_FILL_TIMEOUT_SEC, CANCEL_RETRY_COOLDOWN_SEC, MAX_CANCEL_RETRIES, FORCE_ABANDON_TIMEOUT, SCAN_CODE_COOLDOWN_SEC,
-    MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP, MINI_TRAIL_GAP_OPEN
+    MINI_TRAIL_TRIGGER, MINI_TRAIL_GAP, MINI_TRAIL_GAP_OPEN,
+    KIWOOM_EXCHANGE, REST_RATE_PER_SEC, REST_RATE_BURST, REST_TIMEOUT_SEC, WS_SILENCE_RECONNECT_SEC
+)
+from kiwoom_rest import (
+    KiwoomRestClient, KiwoomWebSocket, KiwoomError, KiwoomRateLimitError, KiwoomTransportError,
+    load_app_keys, norm_code, to_int,
 )
 from logger_util import setup_logger
 from strategy import is_market_time, is_entry_candidate, is_entry_candidate_VER2, get_entry_signal_data, is_pullback_entry, get_pullback_signal_data, is_flag_entry, get_flag_signal_data, is_no_surge_stock, get_surge_candle_close
@@ -114,10 +125,35 @@ class PositionState:
     vol_peak_high:      int = 0    # TP1 이후 관찰된 최고 고가
     vol_no_new_high_cnt: int = 0   # 고점 갱신 실패 연속 횟수
 
-class KiwoomAPI(QAxWidget):
+
+class _MainThreadBridge(QObject):
+    """
+    다른 스레드(웹소켓 수신 / REST 조회)에서 Qt 메인 스레드로 함수 호출을 넘긴다.
+    OCX 이벤트가 메인 스레드로 들어오던 것과 같은 실행 모델을 유지하기 위함.
+    """
+    _sig = pyqtSignal(object)
+
+    def __init__(self, log):
+        super().__init__()
+        self._log = log
+        self._sig.connect(self._run, Qt.QueuedConnection)
+
+    def post(self, fn, *args):
+        self._sig.emit((fn, args))
+
+    def _run(self, job):
+        fn, args = job
+        try:
+            fn(*args)
+        except Exception as e:
+            # 슬롯에서 예외가 새면 PyQt5 가 프로세스를 죽인다 → 로그만 남기고 계속
+            self._log.error(f"[MAIN_THREAD_ERROR] {getattr(fn, '__name__', fn)}: {e}\n"
+                            f"{traceback.format_exc()}")
+
+
+class KiwoomAPI(QObject):
     def __init__(self):
         super().__init__()
-        self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
         # ----- 로그인 상태 -----
         self.auto_trade_enabled = False
 
@@ -126,25 +162,38 @@ class KiwoomAPI(QAxWidget):
         self.log_trade = setup_logger("trade", "trade.log")
         self.log_signal = setup_logger("signal", "signal.log")
 
-        # ---- 이벤트 연결 ----
-        self.OnEventConnect.connect(self._on_event_connect)
-        self.OnReceiveConditionVer.connect(self._on_receive_condition_ver)
-        self.OnReceiveTrCondition.connect(self._on_receive_tr_condition)
-        self.OnReceiveTrData.connect(self._on_receive_tr_data)
-        self.OnReceiveRealData.connect(self._on_receive_real_data)
-        self.OnReceiveChejanData.connect(self._on_receive_chejan_data)
-        self.OnReceiveRealCondition.connect(self._on_receive_real_condition)
-        self.OnReceiveMsg.connect(self._on_receive_msg)
+        # ---- REST / 웹소켓 ----
+        appkey, secretkey = load_app_keys(IS_REAL)
+        self.rest = KiwoomRestClient(
+            appkey, secretkey, IS_REAL,
+            rate_per_sec=REST_RATE_PER_SEC, burst=REST_RATE_BURST,
+            timeout=REST_TIMEOUT_SEC, exchange=KIWOOM_EXCHANGE, log=self.log_system,
+        )
+        self._bridge = _MainThreadBridge(self.log_system)
+        self.ws = KiwoomWebSocket(
+            self.rest,
+            on_message=lambda d: self._bridge.post(self._on_ws_message, d),
+            on_state=lambda s, m: self._bridge.post(self._on_ws_state, s, m),
+            log=self.log_system,
+            silence_sec=WS_SILENCE_RECONNECT_SEC,
+        )
+        # 조회 TR 은 메인 스레드를 막지 않도록 워커에서 실행
+        self._rest_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="kiwoom-rest")
+        self._ws_wait_trnm = None       # login()/load_conditions() 가 기다리는 응답
+        self._ws_wait_hit = False
+        self._ws_wait_loop = None
+        self._ws_disconnected_ts = 0.0
+        self._stock_names: dict[str, str] = {}     # 종목코드 → 종목명 (ka10099 캐시)
+        self._cond_seq_to_name: dict[str, str] = {}
+        self._candle_req_seq = 0        # 늦게 도착한 분봉 응답 무시용
+        self._candle_rows: list = []
+        self._holdings_attempt = 0
 
         # ===== 미체결 BUY 취소 감시 타이머 =====
         self._pending_cancel_timer = QTimer()
         self._pending_cancel_timer.setInterval(500)  # 0.5초마다 체크
         self._pending_cancel_timer.timeout.connect(self.check_pending_buy_cancel)
         self._pending_cancel_timer.start()
-
-        # ---- 이벤트 루프 ----
-        self._login_loop = None
-        self._cond_loop = None
 
         # ---- 매매 상태 ----
         self.positions: dict[str, PositionState] = {}
@@ -181,13 +230,10 @@ class KiwoomAPI(QAxWidget):
 
         # ---- 다중 조건검색식 라운드로빈 ----
         # CONDITION_NAMES 목록을 한 칸씩 순환하며 조건검색 호출
-        # 키움 API: 스크린 하나에 조건식 하나만 실시간 등록 가능
-        # → 조건식 4개를 스크린 9001~9004에 각각 매핑
+        # (REST 는 화면번호가 없다. 조건식은 seq 로 구분)
         self._cond_rr_idx        = 0      # 다음 호출할 조건식 인덱스
-        self._cond_screen_base   = 9001   # 스크린 시작 번호
-        self._screen_seq = 0
-        self._order_screen_seq = 0   # 주문 전용 화면번호 시퀀스
-        self.TR_TIMEOUT_MS = 2000
+        # REST 분봉 응답 대기 한도. 호출 제한(429) 재시도 여유를 두어 OCX(2초)보다 길게
+        self.TR_TIMEOUT_MS = 4000
 
         # ===== 스캔 타임스탬프 =====
         self.last_scan_times = {}  # { '005930': 1700000.123 } 형태
@@ -275,25 +321,21 @@ class KiwoomAPI(QAxWidget):
             )
             return
 
-        cond_idx  = self.condition_map[cond_to_run]
-        # 조건식별 고정 스크린 번호 (9001, 9002, 9003, 9004)
-        screen_no = str(self._cond_screen_base + (names.index(cond_to_run) % n))
+        cond_seq = self.condition_map[cond_to_run]
 
-        ret = self.dynamicCall(
-            "SendCondition(QString, QString, int, int)",
-            screen_no, cond_to_run, cond_idx, 1
-        )
+        # 조건검색 + 실시간 등록 (결과는 _on_ws_message → CNSRREQ 로 들어옴)
+        ok = self.ws.condition_request(cond_seq, realtime=True)
 
         next_idx = self._cond_rr_idx % n
-        if ret == 1:
+        if ok:
             self.log_system.info(
                 f"[CONDITION] 조건검색 요청 성공: '{cond_to_run}' "
-                f"(screen={screen_no}, "
+                f"(seq={cond_seq}, "
                 f"다음순번={names[next_idx] if n>1 else '-'})"
             )
         else:
             self.log_system.error(
-                f"[CONDITION] 조건검색 요청 실패: '{cond_to_run}'"
+                f"[CONDITION] 조건검색 요청 실패: '{cond_to_run}' (웹소켓 미접속 - 재접속 시 자동 재등록)"
             )
 
 
@@ -341,35 +383,168 @@ class KiwoomAPI(QAxWidget):
     # Login / condition
     # ==================================================
     def login(self):
-        self.dynamicCall("CommConnect()")
-        self._login_loop = QEventLoop()
-        self._login_loop.exec_()
+        """접근토큰 발급 → 종목명 캐시 → 웹소켓 로그인 (OCX CommConnect 대체)"""
+        self.rest.issue_token()      # 실패하면 예외 → main 에서 종료 (앱키/IP 등록 확인)
+        self.log_system.info(
+            f"[LOGIN] 접근토큰 발급 완료 ({'실전' if IS_REAL else '모의'} {self.rest.base_url})"
+        )
+        self.load_stock_names()
 
-    def _on_event_connect(self, err_code):
-        self.log_system.info(f"[LOGIN] 에러코드={err_code}")
-        if self._login_loop:
-            self._login_loop.exit()
-            self._login_loop = None
+        # 주문체결(00)은 종목 구분 없이 계좌 전체를 받는다
+        self.ws.register("1", ["00"], [""])
+        self.ws.start()
+        if self._wait_ws("LOGIN", 15000):
+            self.log_system.info("[LOGIN] 웹소켓 로그인 성공")
+        else:
+            self.log_system.error("[LOGIN] 웹소켓 로그인 실패 (15초) - 백그라운드에서 계속 재접속")
+
+    def _wait_ws(self, trnm: str, timeout_ms: int) -> bool:
+        """웹소켓 응답(trnm)이 올 때까지 이벤트 루프를 돌며 기다린다 (OCX QEventLoop 패턴)"""
+        self._ws_wait_trnm = trnm
+        self._ws_wait_hit = False
+        loop = QEventLoop()
+        self._ws_wait_loop = loop
+        QTimer.singleShot(timeout_ms, loop.quit)
+        loop.exec_()
+        self._ws_wait_loop = None
+        self._ws_wait_trnm = None
+        return self._ws_wait_hit
+
+    def _ws_wait_done(self, trnm: str):
+        if self._ws_wait_trnm == trnm and self._ws_wait_loop is not None:
+            self._ws_wait_hit = True
+            self._ws_wait_loop.quit()
 
     def load_conditions(self):
-        self.dynamicCall("GetConditionLoad()")
-        self._cond_loop = QEventLoop()
-        self._cond_loop.exec_()
+        """조건검색식 목록 조회 (OCX GetConditionLoad 대체)"""
+        if not self.ws.condition_list() or not self._wait_ws("CNSRLST", 10000):
+            self.log_system.error("[CONDITION] 조건검색식 목록 수신 실패 - 재접속 후 자동 재시도")
 
-    def _on_receive_condition_ver(self, ret, msg):
-        conds = self.dynamicCall("GetConditionNameList()")
-        for item in conds.split(";"):
-            if not item:
-                continue
-            parts = item.split("^")
-            if len(parts) != 2:
+    def _on_receive_condition_ver(self, data: dict):
+        """CNSRLST 응답: data = [[seq, name], ...]"""
+        if to_int(data.get("return_code", 0)) != 0:
+            self.log_system.error(f"[CONDITION] 목록 조회 실패: {data.get('return_msg')}")
+            return
+        for item in data.get("data") or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                seq, name = str(item[0]).strip(), str(item[1]).strip()
+            elif isinstance(item, dict) and item.get("seq") is not None:
+                seq, name = str(item.get("seq")).strip(), str(item.get("name", "")).strip()
+            else:
                 self.log_system.warning(f"[COND_PARSE_SKIP] 형식 오류: {item}")
                 continue
-            idx, name = parts
-            self.condition_map[name] = int(idx)
-        if self._cond_loop:
-            self._cond_loop.exit()
-            self._cond_loop = None
+            if not name:
+                continue
+            self.condition_map[name] = seq
+            self._cond_seq_to_name[seq] = name
+        self.log_system.info(f"[CONDITION] 조건식 {len(self.condition_map)}개 로드: {self.condition_map}")
+        self._ws_wait_done("CNSRLST")
+
+    # ==================================================
+    # 웹소켓 수신 (메인 스레드에서 실행됨)
+    # ==================================================
+    def _on_ws_state(self, state: str, detail: str):
+        if state == "LOGIN_OK":
+            if self._ws_disconnected_ts:
+                down = pytime.time() - self._ws_disconnected_ts
+                self.log_system.warning(f"[WS_RECOVERED] 웹소켓 재접속 완료 (끊김 {down:.0f}초)")
+                self._ws_disconnected_ts = 0.0
+            # 첫 로그인 때 웹소켓이 늦게 붙어 조건식 목록을 못 받았으면 지금 받는다
+            if not self.condition_map and self._ws_wait_trnm != "LOGIN":
+                self.ws.condition_list()
+            self._ws_wait_done("LOGIN")
+        elif state == "LOGIN_FAIL":
+            self.log_system.error(f"[WS_LOGIN_FAIL] {detail}")
+        elif state == "DISCONNECTED":
+            self._ws_disconnected_ts = pytime.time()
+            self.log_system.error(f"[WS_DISCONNECTED] {detail} - 체결/시세 수신 중단, 자동 재접속 중")
+            if self.positions:
+                try:
+                    from discord_notify import notify_system
+                    notify_system(f"키움 웹소켓 끊김 (보유 {len(self.positions)}종목) - 자동 재접속 중",
+                                  level="WARNING")
+                except Exception as e:
+                    self.log_system.error(f"[DISCORD_FAIL] 웹소켓끊김알림: {e}")
+
+    def _on_ws_message(self, data: dict):
+        trnm = data.get("trnm")
+
+        if trnm == "REAL":
+            for item in data.get("data") or []:
+                if not isinstance(item, dict):
+                    continue
+                rtype = item.get("type")
+                values = item.get("values") or {}
+                if rtype == "00":                       # 주문체결 (OnReceiveChejanData)
+                    self._on_receive_chejan_data(values)
+                elif rtype == "0B":                     # 주식체결 (OnReceiveRealData)
+                    self._on_receive_real_data(norm_code(item.get("item")), values)
+                elif rtype == "02":                     # 조건검색 실시간 편입/이탈
+                    seq = str(values.get("841", "")).strip()
+                    code = norm_code(values.get("9001") or item.get("item"))
+                    event = str(values.get("843", "")).strip()
+                    name = self._cond_seq_to_name.get(seq, seq)
+                    if code and event in ("I", "D"):
+                        self._on_receive_real_condition(code, event, name, seq)
+            return
+
+        if trnm == "CNSRREQ":
+            self._on_condition_result(data)
+        elif trnm == "CNSRLST":
+            self._on_receive_condition_ver(data)
+        elif trnm in ("REG", "REMOVE", "CNSRCLR"):
+            if to_int(data.get("return_code", 0)) != 0:
+                self.log_system.error(f"[WS_{trnm}_FAIL] {data.get('return_msg')}")
+        elif trnm != "LOGIN":
+            self.log_system.info(f"[WS_MSG] {str(data)[:300]}")
+
+    def _on_condition_result(self, data: dict):
+        """CNSRREQ 응답 → OCX OnReceiveTrCondition 과 같은 형태로 넘긴다"""
+        seq = str(data.get("seq", "")).strip()
+        name = self._cond_seq_to_name.get(seq, seq)
+        if to_int(data.get("return_code", 0)) != 0:
+            self.log_system.error(f"[CONDITION] '{name}' 조건검색 실패: {data.get('return_msg')}")
+            return
+        codes = []
+        for row in data.get("data") or []:
+            if isinstance(row, dict):
+                raw = row.get("jmcode") or row.get("9001") or row.get("stk_cd") or ""
+            else:
+                raw = row
+            c = norm_code(raw)
+            if c and c not in codes:
+                codes.append(c)
+        if str(data.get("cont_yn", "N")).upper() == "Y":
+            self.log_system.warning(f"[CONDITION] '{name}' 결과가 한 페이지를 넘음 - 첫 페이지만 사용")
+        self._on_receive_tr_condition("", ";".join(codes), name, seq, 0)
+
+    # ==================================================
+    # REST 비동기 조회 / 종목명
+    # ==================================================
+    def _rest_async(self, fn, on_done, on_error):
+        """fn() 을 워커 스레드에서 실행하고 결과를 메인 스레드의 on_done / on_error 로 넘긴다"""
+        def job():
+            try:
+                res = fn()
+            except Exception as e:
+                self._bridge.post(on_error, e)
+                return
+            self._bridge.post(on_done, res)
+        self._rest_pool.submit(job)
+
+    def load_stock_names(self):
+        """ka10099 로 코스피/코스닥 종목명을 한 번에 받아 캐시 (OCX GetMasterCodeName 대체)"""
+        for market, label in (("0", "코스피"), ("10", "코스닥")):
+            try:
+                rows = self.rest.stock_list(market)
+            except Exception as e:
+                self.log_system.warning(f"[STOCK_NAMES] {label} 종목명 조회 실패: {e} (로그에 코드만 표시)")
+                continue
+            for r in rows:
+                c = norm_code(r.get("code"))
+                if c:
+                    self._stock_names[c] = str(r.get("name", "")).strip()
+        self.log_system.info(f"[STOCK_NAMES] 종목명 {len(self._stock_names)}개 캐시")
 
     # ==================================================
     # Scan control
@@ -449,34 +624,40 @@ class KiwoomAPI(QAxWidget):
     # TR
     # ==================================================
     def request_candle(self, code):
+        """ka10080 분봉 조회 (워커 스레드). 응답은 _on_candle_response 로 들어온다."""
         from config import CANDLE_INTERVAL_MIN
-        self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
-        self.dynamicCall("SetInputValue(QString, QString)", "틱범위", str(CANDLE_INTERVAL_MIN))
-        self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-        screen = f"{9000 + (self._screen_seq % 100)}"
-        self._screen_seq += 1
+        self._candle_req_seq += 1
+        seq = self._candle_req_seq
+        self._rest_async(
+            lambda: self.rest.minute_chart(code, str(CANDLE_INTERVAL_MIN))[0],
+            lambda data, c=code, s=seq: self._on_candle_response(c, s, data),
+            lambda err, c=code, s=seq: self._on_candle_error(c, s, err),
+        )
 
-        self.dynamicCall("CommRqData(QString, QString, int, QString)",
-                         "RQ_CANDLE", "OPT10080", 0, screen)
-
-    def _on_receive_tr_data(self, screen_no, rq_name, tr_code, record_name, prev_next, data_len, err_code, msg1, msg2):
-        # ── 장 마감 정리 TR 분기 (스캔 TR과 무관하게 처리) ──
-        if rq_name == "RQ_CLOSE_ORDERS" and str(tr_code).upper() == "OPT10075":
-            self._on_close_open_orders_tr(rq_name, tr_code, prev_next)
+    def _on_candle_response(self, code, seq, data):
+        # 타임아웃 후 늦게 온 응답 / 다른 종목 응답은 버린다
+        if seq != self._candle_req_seq or self.current_scan_code != code:
+            self.log_system.debug(f"[CANDLE_STALE] {self.cn(code)} 늦은 응답 무시")
             return
-        if rq_name == "RQ_CLOSE_HOLDINGS" and str(tr_code).upper() == "OPW00018":
-            self._on_close_holdings_tr(rq_name, tr_code, prev_next)
-            return
+        self._candle_rows = data.get("stk_min_pole_chart_qry") or []
+        self._on_receive_tr_data("RQ_CANDLE", "KA10080")
 
-        # ── OPW00018 잔고조회 분기 (스캔 TR과 무관하게 처리) ──
-        if rq_name == "RQ_HOLDINGS" and tr_code == "OPW00018":
-            self._on_receive_holdings_tr(rq_name, tr_code)
+    def _on_candle_error(self, code, seq, err):
+        if seq != self._candle_req_seq or self.current_scan_code != code:
             return
+        self.log_system.warning(f"[CANDLE_TR_FAIL] {self.cn(code)} {err}")
+        if hasattr(self, "_tr_timeout_timer"):
+            self._tr_timeout_timer.stop()
+        # 일시 오류일 수 있으니 큐 뒤로 돌려 쿨타임 후 재스캔
+        if code in self.candidates and code not in self.scan_queue:
+            self.scan_queue.append(code)
+            self.last_scan_times[code] = pytime.time()
+        self._finish_tr(delay=True)
 
+    def _on_receive_tr_data(self, rq_name, tr_code):
         if not self.tr_inflight:
             return
-        # print(rq_name, tr_code)
-        if tr_code != "OPT10080" or rq_name != "RQ_CANDLE":
+        if tr_code != "KA10080" or rq_name != "RQ_CANDLE":
             return
         
         if hasattr(self, "_tr_timeout_timer"):
@@ -776,17 +957,14 @@ class KiwoomAPI(QAxWidget):
     # ---------------------------
     # 체결(chejan) 이벤트: 상태 업데이트
     # ---------------------------
-    def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
-        if str(gubun) != "0":
-            return
-        
-        order_no = str(self.dynamicCall("GetChejanData(int)", 9203)).strip()  # 주문번호
-        raw_code = str(self.dynamicCall("GetChejanData(int)", 9001)).strip()
-        code = raw_code.replace("A", "").strip()
-        qty = int(str(self.dynamicCall("GetChejanData(int)", 911)).strip() or 0)
-        price = abs(int(str(self.dynamicCall("GetChejanData(int)", 910)).strip() or 0))
-        order_gubun = str(self.dynamicCall("GetChejanData(int)", 905))
-        status = str(self.dynamicCall("GetChejanData(int)", 913)).strip()  # 주문상태
+    def _on_receive_chejan_data(self, values: dict):
+        """웹소켓 REAL type=00 (주문체결). FID 번호는 OCX Chejan 과 같다."""
+        order_no = str(values.get("9203", "")).strip()  # 주문번호
+        code = norm_code(values.get("9001", ""))
+        qty = abs(to_int(values.get("911")))            # 체결량 (주문별 누적)
+        price = abs(to_int(values.get("910")))          # 체결가
+        order_gubun = str(values.get("905", ""))        # 주문구분 (+매수 / -매도 / 매수취소 ...)
+        status = str(values.get("913", "")).strip()     # 주문상태 (접수 / 체결 / 확인 ...)
         
         pend = self.pending_orders.get(code)
         pos = self.positions.get(code)
@@ -1247,19 +1425,17 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # Real-time (STOP / TP / TRAIL)
     # ==================================================
-    def _on_receive_real_data(self, code, real_type, data):
-        if real_type != "주식체결":
-            return
+    def _on_receive_real_data(self, code, values: dict):
+        """웹소켓 REAL type=0B (주식체결)"""
         pos = self.positions.get(code)
         if not pos or pos.remain_qty <= 0:
             self.log_signal.debug(
                 f"[REAL_SKIP] {self.cn(code)} 포지션 없음"
-            )            
+            )
             return
-        cur = int(self.dynamicCall("GetCommRealData(QString, int)", code, 10) or 0)
-        cur = abs(cur)
+        cur = abs(to_int(values.get("10")))   # 현재가 FID = 10
         # 거래량 FID = 15
-        vol = abs(int(self.dynamicCall("GetCommRealData(QString, int)", code, 15) or 0))
+        vol = abs(to_int(values.get("15")))
         pos.recent_volumes.append(vol)
 
         # 평균거래량 피크 갱신 (진입~TP1 구간만, TP1 후 왜곡 방지)
@@ -1784,50 +1960,30 @@ class KiwoomAPI(QAxWidget):
                 return
 
     # ==================================================
-    # 주문 화면번호 생성 (고유값)
-    # ==================================================
-    def _next_order_screen(self, prefix: str = "92") -> str:
-        """
-        주문마다 고유 화면번호 반환.
-        prefix="92" → "9200"~"9299", prefix="91" → "9100"~"9199"
-        같은 화면번호를 재사용하면 이전 주문의 OnReceiveMsg/Chejan이
-        유실되거나 충돌할 수 있으므로 순환 사용.
-        NOTE: 100건 순환 후 재사용됨. 일반적 사용에서는 문제없음.
-        """
-        base = int(prefix) * 100
-        seq = self._order_screen_seq % 100
-        self._order_screen_seq += 1
-        return str(base + seq)
-
-    # ==================================================
     # 주문 취소 함수
     # ==================================================
+    def _send_cancel_rest(self, code: str, org_order_no: str, qty: int = 0):
+        """kt10003 취소 1건. 반환: (성공여부, 실패사유). qty=0 이면 잔량 전부."""
+        try:
+            self.rest.cancel_order(code, org_order_no, qty)
+            return True, ""
+        except KiwoomError as e:
+            return False, str(e)
+        except KiwoomTransportError as e:
+            # 취소는 중복으로 가도 거절될 뿐이라 실패로 보고 재시도에 맡긴다
+            return False, f"통신오류({e})"
+
     def send_cancel_order(self, code: str, org_order_no: str, cancel_side: str = "SELL") -> bool:
 
         if not org_order_no:
             self.log_system.error(f"[CANCEL_ABORT] 주문번호 없음 {self.cn(code)}")
             return False
 
-        order_type = 3 if cancel_side == "BUY" else 4
+        ok, err = self._send_cancel_rest(code, org_order_no, 0)   # 0 = 잔량 전부 취소
 
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [
-                "CANCEL",
-                self._next_order_screen("93"),
-                self.get_account(),
-                order_type,
-                code,
-                0,      # 취소는 qty 0 허용
-                0,
-                "00",
-                org_order_no
-            ]
-        )
-
-        if ret != 0:
+        if not ok:
             self.log_trade.error(
-                f"[CANCEL_FAIL] {self.cn(code)} 원주문번호={org_order_no} ret={ret}"
+                f"[CANCEL_FAIL] {self.cn(code)} 원주문번호={org_order_no} 사유={err}"
             )
             return False
 
@@ -2191,9 +2347,6 @@ class KiwoomAPI(QAxWidget):
             self.log_trade.warning(f"[ORDER_THROTTLE] 방향={side} {self.cn(code)} 수량={qty} 주문간격제한")
             return False        
         
-        order_type = 1 if side == "BUY" else 2
-        screen = self._next_order_screen("92" if side == "BUY" else "91")
-        
         self.log_trade.info(
             f"[ORDER_TRY] 방향={side} {self.cn(code)} 수량={qty}주 사유={reason}"
         )        
@@ -2285,13 +2438,42 @@ class KiwoomAPI(QAxWidget):
                 _lmt_p  = 0
                 _ord_tp = "03"               # 시장가 (TP/Trail 등, 또는 SL 폴백)
 
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [side, screen, self.get_account(), order_type, code, qty, _lmt_p, _ord_tp, ""]
-        )
-        
+        # ─── REST 주문 (kt10000 매수 / kt10001 매도) ─────────────────────
+        # OCX 와의 차이: 거절 사유가 OnReceiveMsg 로 나중에 오지 않고 응답에 바로 온다.
+        # 기존 거절 처리([800033] 재시도 등)를 그대로 쓰기 위해, 서버 거절은
+        # OCX 와 같은 순서(접수 → 거절 메시지)로 _on_receive_msg 에 넘긴다.
+        #   ret = 0   : 접수 (order_no 확정)
+        #   ret = 1   : 서버 거절 → pending 생성 후 거절 메시지 처리
+        #   ret = 2   : 통신 오류, 접수됐을 수 있음 → pending(order_no 없음) 으로 체결 통보 대기
+        #   ret = -308: 호출 제한 초과 (OCX 주문차단과 같은 처리)
+        #   ret = -1  : 전송 실패 (확실히 미접수)
+        _trde_tp = "0" if _ord_tp == "00" else "3"     # OCX 00=지정가 → 0, 03=시장가 → 3
+        order_no, reject_msg = None, ""
+        try:
+            order_no = self.rest.send_order(side, code, qty, _trde_tp, _lmt_p) or None
+            ret = 0
+        except KiwoomRateLimitError as e:
+            reject_msg = str(e)
+            ret = -308
+        except KiwoomError as e:
+            reject_msg = str(e)
+            ret = 1
+        except KiwoomTransportError as e:
+            reject_msg = str(e)
+            ret = 2 if e.maybe_sent else -1
+
+        if ret == 2:
+            self.log_trade.warning(
+                f"[ORDER_UNKNOWN] 방향={side} {self.cn(code)} 수량={qty}주 사유={reason} "
+                f"응답 없음 - 접수됐을 수 있어 체결통보를 기다림 ({reject_msg})"
+            )
+        elif ret == 1:
+            self.log_trade.error(
+                f"[ORDER_REJECTED] 방향={side} {self.cn(code)} 수량={qty}주 사유={reason} 메시지={reject_msg}"
+            )
+
         # 주문 접수 실패 처리
-        if ret != 0:
+        if ret not in (0, 1, 2):
             # 주문 차단(-308)인 경우 소프트 리셋
             if ret == -308:
                 self.log_system.error("[ORDER_BLOCK] -308 주문차단 감지")
@@ -2308,9 +2490,9 @@ class KiwoomAPI(QAxWidget):
                 self._pending_buy_qty = 0
                
             self.log_trade.error(
-                f"[ORDER_FAIL] 방향={side} {self.cn(code)} 수량={qty}주 사유={reason} ret={ret}" 
-            ) 
-                           
+                f"[ORDER_FAIL] 방향={side} {self.cn(code)} 수량={qty}주 사유={reason} ret={ret} {reject_msg}"
+            )
+
             return False
         else:
             # 주문 접수 성공
@@ -2320,12 +2502,18 @@ class KiwoomAPI(QAxWidget):
                 "qty": qty,
                 "ts": pytime.time(),    # 주문 시각
                 "reason": reason,
-                "order_no": None,       # 주문번호 (체결시 채워짐)
+                "order_no": order_no,   # REST 는 접수 응답에 주문번호가 온다 (통신오류 시 None → 체결통보에서 채움)
                 "cancel_retries": 0,
                 "last_cancel_ts": 0.0,
                 "reentry_retries": 0,
                 "filled_qty": 0         # SELL 주문별 누적 체결수량 추적
             }
+            if ret == 1:
+                # OCX 에서 OnReceiveMsg 가 SendOrder 직후 따로 오던 것과 같은 순서로 처리
+                QTimer.singleShot(
+                    0, lambda s=side, m=reject_msg, c=code:
+                        self._on_receive_msg("", s, "", m, force_reject=True, code=c)
+                )
         return True
 
     # ==================================================
@@ -2333,13 +2521,9 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # 1. 실시간 등록
     def register_real(self, code):
-        fid_list = "10;15"  # 10=현재가, 15=거래량
-        
-        # codes = list(self.positions.keys())
-        # code_str = ";".join(codes)
-        
-        self.dynamicCall("SetRealReg(QString, QString, QString, QString)",
-                         "9400", code, fid_list, "1") # 1: 추가등록, 0: 해제
+        # 0B 주식체결 (10=현재가, 15=거래량 포함). 그룹 2, 기존 등록 유지.
+        # 웹소켓이 끊겨 있으면 기억해 두었다가 재접속 시 등록된다.
+        self.ws.register("2", ["0B"], [code])
 
         self.log_system.info(
         f"[REAL_REG] 등록종목수={len(self.positions)} 종목={list(self.positions.keys())}"
@@ -2348,19 +2532,17 @@ class KiwoomAPI(QAxWidget):
     # 2. 분봉 파싱
     def parse_candle(self, code):
         """
-        opt10080 분봉 데이터 파싱 (CANDLE_INTERVAL_MIN 단위)
+        ka10080 분봉 데이터 파싱 (CANDLE_INTERVAL_MIN 단위)
         - OHLCV 포함
         - 최소 30개 이상 확보 (VER2 전략 대응)
         - 최신봉 → 과거봉 순서 유지
         """
 
-        rqname = "RQ_CANDLE"
-        trcode = "OPT10080"
-
         candles = []
 
         try:
-            rows = self.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
+            data_rows = self._candle_rows
+            rows = len(data_rows)
 
             if rows <= 0:
                 now_str = datetime.now().strftime('%H:%M:%S')
@@ -2370,70 +2552,22 @@ class KiwoomAPI(QAxWidget):
             # ✔ 최소 30개 확보 (여유 두고 60까지 가져와도 OK)
             fetch_cnt = min(rows, 60)
 
-            # ── 파싱 헬퍼: 루프 밖에 정의 (루프마다 재정의 비효율 제거) ──
-            def _safe_int(val):
-                """거래량 등 항상 양수인 값용"""
-                try:
-                    return abs(int(val.strip()))
-                except:
-                    return 0
-
-            def _safe_int_signed(val):
-                """시가/고가/저가/현재가용 - 부호 보존 후 호출측에서 abs() 처리"""
-                try:
-                    return int(val.strip())
-                except:
-                    return 0
-
             for i in range(fetch_cnt):
+                row = data_rows[i]
 
-                # ⚠️ 버그 수정: open/high/low/close 모두 abs() 처리하되,
-                # 키움 API 특성상 현재가(close)는 음수로 내려오는 하락봉도
-                # open과의 비교(close < open → 음봉)로 판별 가능.
+                # ⚠️ 키움은 가격을 부호 붙은 문자열("+12345" / "-12345")로 준다.
                 # 시가/고가/저가/현재가는 abs()로 절댓값을 취해 가격으로 사용.
-                open_ = abs(_safe_int_signed(
-                    self.dynamicCall(
-                        "GetCommData(QString, QString, int, QString)",
-                        trcode, rqname, i, "시가"
-                    )
-                ))
-
-                high = abs(_safe_int_signed(
-                    self.dynamicCall(
-                        "GetCommData(QString, QString, int, QString)",
-                        trcode, rqname, i, "고가"
-                    )
-                ))
-
-                low = abs(_safe_int_signed(
-                    self.dynamicCall(
-                        "GetCommData(QString, QString, int, QString)",
-                        trcode, rqname, i, "저가"
-                    )
-                ))
-
-                close_raw = _safe_int_signed(
-                    self.dynamicCall(
-                        "GetCommData(QString, QString, int, QString)",
-                        trcode, rqname, i, "현재가"
-                    )
-                )
-                close = abs(close_raw)
+                open_ = abs(to_int(row.get("open_pric")))
+                high  = abs(to_int(row.get("high_pric")))
+                low   = abs(to_int(row.get("low_pric")))
+                close = abs(to_int(row.get("cur_prc")))
 
                 # 거래량은 항상 양수
-                volume = _safe_int(
-                    self.dynamicCall(
-                        "GetCommData(QString, QString, int, QString)",
-                        trcode, rqname, i, "거래량"
-                    )
-                )
+                volume = abs(to_int(row.get("trde_qty")))
 
                 # 체결시간(YYYYMMDDHHMMSS) — 백테스트 데이터 적재용.
                 # 전략 로직은 OHLCV만 사용하므로 필드 추가는 영향 없음.
-                ts_raw = self.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)",
-                    trcode, rqname, i, "체결시간"
-                ).strip()
+                ts_raw = str(row.get("cntr_tm", "")).strip()
 
                 # 시가 또는 종가가 0이면 데이터 오류 → 스킵
                 if open_ == 0 or close == 0:
@@ -2467,21 +2601,14 @@ class KiwoomAPI(QAxWidget):
 
     # 3. 계좌번호 조회
     def get_account(self):
-        accs = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
-        accounts = [a for a in accs.split(";") if a]
+        # REST 는 앱키가 계좌에 묶여 있어 주문에 계좌번호를 넣지 않는다 (표시/점검용)
         if IS_REAL:
             return ACCOUNT_NO
         return MOCK_ACCOUNT_NO
 
-    # 3-1. 종목명 조회
+    # 3-1. 종목명 조회 (login 때 받은 ka10099 캐시)
     def get_stock_name(self, code: str) -> str:
-        try:
-            name = self.dynamicCall(
-                "GetMasterCodeName(QString)", code
-            ).strip()
-            return name if name else code
-        except Exception:
-            return code
+        return self._stock_names.get(code) or code
 
     def cn(self, code: str) -> str:
         """로그용: '종목명(code)' 형태로 반환. ex) '나노엔텍(039860)'"""
@@ -2568,51 +2695,43 @@ class KiwoomAPI(QAxWidget):
         )    
 
     # ==================================================
-    # ⭐ BUG-3: 키움 잔고조회 TR (OPW00018) 기반 전일 미청산 포지션 복구
+    # ⭐ BUG-3: 키움 잔고조회 TR (kt00018, OCX OPW00018) 기반 전일 미청산 포지션 복구
     # ==================================================
     def load_holdings_from_api(self, on_done: callable = None):
         """
-        OPW00018로 실제 보유 잔고를 조회해 positions에 복구.
+        kt00018로 실제 보유 잔고를 조회해 positions에 복구.
         프로그램 재시작 시 전일 미청산 잔고를 메모리에 재등록하기 위해 사용.
 
         on_done: 조회 완료 후 콜백 (main.py에서 liquidate_leftover_positions 예약용)
         """
         self._holdings_callback = on_done
-        self._holdings_result   = []
+        self._holdings_attempt += 1
+        self._rest_async(self.rest.holdings, self._on_receive_holdings_tr, self._on_holdings_error)
+        self.log_system.info("[HOLDINGS_TR] kt00018 잔고조회 요청")
 
-        self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.get_account())
-        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호", "")
-        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
-        self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)",
-                         "RQ_HOLDINGS", "OPW00018", 0, "9500")
-        self.log_system.info("[HOLDINGS_TR] OPW00018 잔고조회 요청")
-
-    def _on_receive_holdings_tr(self, rq_name, tr_code):
-        """OPW00018 수신 처리 (TR 콜백 분기용)"""
-        if rq_name != "RQ_HOLDINGS" or tr_code != "OPW00018":
+    def _on_holdings_error(self, err):
+        if self._holdings_attempt < 3:
+            self.log_system.warning(
+                f"[HOLDINGS_TR_RETRY] 잔고조회 실패 {self._holdings_attempt}회차: {err} → 3초 후 재시도"
+            )
+            QTimer.singleShot(3000, lambda: self.load_holdings_from_api(self._holdings_callback))
             return
+        self._holdings_attempt = 0
+        self.log_system.error(f"[HOLDINGS_TR_FAIL] 잔고조회 3회 실패: {err} - 전일 잔고를 HTS 에서 확인하세요")
 
-        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name)
+    def _on_receive_holdings_tr(self, data_rows: list):
+        """kt00018 수신 처리"""
+        self._holdings_attempt = 0
+        rows = len(data_rows)
         recovered = 0
 
-        for i in range(rows):
-            def _g(field, idx=i):
-                return self.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)",
-                    tr_code, rq_name, idx, field
-                ).strip()
-
-            code     = _g("종목번호").replace("A", "").strip()
-            name     = _g("종목명")
-            qty_str  = _g("보유수량")
-            price_str = _g("매입가")
-
-            try:
-                qty   = int(qty_str.replace(",", ""))
-                price = int(price_str.replace(",", ""))
-            except ValueError:
-                continue
+        for row in data_rows:
+            code  = norm_code(row.get("stk_cd"))
+            name  = str(row.get("stk_nm", "")).strip()
+            qty   = to_int(row.get("rmnd_qty"))
+            price = abs(to_int(row.get("pur_pric")))
+            if code and name:
+                self._stock_names.setdefault(code, name)
 
             if qty <= 0 or not code:
                 continue
@@ -2950,10 +3069,14 @@ class KiwoomAPI(QAxWidget):
     # ==================================================
     # 메시지 수신
     # ==================================================
-    def _on_receive_msg(self, screen_no, rqname, trcode, msg):
+    def _on_receive_msg(self, screen_no, rqname, trcode, msg, force_reject=False, code=None):
+        """
+        주문 거절 처리. REST 에서는 send_market_order 가 거절 응답을 받으면
+        force_reject=True, code=종목코드 로 호출한다.
+        """
         self.log_system.info(f"[RECV_MSG] 화면={screen_no} 요청={rqname} TR={trcode} 메시지={msg}")
 
-        if "주문완료" in msg:
+        if not force_reject and "주문완료" in msg:
             self.last_order_ts = pytime.time()
             return
 
@@ -2961,7 +3084,7 @@ class KiwoomAPI(QAxWidget):
         # 키움 서버가 주문을 거부하면 Chejan 이벤트는 발생하지 않으므로
         # 여기서 pending_orders를 직접 정리해야 무한 대기를 방지할 수 있다.
         reject_keywords = ["거부", "오류", "실패", "제한", "정지", "불가", "초과", "부족"]
-        is_reject = any(kw in msg for kw in reject_keywords)
+        is_reject = force_reject or any(kw in msg for kw in reject_keywords)
 
         if not is_reject:
             return
@@ -2972,11 +3095,14 @@ class KiwoomAPI(QAxWidget):
 
         # rqname이 "BUY" 또는 "SELL"인 경우 → send_market_order에서 발송
         # pending_orders 중 해당 side와 매칭되는 항목 정리
-        # (screen_no로는 code를 특정할 수 없으므로, 가장 최근 pending을 대상으로 처리)
+        # REST 는 거절된 종목(code)을 알기 때문에 그 종목만 정리한다
         if rqname in ("BUY", "SELL"):
             # side가 일치하는 pending을 찾아 제거
             # order_no 유무 관계없이 매칭 (주문번호 배정 후에도 거부될 수 있음)
+            _target = code
             for code, pend in list(self.pending_orders.items()):
+                if _target and code != _target:
+                    continue
                 if pend.get("side") == rqname:
                     self.log_system.error(
                         f"[REJECT_CLEANUP] {self.cn(code)} 방향={rqname} 메시지={msg}"
@@ -3215,8 +3341,8 @@ class KiwoomAPI(QAxWidget):
 
         [순서]
           1) closing=True → 사유가 CLOSE_ 로 시작하는 정리 주문만 허용, 스캔 중단
-          2) OPT10075 미체결 전량 조회 → 매수/매도 모두 취소
-          3) OPW00018 실제 잔고 조회 → 메모리 포지션 대조 → 매매가능수량 전량 시장가 매도
+          2) ka10075 미체결 전량 조회 → 매수/매도 모두 취소
+          3) kt00018 실제 잔고 조회 → 메모리 포지션 대조 → 매매가능수량 전량 시장가 매도
           4) 정규장 종료 전 재확인 (CLOSE_VERIFY_*):
                미체결 매수는 취소, 정리 매도는 동시호가 체결 대기로 두고,
                남은 매매가능수량은 재매도
@@ -3241,45 +3367,61 @@ class KiwoomAPI(QAxWidget):
         self._close_query_open_orders("CANCEL")
 
     # ── 정리용 TR 요청 (재시도 + 응답 타임아웃) ─────────────────────────
-    def _close_request_tr(self, rq_name, tr_code, inputs, screen, attempt=1):
-        for key, val in inputs:
-            self.dynamicCall("SetInputValue(QString, QString)", key, val)
-        ret = self.dynamicCall("CommRqData(QString, QString, int, QString)",
-                               rq_name, tr_code, 0, screen)
+    # 연속조회를 끝까지 받으므로 OCX 시절보다 오래 걸릴 수 있어 대기 한도를 15초로 둔다
+    CLOSE_TR_TIMEOUT_MS = 15000
 
-        if ret == 0:
-            self._close_wait_seq += 1
-            seq = self._close_wait_seq
-            self._close_waiting = (tr_code, seq)
-            self.log_system.info(
-                f"[CLOSE_TR] {tr_code} 요청 phase={self._close_phase}"
-            )
-            QTimer.singleShot(5000, lambda: self._close_tr_timeout(tr_code, seq))
+    def _close_request_tr(self, tr_code, attempt=1):
+        """tr_code: 'KA10075'(미체결) | 'KT00018'(잔고). 응답은 _on_close_tr_done 으로."""
+        fn = self.rest.open_orders if tr_code == "KA10075" else self.rest.holdings
+
+        self._close_wait_seq += 1
+        seq = self._close_wait_seq
+        self._close_waiting = (tr_code, seq)
+        self.log_system.info(
+            f"[CLOSE_TR] {tr_code} 요청 phase={self._close_phase}"
+        )
+        QTimer.singleShot(self.CLOSE_TR_TIMEOUT_MS, lambda: self._close_tr_timeout(tr_code, seq))
+        self._rest_async(
+            fn,
+            lambda rows: self._on_close_tr_done(tr_code, seq, rows),
+            lambda err: self._on_close_tr_error(tr_code, seq, attempt, err),
+        )
+
+    def _on_close_tr_done(self, tr_code, seq, rows):
+        if self._close_waiting != (tr_code, seq):
+            return                         # 타임아웃 처리 후 늦게 온 응답
+        self._close_waiting = None
+        if tr_code == "KA10075":
+            self._on_close_open_orders_tr(rows)
+        else:
+            self._on_close_holdings_tr(rows)
+
+    def _on_close_tr_error(self, tr_code, seq, attempt, err):
+        if self._close_waiting != (tr_code, seq):
             return
-
+        self._close_waiting = None
         if attempt < 3:
             self.log_system.warning(
-                f"[CLOSE_TR_RETRY] {tr_code} ret={ret} {attempt}회차 → 1초 후 재요청"
+                f"[CLOSE_TR_RETRY] {tr_code} {err} {attempt}회차 → 1초 후 재요청"
             )
-            QTimer.singleShot(
-                1000,
-                lambda: self._close_request_tr(rq_name, tr_code, inputs, screen, attempt + 1)
-            )
+            QTimer.singleShot(1000, lambda: self._close_request_tr(tr_code, attempt + 1))
             return
 
-        self.log_system.error(f"[CLOSE_TR_FAIL] {tr_code} ret={ret} 3회 실패")
+        self.log_system.error(f"[CLOSE_TR_FAIL] {tr_code} {err} 3회 실패")
         self._close_tr_fallback(tr_code)
 
     def _close_tr_timeout(self, tr_code, seq):
         if self._close_waiting != (tr_code, seq):
             return                         # 이미 응답 받음
         self._close_waiting = None
-        self.log_system.error(f"[CLOSE_TR_TIMEOUT] {tr_code} 5초 내 응답 없음")
+        self.log_system.error(
+            f"[CLOSE_TR_TIMEOUT] {tr_code} {self.CLOSE_TR_TIMEOUT_MS // 1000}초 내 응답 없음"
+        )
         self._close_tr_fallback(tr_code)
 
     def _close_tr_fallback(self, tr_code):
         """조회가 안 되면 멈추지 말고 다음 단계로 진행한다."""
-        if str(tr_code).upper() == "OPT10075":
+        if str(tr_code).upper() == "KA10075":
             # 미체결 조회 실패 → 취소는 못 해도 잔고 기준 매도는 시도
             self._close_resting_sells = set()
             self._close_query_holdings()
@@ -3301,37 +3443,15 @@ class KiwoomAPI(QAxWidget):
     # ── 1) 미체결 조회 → 취소 ───────────────────────────────────────────
     def _close_query_open_orders(self, phase):
         self._close_phase = phase
-        self._close_request_tr(
-            "RQ_CLOSE_ORDERS", "OPT10075",
-            [
-                ("계좌번호", self.get_account()),
-                ("전체종목구분", "0"),     # 0: 전체
-                ("매매구분", "0"),         # 0: 전체
-                ("종목코드", ""),
-                ("체결구분", "1"),         # 1: 미체결
-            ],
-            "9510",
-        )
+        self._close_request_tr("KA10075")     # 전 종목 / 매수·매도 전체 미체결
 
-    def _on_close_open_orders_tr(self, rq_name, tr_code, prev_next):
-        self._close_waiting = None
-        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name)
-
+    def _on_close_open_orders_tr(self, data_rows: list):
         orders = []
-        for i in range(rows):
-            def _g(field, idx=i):
-                return str(self.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)",
-                    tr_code, rq_name, idx, field
-                )).strip()
-
-            try:
-                remain = int(_g("미체결수량").replace(",", "") or 0)
-            except ValueError:
-                continue
-            gubun    = _g("주문구분")
-            order_no = _g("주문번호")
-            code     = _g("종목코드").replace("A", "").strip()
+        for row in data_rows:
+            remain   = to_int(row.get("oso_qty"))          # 미체결수량
+            gubun    = str(row.get("io_tp_nm", "")).strip() # 주문구분 (+매수 / -매도 ...)
+            order_no = str(row.get("ord_no", "")).strip()
+            code     = norm_code(row.get("stk_cd"))
 
             if remain <= 0 or not order_no or not code or "취소" in gubun:
                 continue
@@ -3343,11 +3463,6 @@ class KiwoomAPI(QAxWidget):
                 continue
             orders.append({"code": code, "order_no": order_no, "side": side,
                            "qty": remain, "gubun": gubun})
-
-        if str(prev_next) == "2":
-            self.log_system.warning(
-                "[CLOSE_ORDERS_MORE] 미체결이 한 페이지를 넘음 - 나머지는 재확인 단계에서 처리"
-            )
 
         self.log_system.warning(
             f"[CLOSE_ORDERS] phase={self._close_phase} 미체결 {len(orders)}건 "
@@ -3380,21 +3495,8 @@ class KiwoomAPI(QAxWidget):
             return
 
         o = orders[idx]
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            [
-                "CLOSE_CANCEL",
-                self._next_order_screen("93"),
-                self.get_account(),
-                3 if o["side"] == "BUY" else 4,   # 3: 매수취소 / 4: 매도취소
-                o["code"],
-                o["qty"],                           # 미체결수량 전량
-                0,
-                "00",
-                o["order_no"],
-            ]
-        )
-        if ret == 0:
+        ok, err = self._send_cancel_rest(o["code"], o["order_no"], 0)   # 0 = 미체결 잔량 전부
+        if ok:
             self.log_trade.warning(
                 f"[CLOSE_CANCEL_SEND] {self.cn(o['code'])} {o['gubun']} "
                 f"원주문번호={o['order_no']} 미체결={o['qty']}주"
@@ -3402,7 +3504,7 @@ class KiwoomAPI(QAxWidget):
         else:
             self.log_trade.error(
                 f"[CLOSE_CANCEL_FAIL] {self.cn(o['code'])} {o['gubun']} "
-                f"원주문번호={o['order_no']} ret={ret}"
+                f"원주문번호={o['order_no']} 사유={err}"
             )
 
         QTimer.singleShot(CLOSE_ORDER_GAP_MS,
@@ -3410,49 +3512,20 @@ class KiwoomAPI(QAxWidget):
 
     # ── 2) 실제 잔고 조회 → 대조 → 매도 ────────────────────────────────
     def _close_query_holdings(self):
-        self._close_request_tr(
-            "RQ_CLOSE_HOLDINGS", "OPW00018",
-            [
-                ("계좌번호", self.get_account()),
-                ("비밀번호", ""),
-                ("비밀번호입력매체구분", "00"),
-                ("조회구분", "1"),
-            ],
-            "9511",
-        )
+        self._close_request_tr("KT00018")
 
-    def _on_close_holdings_tr(self, rq_name, tr_code, prev_next):
-        self._close_waiting = None
-        rows = self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, rq_name)
-
-        def _int(s):
-            try:
-                return int(str(s).replace(",", "").strip() or 0)
-            except ValueError:
-                return 0
-
+    def _on_close_holdings_tr(self, data_rows: list):
         holdings = {}
-        for i in range(rows):
-            def _g(field, idx=i):
-                return str(self.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)",
-                    tr_code, rq_name, idx, field
-                )).strip()
-
-            code = _g("종목번호").replace("A", "").strip()
-            hold = _int(_g("보유수량"))
+        for row in data_rows:
+            code = norm_code(row.get("stk_cd"))
+            hold = to_int(row.get("rmnd_qty"))            # 보유수량
             if not code or hold <= 0:
                 continue
             holdings[code] = {
                 "hold": hold,
-                "sellable": _int(_g("매매가능수량")),
-                "price": _int(_g("매입가")),
+                "sellable": to_int(row.get("trde_able_qty")),  # 매매가능수량
+                "price": abs(to_int(row.get("pur_pric"))),     # 매입가
             }
-
-        if str(prev_next) == "2":
-            self.log_system.warning(
-                "[CLOSE_HOLDINGS_MORE] 잔고가 한 페이지를 넘음 - 나머지는 재확인 단계에서 처리"
-            )
 
         self.log_system.warning(
             f"[CLOSE_HOLDINGS] phase={self._close_phase} 실제잔고 {len(holdings)}종목 "

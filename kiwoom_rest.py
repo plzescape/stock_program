@@ -342,6 +342,13 @@ class KiwoomRestClient:
                             {"stk_cd": code, "tic_scope": str(tic_scope), "upd_stkpc_tp": "1"},
                             cont_yn, next_key)
 
+    def daily_chart(self, code: str, base_dt: str, cont_yn: str = "N", next_key: str = ""):
+        """ka10081 주식일봉차트 (base_dt=YYYYMMDD 기준 과거로) → (응답, cont_yn, next_key).
+        봉 배열 키: stk_dt_pole_chart_qry (최신→과거). 항목: dt, open_pric, high_pric, low_pric, cur_prc, trde_qty, trde_prica"""
+        return self.request("ka10081", "/api/dostk/chart",
+                            {"stk_cd": code, "base_dt": base_dt, "upd_stkpc_tp": "1"},
+                            cont_yn, next_key)
+
     def stock_list(self, market: str) -> list:
         """ka10099 종목정보 리스트. market: '0'=코스피, '10'=코스닥. 항목: code, name, marketCode ..."""
         return self.request_all("ka10099", "/api/dostk/stkinfo", {"mrkt_tp": market}, "list")
@@ -470,6 +477,15 @@ class KiwoomWebSocket:
                 if it not in reg["items"]:
                     reg["items"].append(it)
         return self.send({"trnm": "REG", "grp_no": grp_no, "refresh": "1",
+                          "data": [{"item": list(items), "type": list(types)}]})
+
+    def unregister(self, grp_no: str, types: list, items: list) -> bool:
+        """실시간 해지 (해당 그룹에서 items 만 뺀다). 재접속 복구 목록에서도 제거."""
+        with self._state_lock:
+            reg = self._regs.get(grp_no)
+            if reg:
+                reg["items"] = [it for it in reg["items"] if it not in items]
+        return self.send({"trnm": "REMOVE", "grp_no": grp_no, "refresh": "1",
                           "data": [{"item": list(items), "type": list(types)}]})
 
     def condition_list(self) -> bool:

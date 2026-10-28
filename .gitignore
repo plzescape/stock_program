@@ -16,3 +16,7 @@ reports/index.html
 
 # 키움 REST 앱키 (절대 커밋 금지)
 kiwoom_keys.json
+
+# 연구용 데이터 (용량 큼)
+tick_data/
+daily_data/

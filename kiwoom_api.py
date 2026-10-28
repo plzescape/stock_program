@@ -189,6 +189,17 @@ class KiwoomAPI(QObject):
         self._candle_rows: list = []
         self._holdings_attempt = 0
 
+        # ---- 연구용 체결/호가 녹화 ----
+        self.recorder = None
+        self._rec_codes: dict[str, float] = {}     # 녹화 중 종목 → 마지막 편입 시각 (삽입순)
+        try:
+            from config import TICK_RECORD_ENABLED
+            if TICK_RECORD_ENABLED:
+                from tick_recorder import TickRecorder
+                self.recorder = TickRecorder(log=self.log_system)
+        except Exception as e:
+            self.log_system.warning(f"[TICK_REC_DISABLED] {e}")
+
         # ===== 미체결 BUY 취소 감시 타이머 =====
         self._pending_cancel_timer = QTimer()
         self._pending_cancel_timer.setInterval(500)  # 0.5초마다 체크
@@ -478,7 +489,14 @@ class KiwoomAPI(QObject):
                 if rtype == "00":                       # 주문체결 (OnReceiveChejanData)
                     self._on_receive_chejan_data(values)
                 elif rtype == "0B":                     # 주식체결 (OnReceiveRealData)
-                    self._on_receive_real_data(norm_code(item.get("item")), values)
+                    rcode = norm_code(item.get("item"))
+                    if self.recorder and rcode in self._rec_codes:
+                        self.recorder.record_trade(rcode, values)
+                    self._on_receive_real_data(rcode, values)
+                elif rtype == "0D":                     # 호가잔량 (녹화 전용)
+                    rcode = norm_code(item.get("item"))
+                    if self.recorder and rcode in self._rec_codes:
+                        self.recorder.record_book(rcode, values)
                 elif rtype == "02":                     # 조건검색 실시간 편입/이탈
                     seq = str(values.get("841", "")).strip()
                     code = norm_code(values.get("9001") or item.get("item"))
@@ -531,6 +549,37 @@ class KiwoomAPI(QObject):
                 return
             self._bridge.post(on_done, res)
         self._rest_pool.submit(job)
+
+    def _record_watch(self, code: str, cond_name: str):
+        """조건검색 편입 종목을 녹화 대상으로 등록. 실패해도 매매에는 영향 없음."""
+        if not self.recorder:
+            return
+        try:
+            from config import TICK_RECORD_MAX_CODES, TICK_RECORD_ORDERBOOK
+            self.recorder.record_event(code, "COND_IN", cond_name)
+            if code in self._rec_codes:
+                self._rec_codes.pop(code)
+                self._rec_codes[code] = pytime.time()     # 최근 편입으로 순서 갱신
+                return
+            # 0B 는 포지션 감시와 같은 그룹 2 를 쓴다 (그룹을 나누면 같은 틱이 두 번 올 수 있음)
+            self.ws.register("2", ["0B"], [code])
+            if TICK_RECORD_ORDERBOOK:
+                self.ws.register("3", ["0D"], [code])
+            self._rec_codes[code] = pytime.time()
+
+            # 상한 초과 → 보유/주문 중이 아닌 가장 오래된 종목부터 해지
+            while len(self._rec_codes) > TICK_RECORD_MAX_CODES:
+                old = next((c for c in self._rec_codes
+                            if c not in self.positions and c not in self.pending_orders), None)
+                if old is None:
+                    break
+                self._rec_codes.pop(old)
+                self.ws.unregister("2", ["0B"], [old])
+                if TICK_RECORD_ORDERBOOK:
+                    self.ws.unregister("3", ["0D"], [old])
+                self.recorder.record_event(old, "REC_STOP", "max_codes")
+        except Exception as e:
+            self.log_system.warning(f"[TICK_REC_WATCH_FAIL] {self.cn(code)} {e}")
 
     def load_stock_names(self):
         """ka10099 로 코스피/코스닥 종목명을 한 번에 받아 캐시 (OCX GetMasterCodeName 대체)"""
@@ -1717,12 +1766,6 @@ class KiwoomAPI(QObject):
                         f"하락={drop*100:.2f}% "
                         f"GAP={_active_gap*100:.1f}%({'장초반' if _now_t < _open_end else '일반'}) → 익절 청산"
                     )
-                elif drop >= _active_gap and pnl_rate < _min_exit_pnl:
-                    self.log_trade.info(
-                        f"[MINI_TRAIL_HOLD] {self.cn(code)} "
-                        f"GAP 충족({drop*100:.2f}%≥{_active_gap*100:.1f}%) 하지만 "
-                        f"pnl={pnl_rate*100:.2f}%<최소{_min_exit_pnl*100:.1f}% → 발동 억제 (ATR손절 대기)"
-                    )
                     ok = self.send_market_order("SELL", code, pos.remain_qty, "MINI_TRAIL_STOP")
                     if ok:
                         pos.last_sell_attempt_ts = now
@@ -1733,6 +1776,15 @@ class KiwoomAPI(QObject):
                         # tp1_done=True로 세팅하지 않으면, selling이 잠깐 False로 리셋되는
                         # 타이밍에 TP1이 추가 주문을 발송해 [800033] 이중 주문 발생 (일성건설 케이스)
                     return
+                elif drop >= _active_gap and pnl_rate < _min_exit_pnl:
+                    # 억제 로그는 틱마다 찍히지 않도록 포지션당 1회만
+                    if not getattr(pos, 'mini_trail_hold_logged', False):
+                        pos.mini_trail_hold_logged = True
+                        self.log_trade.info(
+                            f"[MINI_TRAIL_HOLD] {self.cn(code)} "
+                            f"GAP 충족({drop*100:.2f}%≥{_active_gap*100:.1f}%) 하지만 "
+                            f"pnl={pnl_rate*100:.2f}%<최소{_min_exit_pnl*100:.1f}% → 발동 억제 (ATR손절 대기)"
+                        )
 
         # =========================
         # TP1 시장가 익절 (ATR 기반 목표가 도달 시)
@@ -2863,6 +2915,7 @@ class KiwoomAPI(QObject):
         new_codes = [c for c in codes.split(";") if c]
 
         for code in new_codes:
+            self._record_watch(code, cond_name)   # 연구용 녹화 (매매 판단과 무관)
             # 이미 포지션 있으면 무시
             if code in self.positions:
                 continue
@@ -2915,6 +2968,7 @@ class KiwoomAPI(QObject):
         # 조건 진입 (I)
         # =========================
         if event_type == "I":  # 조건 진입
+            self._record_watch(code, cond_name)   # 연구용 녹화 (매매 판단과 무관)
             if code in self.positions:
                 self.log_trade.info(
                     f"[COND_IN_IGNORE] {self.cn(code)} 사유=이미보유중"
@@ -2998,6 +3052,8 @@ class KiwoomAPI(QObject):
         # =========================
         elif event_type == "D":
             self.log_signal.info(f"[COND_OUT] {self.cn(code)}")
+            if self.recorder:
+                self.recorder.record_event(code, "COND_OUT", cond_name)
             # 🔴 이미 포지션 보유 중이면 건드리지 않음
             if code in self.positions:
                 return

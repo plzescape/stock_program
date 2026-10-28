@@ -16,6 +16,15 @@
    - 체결은 웹소켓 주문체결(00)로 확정하며, 체결 후 주식체결(0B) 실시간 감시로 손절/익절/트레일링 수행
    - 웹소켓이 끊기면 자동 재접속 + 실시간/조건검색 재등록 (system.log 의 WS_* 로그)
 
+연구용 데이터
+- tick_data/YYYY-MM-DD/ : main.py 가 조건검색 편입 종목의 체결(0B)·호가잔량(0D)을 녹화
+    <code>.trade.csv  체결 한 틱 한 줄 (체결강도, 누적거래대금, 최우선호가 등. 거래량 +매수/-매도체결)
+    <code>.book.csv   호가잔량 종목당 최대 1초 1줄
+    events.csv        조건검색 편입/이탈
+  지난 날짜는 다음 실행 때 .csv.gz 로 압축. config.py TICK_RECORD_* 로 끄거나 종목 수 조절.
+- daily_data/ : collect_daily.py 가 받는 3년치 일봉 (5_Swing_Research.bat)
+- swing_research.py : 일봉 스윙 진입 후보 IS/OOS 검증
+
 로그
 - logs/system.log : 시스템/메시지/리셋
 - logs/signal.log : 조건검색/진입판단

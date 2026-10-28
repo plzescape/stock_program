@@ -34,6 +34,14 @@ TOTAL_BUDGET = 50000000     # 총 투자 한도 (원)
 # 적재 실패는 전부 무시되어 매매에 영향을 주지 않는다.
 RECORD_CANDLES = True
 
+# ===== 연구용 체결/호가 녹화 (tick_recorder.py) =====
+# 조건검색에 걸린 종목의 웹소켓 체결(0B)·호가잔량(0D)을 tick_data/ 에 저장한다.
+# 분봉만으로는 단타 우위가 안 나와서, 체결강도·호가 같은 미시 데이터를 쌓기 위함.
+# 녹화 실패는 매매에 영향을 주지 않는다.
+TICK_RECORD_ENABLED   = True
+TICK_RECORD_MAX_CODES = 60     # 동시에 녹화할 최대 종목 수 (넘으면 가장 오래된 후보부터 해지)
+TICK_RECORD_ORDERBOOK = True   # 호가잔량(0D)도 녹화 (종목당 최대 1초 1줄)
+
 # ===== 분봉 단위 =====
 CANDLE_INTERVAL_MIN = 3   # OPT10080 분봉 단위 (1 / 3 / 5분봉). 전략 전체에 적용.
                           # 3분봉: 패턴 노이즈↓, TP 고점 포착률↑, SL 반응 최대 3분 지연

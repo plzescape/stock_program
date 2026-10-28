@@ -250,6 +250,8 @@ def main():
         code = app.exec_()
     finally:
         api.ws.stop()
+        if api.recorder:
+            api.recorder.close()
     sys.exit(code)
 
 if __name__ == "__main__":

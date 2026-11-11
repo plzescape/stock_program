@@ -769,7 +769,7 @@ tr:hover td{{background:rgba(52,73,94,.05)}}
 SKIP_TAGS = ('PUMP_SKIP', 'ENERGY_SPENT_SKIP', 'NO_SURGE_SKIP', 'BREAKOUT_STALE_SKIP',
              'ENTRY_SKIP_ATR', 'ENTRY_SKIP_BUDGET', 'ENTRY_SKIP_PRICE', 'ENTRY_CUTOFF',
              'ORDER_REJECT', 'ORDER_FAIL', 'BUY_BLOCK', 'BUY_BLOCK_PENDING',
-             'CLOSE_ORDER_BLOCK', 'REJECT_CLEANUP')
+             'CLOSE_ORDER_BLOCK', 'REJECT_CLEANUP', 'REENTRY_GIVEUP')
 
 
 def _lookup_skip_reasons(log_folder, codes):

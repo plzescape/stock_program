@@ -64,15 +64,15 @@ EMERGENCY_SL_RATE    = 0.025     # 실시간 안전망: -2.5% (ATR 손절과 별
 #   본절보호 = 매수가 - ATR × ATR_SAFE_MULT  (TP1 후 여기 이하로 밀리면 즉시 탈출)
 #   트레일링: TP2 후 최고가 - ATR × ATR_TRAIL_MULT 이하 시 청산
 ATR_PERIOD    = 14      # ATR 계산에 사용할 분봉 수
-ATR_SL_MULT   = 2.0    # 손절 배수 ← 1.5→2.0: SL폭 확대로 슬리피지 완충
-ATR_TP_MULT   = 1.2    # 익절 배수 (TP1, TP2 공통) ← 1.5→1.2: 3분봉 ATR이 1분봉 대비 ~1.5× 크므로 TP 과다 보정
-ATR_SAFE_MULT = 1.0    # 본절보호 배수 (TP1 후 매수가 이하 보호선) ← 1.5→1.0: 조정 여유 확보
-ATR_TRAIL_MULT = 1.5   # 트레일링 스탑 배수 (고점 기준)
+ATR_SL_MULT   = 1.0    # 손절 배수 ← 1.5→2.0: SL폭 확대로 슬리피지 완충
+ATR_TP_MULT   = 2.0    # 익절 배수 (TP1, TP2 공통) ← 1.5→1.2: 3분봉 ATR이 1분봉 대비 ~1.5× 크므로 TP 과다 보정
+ATR_SAFE_MULT = 0.5    # 본절보호 배수 (TP1 후 매수가 이하 보호선) ← 1.5→1.0: 조정 여유 확보
+ATR_TRAIL_MULT = 1.0   # 트레일링 스탑 배수 (고점 기준)
 
 # ===== 분할 매도 비율 =====
-TP1_RATIO = 0.55        # TP1 도달 시 55% 매도  ← 40%→55%: TP1 미달 손절 시 손실 완화
+TP1_RATIO = 0.3        # TP1 도달 시 30% 매도  ← 40%→30%: TP1 미달 손절 시 손실 완화
 TP2_RATIO = 0.40        # TP2 도달 시 40% 매도  ← 30%→40% 조정
-                        # 구조: TP1=40% + TP2=40% + 잔여=20%(트레일링)
+                        # 구조: TP1=30% + TP2=40% + 잔여=30%(트레일링)
 
 # ===== 하위 호환 유지 (직접 참조하는 코드 없음, 참고용) =====
 STOP_LOSS_RATE = 0.010   # 미사용 (ATR 손절로 대체)
@@ -218,7 +218,7 @@ BREAKOUT_FIRST_COND_TIMEOUT = 900    # 15분으로 단축 (기존 20분 → NEVE
 # signal.log 분석 결과 이 조건의 통과율이 5.55% 로 BREAKOUT 최대 병목.
 # 기존 하드코딩 값과 동일하게 두었으므로 그대로 두면 동작 변화 없음.
 # 완화 효과는 backtest.py --sweep vol 로 먼저 측정할 것.
-BREAKOUT_VOL_RATIO_MIN = 5.0    # 직전 5봉 평균 거래량 대비 배수
+BREAKOUT_VOL_RATIO_MIN = 7.0    # 직전 5봉 평균 거래량 대비 배수
 BREAKOUT_VOL_MIN_QTY   = 3000   # 최소 절대 거래량(주)
 
 # ===== BREAKOUT 강화 필터 (로그 분석 기반) =====

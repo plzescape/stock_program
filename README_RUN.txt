@@ -24,6 +24,8 @@
   지난 날짜는 다음 실행 때 .csv.gz 로 압축. config.py TICK_RECORD_* 로 끄거나 종목 수 조절.
 - daily_data/ : collect_daily.py 가 받는 3년치 일봉 (5_Swing_Research.bat)
 - swing_research.py : 일봉 스윙 진입 후보 IS/OOS 검증
+- tick_research.py  : tick_data 로 체결강도/매수체결/호가잔량 진입 후보 검증 (6_Tick_Research.bat)
+    매수=다음 초 매도1호가, 매도=매수1호가 (스프레드 반영), 녹화 20일 미만이면 참고용
 
 로그
 - logs/system.log : 시스템/메시지/리셋

@@ -101,9 +101,10 @@ def to_int(val) -> int:
 
 
 def norm_code(code) -> str:
-    """'A005930' / '005930_NX' / ' 005930 ' → '005930'"""
+    """'A005930' / '005930_NX' / ' 005930 ' → '005930', 'A0009K0' → '0009K0' (영문 포함 신규 코드)"""
     s = str(code or "").strip()
-    if s[:1] in ("A", "J", "Q") and s[1:7].isdigit():
+    # KRX 종목코드는 6자리이고 첫 글자가 숫자 (신규 코드는 0009K0 처럼 영문 포함)
+    if s[:1] in ("A", "J", "Q") and s[1:2].isdigit() and s[1:7].isalnum() and len(s.split("_")[0]) == 7:
         s = s[1:]
     for suffix in ("_NX", "_AL"):
         if s.endswith(suffix):
@@ -431,6 +432,13 @@ class KiwoomWebSocket:
         # 재접속 시 복구할 등록 상태
         self._regs: dict[str, dict] = {}       # grp_no → {"types": [..], "items": [..]}
         self._cond_realtime: list[str] = []    # 실시간 등록한 조건식 seq
+        self._cond_listed = False              # CNSRLST 를 한 번이라도 요청했는지
+
+        # REG/REMOVE 는 서버가 건수를 제한한다 ("허용된 요청 건수를 초과").
+        # 바로 보내지 않고 큐에 모아 같은 그룹·타입끼리 합쳐서 간격을 두고 보낸다.
+        self._reg_queue: list[dict] = []       # {"trnm", "grp_no", "types", "items"}
+        self._reg_cv = threading.Condition()
+        self._reg_thread = None
 
     # ── 공개 API ─────────────────────────────────────
     @property
@@ -443,9 +451,14 @@ class KiwoomWebSocket:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="kiwoom-ws", daemon=True)
         self._thread.start()
+        if not (self._reg_thread and self._reg_thread.is_alive()):
+            self._reg_thread = threading.Thread(target=self._reg_sender, name="kiwoom-ws-reg", daemon=True)
+            self._reg_thread.start()
 
     def stop(self):
         self._stop.set()
+        with self._reg_cv:
+            self._reg_cv.notify_all()
         ws = self._ws
         if ws is not None:
             try:
@@ -476,8 +489,8 @@ class KiwoomWebSocket:
             for it in items:
                 if it not in reg["items"]:
                     reg["items"].append(it)
-        return self.send({"trnm": "REG", "grp_no": grp_no, "refresh": "1",
-                          "data": [{"item": list(items), "type": list(types)}]})
+        self._enqueue_reg("REG", grp_no, types, items)
+        return True
 
     def unregister(self, grp_no: str, types: list, items: list) -> bool:
         """실시간 해지 (해당 그룹에서 items 만 뺀다). 재접속 복구 목록에서도 제거."""
@@ -485,10 +498,11 @@ class KiwoomWebSocket:
             reg = self._regs.get(grp_no)
             if reg:
                 reg["items"] = [it for it in reg["items"] if it not in items]
-        return self.send({"trnm": "REMOVE", "grp_no": grp_no, "refresh": "1",
-                          "data": [{"item": list(items), "type": list(types)}]})
+        self._enqueue_reg("REMOVE", grp_no, types, items)
+        return True
 
     def condition_list(self) -> bool:
+        self._cond_listed = True
         return self.send({"trnm": "CNSRLST"})
 
     def condition_request(self, seq: str, realtime: bool = True) -> bool:
@@ -507,6 +521,33 @@ class KiwoomWebSocket:
         return self.send({"trnm": "CNSRCLR", "seq": str(seq)})
 
     # ── 내부 ─────────────────────────────────────────
+    REG_MIN_GAP_SEC = 0.5
+
+    def _enqueue_reg(self, trnm, grp_no, types, items):
+        """큐 끝의 같은 (trnm, 그룹, 타입) 요청에 합친다. 미접속이면 재접속 복구(_restore)에 맡긴다."""
+        if not self._logged_in:
+            return
+        with self._reg_cv:
+            last = self._reg_queue[-1] if self._reg_queue else None
+            if last and last["trnm"] == trnm and last["grp_no"] == grp_no and last["types"] == list(types):
+                last["items"] += [it for it in items if it not in last["items"]]
+            else:
+                self._reg_queue.append({"trnm": trnm, "grp_no": grp_no,
+                                        "types": list(types), "items": list(items)})
+            self._reg_cv.notify()
+
+    def _reg_sender(self):
+        while not self._stop.is_set():
+            with self._reg_cv:
+                while not self._reg_queue and not self._stop.is_set():
+                    self._reg_cv.wait(1.0)
+                if self._stop.is_set():
+                    return
+                op = self._reg_queue.pop(0)
+            self.send({"trnm": op["trnm"], "grp_no": op["grp_no"], "refresh": "1",
+                       "data": [{"item": op["items"], "type": op["types"]}]})
+            time.sleep(self.REG_MIN_GAP_SEC)
+
     def _log(self, level, msg):
         if self.log:
             getattr(self.log, level)(msg)
@@ -575,16 +616,24 @@ class KiwoomWebSocket:
 
     def _restore(self):
         """재접속 후 실시간 등록 / 실시간 조건검색 복구"""
+        # 큐를 먼저 비우고 나서 등록 목록을 읽는다. 그 사이에 들어온 register() 는
+        # 목록에 들어갔거나 비운 뒤의 큐에 들어가므로 빠지지 않는다 (중복 REG 는 무해).
+        with self._reg_cv:
+            self._reg_queue.clear()
         with self._state_lock:
             regs = {g: {"types": list(r["types"]), "items": list(r["items"])}
                     for g, r in self._regs.items()}
             conds = list(self._cond_realtime)
+        # REG 는 전송 스레드가 간격을 두고 보낸다 (이 스레드는 바로 수신 루프로 가서 PING 에 응답)
         for grp_no, r in regs.items():
             if r["types"] and r["items"]:
-                self.send({"trnm": "REG", "grp_no": grp_no, "refresh": "1",
-                           "data": [{"item": r["items"], "type": r["types"]}]})
-        if conds:
-            # 조건식은 세션 단위 등록이라 목록 조회부터 다시 해야 한다
+                with self._reg_cv:
+                    self._reg_queue.append({"trnm": "REG", "grp_no": grp_no,
+                                            "types": r["types"], "items": r["items"]})
+                    self._reg_cv.notify()
+        if conds or self._cond_listed:
+            # 조건식은 세션 단위라 새 세션에서 목록 조회(CNSRLST)를 먼저 하지 않으면
+            # 이후 CNSRREQ 를 서버가 응답 없이 무시한다 (2026-11-02 장전 재접속 후 종일 무응답)
             self.send({"trnm": "CNSRLST"})
             time.sleep(0.5)
             for seq in conds:

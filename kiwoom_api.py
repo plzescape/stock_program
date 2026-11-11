@@ -185,6 +185,7 @@ class KiwoomAPI(QObject):
         self._ws_disconnected_ts = 0.0
         self._stock_names: dict[str, str] = {}     # 종목코드 → 종목명 (ka10099 캐시)
         self._cond_seq_to_name: dict[str, str] = {}
+        self._cond_waiting: dict[str, float] = {}    # CNSRREQ 응답 대기 seq → 요청 시각
         self._candle_req_seq = 0        # 늦게 도착한 분봉 응답 무시용
         self._candle_rows: list = []
         self._holdings_attempt = 0
@@ -344,6 +345,9 @@ class KiwoomAPI(QObject):
                 f"(seq={cond_seq}, "
                 f"다음순번={names[next_idx] if n>1 else '-'})"
             )
+            self._cond_waiting[str(cond_seq)] = pytime.time()
+            QTimer.singleShot(self.COND_REPLY_TIMEOUT_MS,
+                              lambda s=str(cond_seq), nm=cond_to_run: self._check_cond_reply(s, nm))
         else:
             self.log_system.error(
                 f"[CONDITION] 조건검색 요청 실패: '{cond_to_run}' (웹소켓 미접속 - 재접속 시 자동 재등록)"
@@ -516,9 +520,20 @@ class KiwoomAPI(QObject):
         elif trnm != "LOGIN":
             self.log_system.info(f"[WS_MSG] {str(data)[:300]}")
 
+    COND_REPLY_TIMEOUT_MS = 15000
+
+    def _check_cond_reply(self, seq: str, name: str):
+        """CNSRREQ 응답이 안 오면 세션의 조건식 목록이 없는 상태일 수 있다 → CNSRLST 후 재요청"""
+        if self._cond_waiting.pop(seq, None) is None:
+            return
+        self.log_system.error(f"[CONDITION_NO_REPLY] '{name}' (seq={seq}) 응답 없음 → 조건식 목록 재조회 후 재요청")
+        self.ws.condition_list()
+        QTimer.singleShot(1500, lambda: self.ws.condition_request(seq, realtime=True))
+
     def _on_condition_result(self, data: dict):
         """CNSRREQ 응답 → OCX OnReceiveTrCondition 과 같은 형태로 넘긴다"""
         seq = str(data.get("seq", "")).strip()
+        self._cond_waiting.pop(seq, None)
         name = self._cond_seq_to_name.get(seq, seq)
         if to_int(data.get("return_code", 0)) != 0:
             self.log_system.error(f"[CONDITION] '{name}' 조건검색 실패: {data.get('return_msg')}")
@@ -532,6 +547,7 @@ class KiwoomAPI(QObject):
             c = norm_code(raw)
             if c and c not in codes:
                 codes.append(c)
+        self.log_system.info(f"[CONDITION_RESULT] '{name}' {len(codes)}종목")
         if str(data.get("cont_yn", "N")).upper() == "Y":
             self.log_system.warning(f"[CONDITION] '{name}' 결과가 한 페이지를 넘음 - 첫 페이지만 사용")
         self._on_receive_tr_condition("", ";".join(codes), name, seq, 0)
